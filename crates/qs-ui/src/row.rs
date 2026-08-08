@@ -450,6 +450,15 @@ pub struct ListRenderer {
     /// [`qs_gpu::frame::DrawStats::icons_dropped`] for why this is not folded into
     /// `glyphs_dropped`.
     pub icons_dropped: u32,
+    /// The vertical metric the last frame's rows were laid out on, or `None` when the face
+    /// had no parseable metrics and the fallback baseline was used.
+    ///
+    /// Diagnostic state, the same kind as `glyphs_dropped`: it reports something about the
+    /// frame that is otherwise invisible once the draw list is flat. SC-007 is why it is
+    /// worth reporting -- a row whose text does not fit is a criterion failure, and without
+    /// this the headroom is a number that exists for one expression inside `render` and is
+    /// then unrecoverable from anything the renderer produces.
+    pub last_text_fit: Option<RowTextFit>,
     icons: IconCache,
 }
 
@@ -543,6 +552,7 @@ impl ListRenderer {
             weight_coverage,
             glyphs_dropped: 0,
             icons_dropped: 0,
+            last_text_fit: None,
             icons: IconCache::default(),
         }
     }
@@ -662,12 +672,14 @@ impl ListRenderer {
         let font_px = PxSize::new(primary.size_px(layout.scale, layout.text_scale));
         let secondary_px = PxSize::new(secondary.size_px(layout.scale, layout.text_scale));
         let metrics = self.shaper.metrics(self.face_for(primary), font_px);
-        let baseline = match metrics {
-            // Optically centred -- see `row_text_fit`, which is this calculation. The
-            // renderer calls it rather than repeating it so the SC-007 fit test measures
-            // the baseline rows are actually drawn on, not a second copy of the formula
-            // that could drift away from this one without anything noticing.
-            Some(m) => row_text_fit(layout.row_height, m.ascent, m.descent, m.x_height).baseline,
+        // Optically centred -- see `row_text_fit`, which is this calculation. The renderer
+        // calls it rather than repeating it, and records what it got, so the SC-007 fit
+        // check measures the baseline rows are actually drawn on rather than a second copy
+        // of the formula that could drift from this one without anything noticing.
+        self.last_text_fit =
+            metrics.map(|m| row_text_fit(layout.row_height, m.ascent, m.descent, m.x_height));
+        let baseline = match self.last_text_fit {
+            Some(fit) => fit.baseline,
             None => layout.row_height as f32 * 0.7,
         };
 
@@ -1818,62 +1830,75 @@ mod tests {
         // to its own copy of the formula -- and then the criterion would be measuring a row
         // nobody draws, which is the same genus of blindness this chunk is closing.
         //
-        // So this observes the draw list. The two densities share a font size (`Compact`
-        // removes padding, not legibility), so the same glyphs raster to the same atlas
-        // entries and every glyph's y differs by exactly the baseline difference and
-        // nothing else. Under `row_text_fit` that difference is half the row-height
-        // difference; under naive box-centring it would also be half, so the constant is
-        // checked against the function rather than against 2.0.
+        // The measurement has to be ABSOLUTE, and getting that wrong is worth recording,
+        // because the first version of this test was itself the failure it was written to
+        // rule out. It rendered at both densities and compared how far the glyphs moved,
+        // reasoning that the shared font size makes every other term cancel. It does -- but
+        // so does the thing under test. Optical centring gives (h + x)/2 and box centring
+        // gives h/2, and those differ by x/2, a constant: any difference across two row
+        // heights cancels it exactly. That version passed with `render` mutated to use
+        // naive box-centring, which is the mutation it existed to catch. A differential can
+        // only ever show the baseline is linear in row height with slope one half, and both
+        // formulas satisfy that.
+        //
+        // So `render` records the fit it used and this reads it back. That is also why
+        // `last_text_fit` is worth having as real diagnostic state rather than a test hook:
+        // once the draw list is flat, the row's vertical metric is unrecoverable from
+        // anything the renderer produces.
         use crate::density::Density;
         let mut renderer = renderer();
 
-        // One row, so the only thing that can move a glyph is the baseline. With several
-        // rows the comparison also picks up each row's top edge, which shifts by the full
-        // row-height difference and swamps the quantity under test -- the first version of
-        // this test measured 6 px where the baseline moved 2.
-        let glyph_tops = |renderer: &mut ListRenderer, density: Density| -> Vec<f32> {
-            let mut layout = layout_for(1, 1.0);
-            layout.density = density;
-            layout.row_height = density.row_height_px(1.0, 1.0);
-            let mut list = DrawList::default();
-            renderer.render(
-                &mut list,
-                &plain_rows(1),
-                &layout,
-                Interaction::default(),
-                &settled(),
-            );
-            list.instances
-                .iter()
-                .filter(|i| i.kind == qs_gpu::PrimKind::Glyph as u32)
-                .map(|i| i.rect[1])
-                .collect()
-        };
+        for density in [Density::Compact, Density::Default] {
+            for text_scale in [1.0, 2.0] {
+                let mut layout = layout_for(1, 1.0);
+                layout.density = density;
+                layout.text_scale = text_scale;
+                layout.row_height = density.row_height_px(1.0, text_scale);
 
-        let compact = glyph_tops(&mut renderer, Density::Compact);
-        let default = glyph_tops(&mut renderer, Density::Default);
-        assert!(!compact.is_empty(), "no glyphs were drawn");
-        assert_eq!(
-            compact.len(),
-            default.len(),
-            "the two runs must draw the same glyphs for the comparison to mean anything"
-        );
+                let mut list = DrawList::default();
+                renderer.render(
+                    &mut list,
+                    &plain_rows(1),
+                    &layout,
+                    Interaction::default(),
+                    &settled(),
+                );
 
-        let role = renderer.tokens.type_role(role::MD);
-        let size = PxSize::new(role.size_px(1.0, 1.0));
-        let font = renderer.face_for(role);
-        let Some(m) = renderer.shaper.metrics(font, size) else {
-            panic!("the test machine has no parseable UI face");
-        };
-        let expected = row_text_fit(Density::Default.row_height_px(1.0, 1.0), m.ascent, m.descent, m.x_height).baseline
-            - row_text_fit(Density::Compact.row_height_px(1.0, 1.0), m.ascent, m.descent, m.x_height).baseline;
+                let role = renderer.tokens.type_role(role::MD);
+                let size = PxSize::new(role.size_px(1.0, text_scale));
+                let font = renderer.face_for(role);
+                let Some(m) = renderer.shaper.metrics(font, size) else {
+                    panic!("the test machine has no parseable UI face");
+                };
+                let expected = row_text_fit(layout.row_height, m.ascent, m.descent, m.x_height);
 
-        for (a, b) in compact.iter().zip(&default) {
-            assert!(
-                (b - a - expected).abs() <= 1.0,
-                "the renderer's baseline moved by {} where `row_text_fit` says {expected}",
-                b - a
-            );
+                assert_eq!(
+                    renderer.last_text_fit,
+                    Some(expected),
+                    "{density:?} at text scale {text_scale}: the renderer laid rows out on \
+                     a different metric than the one SC-007 measures"
+                );
+
+                // And the recorded metric is the one the glyphs were actually placed on,
+                // not a number computed beside them and discarded. Glyph tops sit within a
+                // line box of the baseline; anything further means the record and the draw
+                // list disagree about where the row's text is.
+                let tops: Vec<f32> = list
+                    .instances
+                    .iter()
+                    .filter(|i| i.kind == qs_gpu::PrimKind::Glyph as u32)
+                    .map(|i| i.rect[1])
+                    .collect();
+                assert!(!tops.is_empty(), "no glyphs were drawn");
+                for top in tops {
+                    assert!(
+                        top > expected.baseline - m.ascent - 1.0
+                            && top < expected.baseline + m.descent + 1.0,
+                        "a glyph at y={top} is nowhere near the recorded baseline {}",
+                        expected.baseline
+                    );
+                }
+            }
         }
     }
 
