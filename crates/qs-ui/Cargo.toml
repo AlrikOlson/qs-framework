@@ -1,0 +1,27 @@
+[package]
+name = "qs-ui"
+description = "Row recycling, scroll state, densities, layout, tokens and the accessibility tree."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+accesskit.workspace = true
+qs-gpu.workspace = true
+qs-text.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# A dev-dependency cycle (qs-bench depends on qs-ui). Cargo permits this, and it is the
+# right shape here: the RS-1 test needs a source that would genuinely block, and the only
+# honest one lives beside the corpus generator rather than being reimplemented in a fixture.
+qs-bench.workspace = true
+
+[lints]
+workspace = true

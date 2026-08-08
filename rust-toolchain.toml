@@ -1,0 +1,13 @@
+[toolchain]
+# The MSRV *is* the pinned toolchain, so a build that would fail on the floor
+# fails here instead of in a user's CI three weeks later.
+#
+# plan.md names 1.85 (the first edition-2024 release). It is raised to 1.87
+# deliberately -- `wgpu` 30, the renderer chosen in ADR 001, declares
+# `rust-version = "1.87"`. See docs/adr/011-msrv-1-87.md. Raise this only with
+# an accompanying ADR; never silently, and never as a side effect of adding a
+# dependency.
+channel = "1.87.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"

@@ -1,0 +1,76 @@
+# cargo-deny policy. Run with `cargo deny check` (or `cargo xtask deny`).
+#
+# Two things are gated here, and they fail the build rather than warn:
+#   1. Licence compatibility -- Quicksilver ships as a binary, so a copyleft
+#      dependency is a distribution problem discovered at release time unless
+#      it is caught at merge time.
+#   2. Security advisories -- an unpatched RUSTSEC advisory in a desktop app
+#      with filesystem reach is not a backlog item.
+
+[graph]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licences only. Anything outside this list needs an explicit
+# exception below with a reason, not a silent addition to the allow list.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+    "MPL-2.0",           # file-level copyleft; acceptable for unmodified crates
+    "OpenSSL",
+    "Ucd",               # Unicode character database, used by unicode-* crates
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all-duplicates"
+
+# Crates that must never appear in the graph, with the reason stated so the
+# next person does not have to reconstruct it.
+deny = [
+    # A blocking async runtime on the frame path is Constitution I in crate form.
+    # If one of these becomes genuinely necessary it needs an ADR, not a merge.
+    { name = "openssl-sys", reason = "native TLS pulls a C toolchain into all 8 cross-compilation targets" },
+]
+
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,23 @@
+[package]
+name = "qs-text"
+description = "Shaping, shaped-run caching, glyph rasterization and bidirectional resolution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustybuzz.workspace = true
+swash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ttf-parser.workspace = true
+unicode-bidi.workspace = true
+unicode-script.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

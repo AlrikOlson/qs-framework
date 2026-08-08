@@ -1,2 +1,34 @@
-*.pyc
+# --- Rust -------------------------------------------------------------------
+/target/
+**/*.rs.bk
+*.pdb
+*.rlib
+*.prof*
+# Cargo.lock IS committed: this workspace produces binaries, and a reproducible
+# dependency graph is a precondition for a comparable benchmark measurement.
+
+# --- benchmark output -------------------------------------------------------
+# Reports are artifacts; baselines are source and are committed explicitly.
+/target/bench/
+/target/golden/
+# `baselines/` is source, not output, and is committed.
+
+# --- Python (speckit scripts) ----------------------------------------------
 __pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- editors / OS ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.idea/
+*.iml
+
+# --- local environment -------------------------------------------------------
+*.log
+.env
+.env.*
+!.env.example

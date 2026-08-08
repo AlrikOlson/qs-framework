@@ -1,0 +1,25 @@
+[package]
+name = "qs-platform"
+description = "Windowing, input, display enumeration and present tuning, behind traits that outlive the backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+raw-window-handle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu.workspace = true
+wgpu-hal.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu.workspace = true
+wgpu-hal.workspace = true
+
+[lints]
+workspace = true
