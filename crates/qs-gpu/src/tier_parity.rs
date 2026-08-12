@@ -50,14 +50,50 @@
 //!
 //! # What the bounds were checked against
 //!
-//! Nine mutations, each applied for real and re-run: the CPU tier shifted a whole pixel;
+//! Twelve mutations, each applied for real and re-run: the CPU tier shifted a whole pixel;
 //! shifted a *quarter* pixel; the stroke inset deleted (the original bug); the glyph blit
 //! reading one texel across; the transcription's stroke band turned into a fill; its
 //! radius clamp deleted; a `PrimKind` dropped from `ALL`; a `cases_for` arm stubbed out to
-//! nothing; and `CPU_EDGE_QUANTUM` sharpened. All nine fail the suite. The radius clamp
+//! nothing; and `CPU_EDGE_QUANTUM` sharpened. Those nine all fail the suite. The radius clamp
 //! was the one that initially did *not* -- no fixture asked for a radius large enough to
 //! clamp, so deleting the clamp changed nothing anywhere. `rect/over-large-radius` and
 //! `stroke/over-large-radius` exist because of that survivor.
+//!
+//! Three more arrived with the gradient, and they matter more than the count suggests
+//! because a ramp can be wrong in ways that still look like a ramp. Making the CPU tier
+//! interpolate in linear light rather than Oklab takes `gradient/vertical-sharp` to 33
+//! channels and also reddens `the_ramp_is_walked_in_oklab_and_not_in_linear_srgb` -- two
+//! independent failures, which is the point of having both. Normalizing the gradient axis
+//! against the box's half-width instead of its support takes it to 29. And dropping the
+//! dither from the CPU tier while the shader keeps it takes it to 1, which is the whole
+//! bound now that the three sharp gradient fixtures measure zero.
+//!
+//! Those fixtures used to allow 1, and the 1 was the CPU tier approximating an Oklab curve
+//! with 33 chords. `prim-noise-dither` had to delete that approximation -- a stop list has
+//! nowhere to put a per-pixel offset -- and the tiers came out bit-identical on a ramp, so
+//! the bound was tightened to nothing rather than left with slack nobody was using.
+//!
+//! # Two questions, chosen by the primitive
+//!
+//! Everything above describes the [`Fidelity::Exact`] question: *do the two tiers agree?*
+//! It is the right question for a rounded rect and an impossible one for an effect
+//! `tiny-skia` cannot draw at any tolerance, so a primitive picks which question it is
+//! asked. An [`Fidelity::Enhanced`] kind is asked the other one -- *did the CPU tier draw
+//! the floor its `PrimKind` declares?* -- and it is asked exactly, with no tolerance at all,
+//! because both sides of that comparison are the same rasterizer.
+//!
+//! What the second question buys is not leniency. It is that the fallback stops being
+//! whatever fell out and becomes something somebody chose, wrote down, and can be held to.
+//!
+//! [`PrimKind::Glow`] is the one `Enhanced` kind, and its fixtures ask the floor question
+//! instead. The synthetic declarations in `the_floor_check_*` are still here and still run
+//! in both directions: they are what shows the check can go red, which a real `Enhanced`
+//! kind cannot demonstrate about itself.
+//!
+//! One thing the floor route structurally cannot see is whether the *shader* draws anything
+//! -- a branch returning zero satisfies "the CPU tier drew nothing" perfectly. The four
+//! tests under "the glow's own geometry" are that half, and they hold the transcription to
+//! the halo's measured profile rather than to a snapshot of it.
 //!
 //! A tolerance on its own is a weak assertion, so the comparison does not rest on one.
 //! Alongside the channel difference it pins the ink's bounding box *exactly*, its
@@ -78,7 +114,7 @@ use tiny_skia::Pixmap;
 use crate::atlas::PendingUpload;
 use crate::color::Srgba;
 use crate::cpu_raster::CpuRasterizer;
-use crate::frame::{DrawList, Instance, PrimKind};
+use crate::frame::{DrawList, Fidelity, Floor, Instance, PrimKind};
 
 /// `shaders/instance.wgsl`, transcribed function for function.
 ///
@@ -95,6 +131,206 @@ mod shader {
     pub const KIND_STROKE: u32 = 1;
     /// `const KIND_GLYPH: u32 = 2u;` -- shader line 16.
     pub const KIND_GLYPH: u32 = 2;
+    /// `const KIND_GRADIENT: u32 = 3u;` -- shader line 17.
+    pub const KIND_GRADIENT: u32 = 3;
+    /// `const KIND_GLOW: u32 = 4u;` -- shader line 18.
+    pub const KIND_GLOW: u32 = 4;
+    /// `const KIND_RIM: u32 = 5u;` -- shader line 19.
+    pub const KIND_RIM: u32 = 5;
+    /// `const KIND_PBR: u32 = 6u;` -- shader line 20.
+    pub const KIND_PBR: u32 = 6;
+    /// `const KIND_SWEEP: u32 = 7u;` -- shader line 21.
+    pub const KIND_SWEEP: u32 = 7;
+    /// `const KIND_FIELD: u32 = 8u;` -- shader line 22.
+    pub const KIND_FIELD: u32 = 8;
+
+    pub const PI: f32 = std::f32::consts::PI;
+    pub const TAU: f32 = std::f32::consts::TAU;
+
+    /// `fn sd_rounded_box_grad(p, b, r)` -- the distance field's analytic gradient, i.e. the
+    /// direction of the nearest edge.
+    ///
+    /// Transcribed rather than approximated by finite differences, which is the whole reason
+    /// the CPU side can reproduce a normal at all: a difference would need neighbouring
+    /// fragments, and this tier has none.
+    pub fn sd_rounded_box_grad(p: [f32; 2], b: [f32; 2], r: f32) -> [f32; 2] {
+        let q = [p[0].abs() - b[0] + r, p[1].abs() - b[1] + r];
+        let s = [sign(p[0]), sign(p[1])];
+        if q[0].max(q[1]) > 0.0 {
+            let m = [q[0].max(0.0), q[1].max(0.0)];
+            let len = (m[0] * m[0] + m[1] * m[1]).sqrt();
+            return [m[0] / len * s[0], m[1] / len * s[1]];
+        }
+        if q[0] > q[1] {
+            return [s[0], 0.0];
+        }
+        [0.0, s[1]]
+    }
+
+    /// WGSL `sign`, which returns 0 for 0 -- not Rust's `f32::signum`, which returns 1.0.
+    /// The difference is exactly one pixel wide and sits on the shape's centre lines.
+    fn sign(v: f32) -> f32 {
+        if v > 0.0 {
+            1.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// `fn bevel_normal(distance, grad, width)` -- a quarter-round profile: vertical at the
+    /// boundary, flat `width` pixels inward.
+    pub fn bevel_normal(distance: f32, grad: [f32; 2], width: f32) -> [f32; 3] {
+        if width <= 0.0 {
+            return [0.0, 0.0, 1.0];
+        }
+        let t = (-distance / width).clamp(0.0, 1.0);
+        let theta = (1.0 - t) * PI * 0.5;
+        let (sin, cos) = theta.sin_cos();
+        [grad[0] * sin, grad[1] * sin, cos]
+    }
+
+    /// `fn environment(ray)` -- an infinite sky, so the ray's elevation is the whole answer.
+    pub fn environment(ray: [f32; 3], horizon: [f32; 3], zenith: [f32; 3]) -> [f32; 3] {
+        let t = (ray[2] * 0.5 + 0.5).clamp(0.0, 1.0);
+        [
+            horizon[0] + (zenith[0] - horizon[0]) * t,
+            horizon[1] + (zenith[1] - horizon[1]) * t,
+            horizon[2] + (zenith[2] - horizon[2]) * t,
+        ]
+    }
+
+    /// `fn distribution_ggx(n_dot_h, roughness)`.
+    pub fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
+        let a = roughness * roughness;
+        let a2 = a * a;
+        let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+        a2 / (PI * d * d).max(1e-7)
+    }
+
+    /// `fn visibility_smith(n_dot_v, n_dot_l, roughness)` -- height-correlated, with the
+    /// BRDF's `1 / (4 (N.L)(N.V))` already folded in.
+    pub fn visibility_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
+        let a = roughness * roughness;
+        let a2 = a * a;
+        let lv = n_dot_l * (n_dot_v * n_dot_v * (1.0 - a2) + a2).sqrt();
+        let ll = n_dot_v * (n_dot_l * n_dot_l * (1.0 - a2) + a2).sqrt();
+        0.5 / (lv + ll).max(1e-5)
+    }
+
+    /// `fn fresnel_schlick(cos_theta, f0)`.
+    pub fn fresnel_schlick(cos_theta: f32, f0: [f32; 3]) -> [f32; 3] {
+        let f = (1.0 - cos_theta).clamp(0.0, 1.0).powi(5);
+        [
+            f0[0] + (1.0 - f0[0]) * f,
+            f0[1] + (1.0 - f0[1]) * f,
+            f0[2] + (1.0 - f0[2]) * f,
+        ]
+    }
+
+    /// `fn fresnel_roughness(cos_theta, f0, roughness)`.
+    pub fn fresnel_roughness(cos_theta: f32, f0: [f32; 3], roughness: f32) -> [f32; 3] {
+        let f = (1.0 - cos_theta).clamp(0.0, 1.0).powi(5);
+        let ceiling = 1.0 - roughness;
+        [
+            f0[0] + (ceiling.max(f0[0]) - f0[0]) * f,
+            f0[1] + (ceiling.max(f0[1]) - f0[1]) * f,
+            f0[2] + (ceiling.max(f0[2]) - f0[2]) * f,
+        ]
+    }
+
+    /// `const LIGHT_DIR` -- shader line, above and slightly to the left.
+    ///
+    /// Taken from `crate::frame` rather than re-typed here. It used to be a literal, and it
+    /// stopped being one when a material gained the ability to cast a contact shadow: the
+    /// direction a shadow falls and the direction a surface is shaded from have to be the same
+    /// vector, and two copies of it are two chances for a window whose shadows point one way
+    /// and whose highlights point the other.
+    pub const LIGHT_DIR: [f32; 3] = crate::frame::LIGHT_DIR;
+    /// `const LIGHT_RADIANCE` -- the exposure that puts a flat dielectric back at its albedo.
+    pub const LIGHT_RADIANCE: f32 = 4.0757;
+
+    /// `fn edge_emission(distance, bevel)` -- how much of a surface's emission reaches one
+    /// fragment: all of it at the boundary, none of it `bevel` pixels inward.
+    ///
+    /// The rim's profile, and reusing `rim_t` rather than restating it is the point: the whole
+    /// contrast argument is that emission stops exactly where the bevel does, so there must be
+    /// one answer to "how far inside the edge am I" and not two.
+    pub fn edge_emission(distance: f32, bevel: f32) -> f32 {
+        let edge = 1.0 - rim_t(distance, bevel);
+        edge * edge
+    }
+
+    /// `fn shade_pbr(...)` -- Cook-Torrance with an orthographic viewer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn shade_pbr(
+        normal: [f32; 3],
+        albedo: [f32; 3],
+        roughness: f32,
+        metallic: f32,
+        env_strength: f32,
+        emissive: f32,
+        horizon: [f32; 3],
+        zenith: [f32; 3],
+    ) -> [f32; 3] {
+        let rough = roughness.clamp(0.045, 1.0);
+        let metal = metallic.clamp(0.0, 1.0);
+
+        let v = [0.0, 0.0, 1.0];
+        let l = normalize3(LIGHT_DIR);
+        let h = normalize3([l[0] + v[0], l[1] + v[1], l[2] + v[2]]);
+
+        let n_dot_v = normal[2].max(1e-4);
+        let n_dot_l = dot3(normal, l).max(0.0);
+        let n_dot_h = dot3(normal, h).max(0.0);
+        let v_dot_h = dot3(v, h).max(0.0);
+
+        let f0 = [
+            0.04 + (albedo[0] - 0.04) * metal,
+            0.04 + (albedo[1] - 0.04) * metal,
+            0.04 + (albedo[2] - 0.04) * metal,
+        ];
+
+        let d = distribution_ggx(n_dot_h, rough);
+        let vis = visibility_smith(n_dot_v, n_dot_l, rough);
+        let f = fresnel_schlick(v_dot_h, f0);
+
+        let reflected = [
+            2.0 * normal[0] * n_dot_v - v[0],
+            2.0 * normal[1] * n_dot_v - v[1],
+            2.0 * normal[2] * n_dot_v - v[2],
+        ];
+        let env_spec_tint = fresnel_roughness(n_dot_v, f0, rough);
+        let env_spec = environment(reflected, horizon, zenith);
+        let env_diff = environment(normal, horizon, zenith);
+
+        // See the shader: a rig, not a gain.
+        let sky_mix = env_strength.clamp(0.0, 1.0);
+        let mut out = [0.0f32; 3];
+        for i in 0..3 {
+            let specular = d * vis * f[i];
+            let kd = (1.0 - f[i]) * (1.0 - metal);
+            let diffuse = kd * albedo[i] / PI;
+            let direct = (diffuse + specular) * n_dot_l * LIGHT_RADIANCE * (1.0 - sky_mix);
+            let ambient = (env_diff[i] * albedo[i] * (1.0 - metal)
+                + env_spec[i] * env_spec_tint[i])
+                * sky_mix;
+            // Added, not mixed: a light is this surface plus light. `emissive` arrives already
+            // weighted by `edge_emission`, so it is zero everywhere deeper than the bevel.
+            out[i] = direct + ambient + albedo[i] * emissive.max(0.0);
+        }
+        out
+    }
+
+    fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn normalize3(v: [f32; 3]) -> [f32; 3] {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
     // `KIND_RECT` (line 14) has no constant here on purpose: the shader reaches it as the
     // `else` of both branches, and a constant nothing compares against is dead weight
     // that would still have to be kept in sync.
@@ -121,11 +357,57 @@ mod shader {
         (m[0] * m[0] + m[1] * m[1]).sqrt() + q[0].max(q[1]).min(0.0) - r
     }
 
-    /// The quad expansion from `vs_main` -- shader line 70. Shapes grow by one pixel so
+    /// The quad expansion from `vs_main` -- shader line 76. Shapes grow by one pixel so
     /// the antialiased edge has somewhere to live; glyphs do not, because padding would
-    /// shear their UV mapping.
-    pub fn quad_pad(kind: u32) -> f32 {
-        if kind == KIND_GLYPH { 0.0 } else { 1.0 }
+    /// shear their UV mapping; a glow grows by its whole falloff, because the fragment
+    /// stage only runs where the quad reaches and a halo cut off at one pixel is a halo
+    /// with a square edge.
+    ///
+    /// Takes `param` for that last case, which is why this is not a function of `kind`
+    /// alone any more. A rim is deliberately not a fourth case: it lives entirely inside its
+    /// shape, so the one-pixel margin every other fill gets is exactly what it needs.
+    pub fn quad_pad(kind: u32, param: f32) -> f32 {
+        if kind == KIND_GLYPH {
+            0.0
+        } else if kind == KIND_GLOW {
+            param.max(0.0) + 1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// `fn glow_t(distance, falloff)` -- how far along the falloff a fragment is: 0 at the
+    /// shape's edge and inside it, 1 at the limit.
+    pub fn glow_t(distance: f32, falloff: f32) -> f32 {
+        if falloff <= 0.0 {
+            return if distance <= 0.0 { 0.0 } else { 1.0 };
+        }
+        (distance / falloff).clamp(0.0, 1.0)
+    }
+
+    /// `fn rim_t(distance, width)` -- how far *inside* the shape a fragment is: 0 at the
+    /// boundary and outside it, 1 at `width` inward.
+    ///
+    /// The same field as `glow_t`, read with the opposite sign, and answering a zero width
+    /// rather than dividing by it for the same reason.
+    pub fn rim_t(distance: f32, width: f32) -> f32 {
+        if width <= 0.0 {
+            return 1.0;
+        }
+        (-distance / width).clamp(0.0, 1.0)
+    }
+
+    /// `fn halo(near, far, t)` -- the tint, mixed in premultiplied linear.
+    ///
+    /// Not Oklab, and the shader says why at length: a zero-alpha stop has no hue to
+    /// unpremultiply, so a perceptual walk fades the halo through black.
+    pub fn halo(near: [f32; 4], far: [f32; 4], t: f32) -> [f32; 4] {
+        [
+            near[0] + (far[0] - near[0]) * t,
+            near[1] + (far[1] - near[1]) * t,
+            near[2] + (far[2] - near[2]) * t,
+            near[3] + (far[3] - near[3]) * t,
+        ]
     }
 
     /// The signed-distance half of `fs_main` -- shader lines 113 to 128.
@@ -133,6 +415,19 @@ mod shader {
     /// `local` is `VsOut::local`: the fragment's position relative to the rect centre, in
     /// pixels. Evaluating in that space is what makes one unit of distance one pixel on
     /// screen, which is what makes the coverage below correct without a derivative.
+    /// The two lines of `fs_main` that every non-glyph branch shares: clamp the radius,
+    /// then take the signed distance.
+    ///
+    /// Its own function because the glow needs the distance *twice* -- once for coverage
+    /// and once for the tint -- exactly as the shader does, where it is one `let`.
+    /// Recomputing it at the second call site would be a place for the two to drift.
+    pub fn fs_distance(local: [f32; 2], half_size: [f32; 2], radius: f32) -> f32 {
+        // Line 113: an unclamped radius larger than half the shorter side inverts the SDF
+        // and renders a bow-tie.
+        let radius = radius.clamp(0.0, half_size[0].min(half_size[1]));
+        sd_rounded_box(local, half_size, radius)
+    }
+
     pub fn fs_alpha(
         kind: u32,
         local: [f32; 2],
@@ -140,19 +435,186 @@ mod shader {
         radius: f32,
         param: f32,
     ) -> f32 {
-        // Line 113: an unclamped radius larger than half the shorter side inverts the SDF
-        // and renders a bow-tie.
-        let radius = radius.clamp(0.0, half_size[0].min(half_size[1]));
-        let distance = sd_rounded_box(local, half_size, radius);
+        let distance = fs_distance(local, half_size, radius);
 
         if kind == KIND_STROKE {
             // Lines 120-121: distance to the centre-line of a band of width `param`.
             let half_width = param * 0.5;
             (0.5 - ((distance + half_width).abs() - half_width)).clamp(0.0, 1.0)
+        } else if kind == KIND_GLOW {
+            // Quadratic, continuous across the shape's boundary: solid inside, falling from
+            // the edge outward. There is no edge here to antialias, so no `0.5 - d`.
+            let fade = 1.0 - glow_t(distance, param);
+            fade * fade
+        } else if kind == KIND_PBR {
+            // The fill's coverage, unchanged: shading changes what is inside a shape, never
+            // which pixels the shape covers. That separation is what makes the floor exact.
+            (0.5 - distance).clamp(0.0, 1.0)
+        } else if kind == KIND_RIM {
+            // Quadratic inward, multiplied by the fill's own coverage rather than replacing
+            // it: that factor is what keeps the light inside the shape and antialiases its
+            // outer edge, which is why a rim needs no quad padding.
+            let fade = 1.0 - rim_t(distance, param);
+            (0.5 - distance).clamp(0.0, 1.0) * fade * fade
         } else {
             // Line 127.
             (0.5 - distance).clamp(0.0, 1.0)
         }
+    }
+
+    /// `fn unpremultiply(c)` -- the shader's helper, transcribed.
+    pub fn unpremultiply(c: [f32; 4]) -> [f32; 3] {
+        if c[3] <= 0.0 {
+            return [0.0; 3];
+        }
+        [c[0] / c[3], c[1] / c[3], c[2] / c[3]]
+    }
+
+    /// `fn ramp(near, far, local, half_size, angle, pixel)` -- the gradient's colour at one
+    /// fragment, premultiplied.
+    ///
+    /// The Oklab conversions themselves are *not* re-transcribed: they come from
+    /// `crate::color`, which is the module the shader's own copy is a transcription of.
+    /// Writing a third copy here would mean the suite could only ever catch the shader
+    /// disagreeing with this file, not the shader disagreeing with the palette. The dither
+    /// comes from the same module for the same reason, and it takes the **framebuffer**
+    /// pixel rather than anything derived from `local` -- see `qs_gpu::color::dithered`.
+    pub fn ramp(
+        near: [f32; 4],
+        far: [f32; 4],
+        local: [f32; 2],
+        half_size: [f32; 2],
+        angle: f32,
+        pixel: [u32; 2],
+    ) -> [f32; 4] {
+        ramp_at(near, far, ramp_t(local, half_size, angle), pixel)
+    }
+
+    /// `fn ramp_t(local, half_size, angle)` -- how far along a linear ramp a fragment is.
+    pub fn ramp_t(local: [f32; 2], half_size: [f32; 2], angle: f32) -> f32 {
+        let (sin, cos) = angle.sin_cos();
+        let extent = (half_size[0] * cos).abs() + (half_size[1] * sin).abs();
+        if extent <= 0.0 {
+            return 0.5;
+        }
+        ((local[0] * cos + local[1] * sin) / extent * 0.5 + 0.5).clamp(0.0, 1.0)
+    }
+
+    /// `fn sweep_t(local, half_size, phase)` -- how far *around* the shape a fragment is, on
+    /// the same two-stop ramp.
+    ///
+    /// The mirror is what makes this continuous across the wrap, and the continuity is the
+    /// property `a_sweep_has_no_seam_where_the_angle_wraps` measures rather than assumes.
+    /// `atan2(0, 0)` is indeterminate in WGSL, so the exact centre is answered explicitly on
+    /// both sides.
+    pub fn sweep_t(local: [f32; 2], half_size: [f32; 2], phase: f32) -> f32 {
+        let nx = local[0] / half_size[0].max(1e-4);
+        let ny = local[1] / half_size[1].max(1e-4);
+        let angle = if nx == 0.0 && ny == 0.0 {
+            0.0
+        } else {
+            ny.atan2(nx)
+        };
+        let turns = (angle - phase) / TAU + 0.5;
+        let f = turns - turns.floor();
+        1.0 - (f * 2.0 - 1.0).abs()
+    }
+
+    /// `fn field_weight(delta, reach)` -- how strongly one centre reaches a point.
+    ///
+    /// Quartic with **bounded support**: zero at the reach and beyond, with zero slope at both
+    /// ends. The bounded part is the cost argument the whole primitive rests on, so it is
+    /// transcribed rather than approximated -- a tail that merely got small would still be
+    /// four evaluations per fragment and would put a faint ring where it was truncated.
+    pub fn field_weight(delta: [f32; 2], reach: f32) -> f32 {
+        if reach <= 0.0 {
+            return 0.0;
+        }
+        let d2 = delta[0] * delta[0] + delta[1] * delta[1];
+        let t = (d2 / (reach * reach)).clamp(0.0, 1.0);
+        let falloff = 1.0 - t;
+        falloff * falloff
+    }
+
+    /// `fn field(base, uv01, aspect, phase, amplitude, pixel)` -- the whole field at one
+    /// fragment, composited over the base and dithered.
+    ///
+    /// The Oklab conversions and the dither come from `crate::color` for the reason `ramp_at`
+    /// gives: a third copy here could only ever catch the shader disagreeing with this file,
+    /// never with the palette.
+    pub fn field(
+        base: [f32; 4],
+        uv01: [f32; 2],
+        aspect: f32,
+        phase: f32,
+        amplitude: f32,
+        centres: &crate::frame::FieldWash,
+        pixel: [u32; 2],
+    ) -> [f32; 4] {
+        let mut total = 0.0_f32;
+        let mut lab = [0.0_f32; 3];
+
+        for centre in &centres.centres {
+            let angle = phase + centre.phase * TAU;
+            let at = [
+                centre.at[0] + centre.drift[0] * angle.cos(),
+                centre.at[1] + centre.drift[1] * angle.sin(),
+            ];
+            let delta = [uv01[0] - at[0], (uv01[1] - at[1]) * aspect];
+            let tint = centre.tint.to_premul_linear_f32();
+            let weight = field_weight(delta, centre.reach) * tint[3];
+            total += weight;
+            let c = crate::color::linear_rgb_to_oklab(unpremultiply(tint));
+            for (slot, channel) in lab.iter_mut().zip(c) {
+                *slot += channel * weight;
+            }
+        }
+
+        if total <= 0.0 {
+            return base;
+        }
+
+        let mixed =
+            crate::color::oklab_to_linear_rgb([lab[0] / total, lab[1] / total, lab[2] / total]);
+        let coverage = total.clamp(0.0, 1.0) * amplitude.clamp(0.0, 1.0);
+        let mut out = [0.0_f32; 4];
+        for ((slot, wash), under) in out.iter_mut().zip(mixed).zip(base) {
+            *slot = wash.clamp(0.0, 1.0) * coverage + under * (1.0 - coverage);
+        }
+        out[3] = coverage + base[3] * (1.0 - coverage);
+
+        let straight = unpremultiply(out);
+        let dithered = crate::color::dithered(straight, pixel[0], pixel[1]);
+        [
+            dithered[0] * out[3],
+            dithered[1] * out[3],
+            dithered[2] * out[3],
+            out[3],
+        ]
+    }
+
+    /// `fn ramp_at(near, far, t, pixel)` -- the two-stop ramp's colour at one fragment, shared
+    /// by both the linear gradient and the conic sweep.
+    pub fn ramp_at(near: [f32; 4], far: [f32; 4], t: f32, pixel: [u32; 2]) -> [f32; 4] {
+        let from = crate::color::linear_rgb_to_oklab(unpremultiply(near));
+        let to = crate::color::linear_rgb_to_oklab(unpremultiply(far));
+        let lab = [
+            from[0] + (to[0] - from[0]) * t,
+            from[1] + (to[1] - from[1]) * t,
+            from[2] + (to[2] - from[2]) * t,
+        ];
+        let alpha = near[3] + (far[3] - near[3]) * t;
+        let rgb = crate::color::oklab_to_linear_rgb(lab);
+        let rgb = crate::color::dithered(
+            [
+                rgb[0].clamp(0.0, 1.0),
+                rgb[1].clamp(0.0, 1.0),
+                rgb[2].clamp(0.0, 1.0),
+            ],
+            pixel[0],
+            pixel[1],
+        );
+        [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha, alpha]
     }
 
     /// `textureSample(atlas_texture, atlas_sampler, uv).r` -- shader line 107.
@@ -230,7 +692,14 @@ fn render_reference(list: &DrawList, atlas: &[u8], atlas_size: u32) -> Surface {
     for batch in &list.batches {
         let range = batch.range.start as usize..batch.range.end as usize;
         for instance in &list.instances[range] {
-            draw_reference_instance(&mut surface, instance, atlas, atlas_size);
+            draw_reference_instance(
+                &mut surface,
+                instance,
+                atlas,
+                atlas_size,
+                list.environment,
+                list.field,
+            );
         }
     }
     surface
@@ -241,7 +710,12 @@ fn draw_reference_instance(
     instance: &Instance,
     atlas: &[u8],
     atlas_size: u32,
+    environment: crate::frame::Environment,
+    field: crate::frame::FieldWash,
 ) {
+    // Straight linear, which is what the shader's `unpremultiply` hands `environment`.
+    let horizon = shader::unpremultiply(environment.horizon.to_premul_linear_f32());
+    let zenith = shader::unpremultiply(environment.zenith.to_premul_linear_f32());
     let [x, y, w, h] = instance.rect;
     // The CPU tier's own early-outs, mirrored so the two tiers agree about *nothing*
     // being drawn as well as about something being drawn.
@@ -249,13 +723,24 @@ fn draw_reference_instance(
         return;
     }
     let color = shader::unpack4x8unorm(instance.color);
-    if color[3] <= 0.0 {
+    // Mirrors `CpuRasterizer::draw_instance`: for a gradient, `color` is only the near
+    // stop, so an invisible one says nothing about the far end. A glow's two stops are the
+    // same field pair and read the same way.
+    let peak_alpha = if instance.kind == shader::KIND_GRADIENT
+        || instance.kind == shader::KIND_GLOW
+        || instance.kind == shader::KIND_SWEEP
+    {
+        color[3].max(instance.uv[3])
+    } else {
+        color[3]
+    };
+    if peak_alpha <= 0.0 {
         return;
     }
 
     let half_size = [w * 0.5, h * 0.5];
     let centre = [x + half_size[0], y + half_size[1]];
-    let pad = shader::quad_pad(instance.kind);
+    let pad = shader::quad_pad(instance.kind, instance.param);
 
     // Which fragments the vertex stage's quad actually generates. Outside it the shader
     // never runs, so neither does this.
@@ -298,13 +783,76 @@ fn draw_reference_instance(
                 )
             };
 
-            // `return in.color * alpha` under `One / OneMinusSrcAlpha`. The colour is
-            // already premultiplied, so scaling the whole vector keeps it that way.
+            // Coverage and colour are separable in `fs_main`: a gradient takes the fill's
+            // coverage and replaces only the tint being covered.
+            let tint = if instance.kind == shader::KIND_GRADIENT {
+                shader::ramp(
+                    color,
+                    instance.uv,
+                    local,
+                    half_size,
+                    instance.param,
+                    [px, py],
+                )
+            } else if instance.kind == shader::KIND_FIELD {
+                let uv01 = [
+                    local[0] / half_size[0].max(1e-4) * 0.5 + 0.5,
+                    local[1] / half_size[1].max(1e-4) * 0.5 + 0.5,
+                ];
+                let aspect = half_size[1] / half_size[0].max(1e-4);
+                shader::field(
+                    color,
+                    uv01,
+                    aspect,
+                    instance.param,
+                    instance.uv[0],
+                    &field,
+                    [px, py],
+                )
+            } else if instance.kind == shader::KIND_SWEEP {
+                shader::ramp_at(
+                    color,
+                    instance.uv,
+                    shader::sweep_t(local, half_size, instance.param),
+                    [px, py],
+                )
+            } else if instance.kind == shader::KIND_GLOW {
+                let distance = shader::fs_distance(local, half_size, instance.radius);
+                shader::halo(color, instance.uv, shader::glow_t(distance, instance.param))
+            } else if instance.kind == shader::KIND_PBR {
+                let radius = instance.radius.clamp(0.0, half_size[0].min(half_size[1]));
+                let distance = shader::fs_distance(local, half_size, instance.radius);
+                let grad = shader::sd_rounded_box_grad(local, half_size, radius);
+                let normal = shader::bevel_normal(distance, grad, instance.uv[0]);
+                let straight = shader::unpremultiply(color);
+                let emissive = instance.param * shader::edge_emission(distance, instance.uv[0]);
+                let lit = shader::shade_pbr(
+                    normal,
+                    straight,
+                    instance.uv[1],
+                    instance.uv[2],
+                    instance.uv[3],
+                    emissive,
+                    horizon,
+                    zenith,
+                );
+                [
+                    lit[0] * color[3],
+                    lit[1] * color[3],
+                    lit[2] * color[3],
+                    color[3],
+                ]
+            } else {
+                color
+            };
+
+            // `return tint * alpha` under `One / OneMinusSrcAlpha`. The colour is already
+            // premultiplied, so scaling the whole vector keeps it that way.
             let src = [
-                color[0] * alpha,
-                color[1] * alpha,
-                color[2] * alpha,
-                color[3] * alpha,
+                tint[0] * alpha,
+                tint[1] * alpha,
+                tint[2] * alpha,
+                tint[3] * alpha,
             ];
             let inv = 1.0 - src[3];
             let dst = surface.pixels[(py * surface.width + px) as usize];
@@ -736,6 +1284,130 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 ink_area: 0.025,
             },
         ],
+        PrimKind::Gradient => {
+            // A wide hue interval on purpose. Two stops of the same hue would agree
+            // between any two interpolation spaces, so a fixture built from them would be
+            // green whether or not the CPU tier walked Oklab at all -- and walking Oklab
+            // is the entire reason this primitive is not a two-instance crossfade.
+            // `the_cpu_tier_walks_the_ramp_in_oklab_and_not_in_linear_srgb` is what makes
+            // that non-vacuous; these measure how *well* it walks it.
+            let steel = Srgba::new(0.145, 0.176, 0.278, 1.0);
+            let cyan = Srgba::new(0.220, 0.792, 0.882, 1.0);
+            let clear_cyan = Srgba::new(0.220, 0.792, 0.882, 0.0);
+            vec![
+                Case {
+                    // The ramp alone: no curvature, no off-grid edge, axis on a cardinal
+                    // direction. It measures **zero** -- the two tiers produce the same
+                    // bytes -- which is what licenses treating the bounds below as
+                    // curvature rather than as the gradient.
+                    //
+                    // It used to be 1, and the 1 was the CPU tier approximating a
+                    // continuous Oklab curve with 33 chords. `prim-noise-dither` deleted
+                    // that approximation, because a dither has to land on the same pixel
+                    // on both tiers and a stop list has nowhere to put one. Tightened here
+                    // rather than left at 1: a bound with slack nobody is using is a bound
+                    // that stops reporting the next regression.
+                    name: "gradient/vertical-sharp",
+                    instance: Instance::gradient(
+                        16.0,
+                        12.0,
+                        32.0,
+                        40.0,
+                        0.0,
+                        std::f32::consts::FRAC_PI_2,
+                        steel,
+                        cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.01,
+                    ink_area: 0.001,
+                },
+                Case {
+                    // The axis alone. A diagonal ramp normalizes t against the box's
+                    // support rather than its half-width, and this is the fixture that
+                    // would catch the two tiers using different normalizations: they
+                    // would put the stops in different places and every interior pixel
+                    // would shift. Still zero, so the axis costs nothing either.
+                    name: "gradient/diagonal-sharp",
+                    instance: Instance::gradient(
+                        12.0,
+                        16.0,
+                        40.0,
+                        32.0,
+                        0.0,
+                        std::f32::consts::FRAC_PI_4,
+                        steel,
+                        cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.01,
+                    ink_area: 0.001,
+                },
+                Case {
+                    // Curvature, on the same footing as `rect/rounded`: a gradient is a
+                    // rect fill with a varying tint, so it inherits that fixture's
+                    // definitional difference between an analytic area and `0.5 - d`, and
+                    // nothing more. Measured 22 of the 24 allowed -- the same 22.
+                    name: "gradient/diagonal-rounded",
+                    instance: Instance::gradient(
+                        10.0,
+                        10.0,
+                        40.0,
+                        32.0,
+                        6.0,
+                        std::f32::consts::FRAC_PI_4,
+                        steel,
+                        cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: CURVATURE,
+                    mean_channel: 0.10,
+                    centroid_shift: 0.01,
+                    ink_area: 0.002,
+                },
+                Case {
+                    // A stop that fades to nothing, sharp-edged so the measurement is
+                    // about alpha and not about corners. This used to be the case where the
+                    // two tiers could genuinely part company for a reason the others could
+                    // not see: the shader interpolates straight colour and re-premultiplies,
+                    // while `tiny-skia` interpolated between stops it had already
+                    // premultiplied, and the two orders differ. It measured 1 across a broad
+                    // region -- a whole area a least-significant bit out, rather than a few
+                    // corner pixels out by twenty -- which is why `max_channel` and not
+                    // `mean_channel` was the bound carrying it.
+                    //
+                    // Evaluating the ramp per pixel removed the second order entirely, so
+                    // there is now nothing here for a bound to hold: both sides do the same
+                    // arithmetic in the same sequence and produce the same bytes.
+                    name: "gradient/fade-out-sharp",
+                    instance: Instance::gradient(
+                        12.0, 16.0, 36.0, 28.0, 0.0, 0.0, cyan, clear_cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.02,
+                    ink_area: 0.002,
+                },
+                Case {
+                    // Both at once, which is the shape a real wash takes. Bounded by
+                    // curvature, as the sum of the two isolations predicts.
+                    name: "gradient/fade-out-rounded",
+                    instance: Instance::gradient(
+                        12.0, 16.0, 36.0, 28.0, 4.0, 0.0, cyan, clear_cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: CURVATURE,
+                    mean_channel: 0.10,
+                    centroid_shift: 0.02,
+                    ink_area: 0.002,
+                },
+            ]
+        }
         PrimKind::Glyph => vec![
             Case {
                 // An integer-aligned quad, which is the only kind the pipeline emits: the
@@ -776,6 +1448,271 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 mean_channel: 0.01,
                 centroid_shift: 0.01,
                 ink_area: 0.001,
+            },
+        ],
+        // A `Fidelity::Enhanced` kind, so `run_kind` asks these fixtures the floor
+        // question rather than the parity one: does the CPU tier draw *nothing*. The four
+        // tolerance fields below are therefore unread, and they are set to the tightest
+        // values in the file rather than to something arbitrary -- if the fidelity
+        // declaration is ever relaxed to `Exact`, these become live bounds that fail loudly
+        // instead of a set of numbers nobody chose quietly passing.
+        //
+        // What the floor check cannot see is whether the *GPU* side draws anything at all:
+        // a shader branch that returned zero would satisfy every assertion here. That is
+        // what `a_glow_reaches_beyond_its_shape_and_fades_to_nothing` and the two tests
+        // beside it are for.
+        PrimKind::Glow => vec![
+            Case {
+                name: "glow/rounded",
+                instance: Instance::glow(20.0, 22.0, 24.0, 20.0, 6.0, 8.0, white),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Two-tone, and translucent at both ends: the form a material will reach
+                // for, and the one where a floor of `Nothing` could be satisfied by
+                // accident if the rasterizer merely rounded a faint halo away. It does not
+                // -- `cpu_floor` drops the instance before `tiny-skia` is reached -- but
+                // the fixture is what says so.
+                name: "glow/two-tone",
+                instance: Instance::glow_two_tone(
+                    14.0,
+                    18.0,
+                    36.0,
+                    28.0,
+                    10.0,
+                    12.0,
+                    Srgba::new(0.35, 0.72, 1.0, 0.55),
+                    Srgba::new(0.60, 0.30, 1.0, 0.10),
+                ),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
+        // The third `Enhanced` kind and the first floored at a primitive rather than at
+        // absence: unlit, a surface is its albedo. The tolerance fields are unread while the
+        // declaration says `Enhanced`, and set tightest-in-file for the reason the glow's are.
+        PrimKind::Pbr => vec![
+            Case {
+                name: "pbr/dielectric",
+                instance: Instance::pbr(
+                    20.0, 22.0, 24.0, 20.0, 6.0, 5.0, 0.35, 0.0, 1.0, 0.0, white,
+                ),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Metal, and translucent: the form where a floor of `Plain(Rect)` could be
+                // satisfied by accident if `cpu_floor` let `uv` through -- a bevel read as a
+                // stroke width, or a roughness read as an angle, would still draw something.
+                name: "pbr/metal-translucent",
+                instance: Instance::pbr(
+                    14.0,
+                    18.0,
+                    36.0,
+                    28.0,
+                    10.0,
+                    8.0,
+                    0.18,
+                    1.0,
+                    0.8,
+                    0.0,
+                    Srgba::new(0.90, 0.72, 0.36, 0.6),
+                ),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
+        // Enhanced too, and floored at `Nothing` for a different reason than the glow --
+        // `PrimKind::fidelity` records it. The same note applies about the four tolerance
+        // fields: unread while the declaration says `Enhanced`, tightest-in-file so that
+        // relaxing it to `Exact` fails loudly rather than passing on numbers nobody chose.
+        //
+        // And the same hole applies: nothing here can see whether the GPU side draws
+        // anything at all. `a_rim_is_brightest_inside_its_own_edge_and_gone_by_its_width`
+        // and the two tests beside it are that half.
+        PrimKind::Rim => vec![
+            Case {
+                name: "rim/rounded",
+                instance: Instance::rim(20.0, 22.0, 24.0, 20.0, 6.0, RIM_WIDTH, white),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Translucent, and wide enough that the ramp reaches well into the shape:
+                // the form a material actually authors, and the one where a floor of
+                // `Nothing` could be satisfied by accident if the rasterizer merely rounded
+                // a faint edge light away. It does not -- `cpu_floor` drops the instance
+                // before `tiny-skia` is reached -- but the fixture is what says so.
+                name: "rim/wide-translucent",
+                instance: Instance::rim(
+                    14.0,
+                    18.0,
+                    36.0,
+                    28.0,
+                    10.0,
+                    9.0,
+                    Srgba::new(0.85, 0.92, 1.0, 0.30),
+                ),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
+        // `Exact`, and the only primitive on this list that looks enhanced and is not.
+        // The bounds are the gradient's, because a sweep *is* the gradient with a different
+        // parameter: the same two stops, the same Oklab walk, the same dither, the same
+        // `0.5 - d` coverage. Both tiers run the same arithmetic in the same order, so the
+        // sharp cases measure zero and the rounded one is bounded by curvature alone --
+        // exactly as `gradient/diagonal-rounded` is, and for the same reason.
+        //
+        // What no fixture here can see is the seam, because the seam is a property of the
+        // *parameter* and both sides compute it identically: two tiers agreeing on a hue step
+        // would measure zero. `a_sweep_has_no_seam_where_the_angle_wraps` is that half.
+        PrimKind::Sweep => {
+            // The same wide hue interval the gradient fixtures use, and for the same reason:
+            // two stops of one hue would agree between any two interpolation spaces.
+            let steel = Srgba::new(0.145, 0.176, 0.278, 1.0);
+            let cyan = Srgba::new(0.220, 0.792, 0.882, 1.0);
+            let clear_cyan = Srgba::new(0.220, 0.792, 0.882, 0.0);
+            vec![
+                Case {
+                    // Square and sharp-edged, phase at zero: the angular parameter alone,
+                    // with no curvature and no aspect normalization in play.
+                    name: "sweep/square-sharp",
+                    instance: Instance::sweep(16.0, 16.0, 32.0, 32.0, 0.0, 0.0, steel, cyan),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.01,
+                    ink_area: 0.001,
+                },
+                Case {
+                    // Wide, and phased a third of a turn off. The aspect is what makes this
+                    // fixture worth having: the angle is taken in the shape's normalized
+                    // space, so a tier that forgot to divide by `half_size` would bunch the
+                    // whole ramp onto the two short sides and every interior pixel would move.
+                    name: "sweep/wide-phased",
+                    instance: Instance::sweep(
+                        8.0,
+                        20.0,
+                        48.0,
+                        24.0,
+                        0.0,
+                        std::f32::consts::TAU / 3.0,
+                        steel,
+                        cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.01,
+                    ink_area: 0.001,
+                },
+                Case {
+                    // Curvature, on the same footing as `gradient/diagonal-rounded`: a sweep
+                    // is a rect fill with a varying tint and inherits that fixture's
+                    // definitional difference between an analytic area and `0.5 - d`.
+                    //
+                    // Deliberately the *same* geometry as that fixture, down to the radius.
+                    // `CURVATURE` is documented as measured on the quarter-aligned rounded
+                    // fixtures, so it is a bound for that geometry class and not a general
+                    // allowance; a fatter radius measured 25 against it here, which is a
+                    // fixture outside the class rather than a regression, and would have
+                    // needed its own derived bound rather than a widened shared one.
+                    name: "sweep/rounded",
+                    instance: Instance::sweep(
+                        10.0,
+                        10.0,
+                        40.0,
+                        32.0,
+                        6.0,
+                        std::f32::consts::FRAC_PI_4,
+                        steel,
+                        cyan,
+                    ),
+                    uploads: Vec::new(),
+                    max_channel: CURVATURE,
+                    mean_channel: 0.10,
+                    centroid_shift: 0.01,
+                    ink_area: 0.002,
+                },
+                Case {
+                    // A stop that fades to nothing, which is the form a travelling highlight
+                    // over an existing surface actually takes: the ramp has to be walked in
+                    // straight colour and re-premultiplied on both tiers, or the fade drags
+                    // its hue toward black on one of them.
+                    name: "sweep/fade-out-sharp",
+                    instance: Instance::sweep(14.0, 18.0, 36.0, 28.0, 0.0, 0.0, cyan, clear_cyan),
+                    uploads: Vec::new(),
+                    max_channel: 0,
+                    mean_channel: 0.0001,
+                    centroid_shift: 0.02,
+                    ink_area: 0.002,
+                },
+            ]
+        }
+        // `Enhanced`, floored at the base colour. The four tolerance fields are unread while
+        // the declaration says `Enhanced` -- `run_kind` asks `assert_floor` instead -- and are
+        // set tightest-in-file for the reason the glow's are: relaxing the declaration to
+        // `Exact` should fail loudly rather than pass on numbers nobody chose.
+        //
+        // The floor question is the sharp one for this primitive, and sharper than it was for
+        // the halo. A field converges to its base wherever no centre reaches, so a rasterizer
+        // that drew the *base* and called it the field would satisfy a careless check. What
+        // `assert_floor` actually holds is that the CPU tier draws the floor **exactly**, and
+        // the fixtures below put centres right in the middle of the shape so that "exactly the
+        // base" is a claim with something to be wrong about.
+        //
+        // What no fixture here can see is whether the GPU side draws a field at all, since
+        // both sides of a floor check are the same rasterizer. The four tests below the
+        // fixtures are that half.
+        PrimKind::Field => vec![
+            Case {
+                name: "field/full-viewport",
+                instance: Instance::field(0.0, 0.0, 64.0, 64.0, 0.6, 0.0, white),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Off-square and phased, which is the form a real window takes: the aspect
+                // correction and the drift both have to end up in the floor's *absence*
+                // rather than in a differently-wrong rectangle.
+                name: "field/wide-phased",
+                instance: Instance::field(
+                    6.0,
+                    10.0,
+                    52.0,
+                    28.0,
+                    1.0,
+                    std::f32::consts::FRAC_PI_3,
+                    Srgba::new(0.10, 0.11, 0.14, 1.0),
+                ),
+                uploads: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
             },
         ],
     }
@@ -870,9 +1807,73 @@ fn assert_parity(case: &Case) {
     );
 }
 
+// -- the floor comparison ---------------------------------------------------------------
+
+/// The CPU tier's pixels for a draw list, as raw linear premultiplied bytes.
+///
+/// Bytes rather than a [`Divergence`]: the floor comparison has no tolerance to spend, so
+/// there is nothing to measure. Both sides come out of the same rasterizer, and the only
+/// interesting answer is whether they are the same.
+fn cpu_pixels(instances: &[Instance], uploads: &[PendingUpload]) -> Vec<u8> {
+    let mut cpu = CpuRasterizer::new(SURFACE, SURFACE, ATLAS).unwrap();
+    cpu.upload_glyphs(uploads);
+
+    let mut list = DrawList::default();
+    list.reset([SURFACE, SURFACE], Srgba::TRANSPARENT, 1);
+    list.instances.extend_from_slice(instances);
+    list.end_batch(None, !uploads.is_empty());
+    cpu.render(&list).data().to_vec()
+}
+
+/// Whether the CPU tier drew `instance` as `floor` says it should have.
+///
+/// The rewrite below restates [`Instance::cpu_floor`]'s rule rather than calling it, for the
+/// same reason the `shader` module above restates `instance.wgsl` rather than linking
+/// against it: a check that calls the thing it is checking is a check that agrees with any
+/// answer. Stated here, a floor that quietly started carrying `param` through would show up
+/// as a failure rather than as two functions changing together.
+///
+/// A predicate rather than an assertion because the guards on it need to watch it say
+/// *false*. With every `PrimKind` currently [`Fidelity::Exact`], a declaration that is wrong
+/// on purpose is the only way to show this check can go red at all.
+fn cpu_output_is_the_floor(instance: &Instance, floor: Floor, uploads: &[PendingUpload]) -> bool {
+    let drawn = cpu_pixels(std::slice::from_ref(instance), uploads);
+    let expected = match floor {
+        Floor::Nothing => cpu_pixels(&[], uploads),
+        Floor::Plain(kind) => cpu_pixels(
+            &[Instance {
+                uv: [0.0; 4],
+                param: 0.0,
+                kind: kind as u32,
+                ..*instance
+            }],
+            uploads,
+        ),
+    };
+    drawn == expected
+}
+
+#[track_caller]
+fn assert_floor(case: &Case, floor: Floor) {
+    assert!(
+        cpu_output_is_the_floor(&case.instance, floor, &case.uploads),
+        "{}: the CPU tier drew something other than the {floor:?} its PrimKind declares. \
+         The fallback tier's appearance is a design decision, and this assertion is what \
+         keeps it one instead of whatever the rasterizer happened to do with an effect it \
+         could not draw",
+        case.name
+    );
+}
+
 fn run_kind(kind: PrimKind) {
     for case in &cases_for(kind) {
-        assert_parity(case);
+        // The fixture list is the same length either way -- what changes is the question.
+        // An enhanced primitive needs a *different* fixture, not fewer of them, which is
+        // what `no_prim_kind_can_ship_without_a_parity_test` holds every kind to.
+        match kind.fidelity() {
+            Fidelity::Exact => assert_parity(case),
+            Fidelity::Enhanced { floor } => assert_floor(case, floor),
+        }
     }
 }
 
@@ -891,6 +1892,490 @@ fn stroke_agrees_across_tiers() {
 #[test]
 fn glyph_agrees_across_tiers() {
     run_kind(PrimKind::Glyph);
+}
+
+#[test]
+fn gradient_agrees_across_tiers() {
+    run_kind(PrimKind::Gradient);
+}
+
+#[test]
+fn sweep_agrees_across_tiers() {
+    run_kind(PrimKind::Sweep);
+}
+
+#[test]
+fn field_stays_at_its_floor_on_the_cpu_tier() {
+    run_kind(PrimKind::Field);
+}
+
+/// A field of one centre, dead centre, reaching a quarter of the width.
+fn fixture_field(tint: Srgba) -> crate::frame::FieldWash {
+    crate::frame::FieldWash::new(&[crate::frame::FieldCentre {
+        at: [0.5, 0.5],
+        drift: [0.0, 0.0],
+        reach: 0.25,
+        phase: 0.0,
+        tint,
+    }])
+}
+
+/// The reference tier's pixels for one field instance under one wash.
+fn field_pixels(instance: Instance, field: crate::frame::FieldWash) -> Surface {
+    let mut list = DrawList::default();
+    list.reset([SURFACE, SURFACE], Srgba::TRANSPARENT, 1);
+    list.set_field(field);
+    list.instances.push(instance);
+    list.end_batch(None, false);
+    render_reference(
+        &list,
+        &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
+        ATLAS,
+    )
+}
+
+#[test]
+fn a_centre_reaches_its_limit_and_stops() {
+    // The property the whole cost argument rests on: bounded support. A tail that merely got
+    // small would still be four evaluations per fragment, and the claim that a full-viewport
+    // pass is affordable would be resting on nothing.
+    let base = Srgba::new(0.10, 0.10, 0.13, 1.0);
+    let tint = Srgba::new(0.30, 0.62, 0.95, 1.0);
+    let field = fixture_field(tint);
+    let surface = field_pixels(
+        Instance::field(0.0, 0.0, SURFACE as f32, SURFACE as f32, 1.0, 0.0, base),
+        field,
+    );
+
+    let mid = SURFACE / 2;
+    let centre = surface.at(mid, mid);
+    // A quarter of the width, from the middle: the reach lands here.
+    let limit = mid + SURFACE / 4;
+
+    let base_linear = base.to_premul_linear_f32();
+    let differs = |p: [f32; 4]| -> f32 {
+        (0..3)
+            .map(|i| (p[i] - base_linear[i]).abs())
+            .fold(0.0_f32, f32::max)
+    };
+
+    assert!(
+        differs(centre) > 0.05,
+        "the centre did not tint the ground at all: {centre:?}"
+    );
+    // Past the reach the field is the base *exactly*, up to the dither's own half-level.
+    for x in (limit + 2)..SURFACE {
+        let p = surface.at(x, mid);
+        assert!(
+            differs(p) <= 2.0 / 255.0,
+            "the centre is still tinting at x={x}, which is past its reach: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn the_phase_carries_the_centres_across_the_window() {
+    // A field that did not drift would satisfy every floor fixture above, because the floor
+    // is the base either way. This is what says the phase reaches the centres.
+    let base = Srgba::new(0.10, 0.10, 0.13, 1.0);
+    let tint = Srgba::new(0.30, 0.62, 0.95, 1.0);
+    let drifting = crate::frame::FieldWash::new(&[crate::frame::FieldCentre {
+        at: [0.5, 0.5],
+        drift: [0.30, 0.0],
+        reach: 0.25,
+        phase: 0.0,
+        tint,
+    }]);
+
+    let brightest_column = |phase: f32| -> u32 {
+        let surface = field_pixels(
+            Instance::field(0.0, 0.0, SURFACE as f32, SURFACE as f32, 1.0, phase, base),
+            drifting,
+        );
+        let row = SURFACE / 2;
+        (0..SURFACE)
+            .max_by(|a, b| {
+                let at = |x: u32| surface.at(x, row)[2];
+                at(*a)
+                    .partial_cmp(&at(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0)
+    };
+
+    // At phase 0 the drift term is `cos(0) = +1`, so the centre sits right of the middle; half
+    // a turn later `cos(PI) = -1` puts it left of it. Asserting the *sides* rather than a
+    // distance keeps this about the direction the phase carries a centre, which is the part a
+    // sign error gets wrong.
+    let at_rest = brightest_column(0.0);
+    let half_turn = brightest_column(std::f32::consts::PI);
+    assert!(
+        at_rest > SURFACE / 2,
+        "at phase zero the centre is not right of the middle: {at_rest}"
+    );
+    assert!(
+        half_turn < SURFACE / 2,
+        "half a turn later the centre is not left of the middle: {half_turn}"
+    );
+}
+
+#[test]
+fn the_worst_colour_a_field_reaches_is_one_of_its_own_centres() {
+    // The claim the contrast gate rests on, and the reason it is measured here rather than
+    // argued in a comment.
+    //
+    // `Material::composites` checks each centre's tint at full amplitude over the base. It
+    // does NOT check the Oklab blend of two overlapping centres, because there are infinitely
+    // many of those. The argument is that Oklab's L is monotone in luminance, so a weighted
+    // mean of two centres has a luminance between theirs and cannot be darker than the darker
+    // one or lighter than the lighter one -- so the extremes the gate checks bracket every
+    // blend the shader can produce.
+    //
+    // This walks the weight simplex densely and checks that. A blend that escaped the bracket
+    // would be a surface the gate measured and the renderer then exceeded, which is the exact
+    // shape of failure the whole `over`/`text` machinery exists to prevent.
+    use crate::color::{linear_rgb_to_oklab, oklab_to_linear_rgb};
+
+    let tints = [
+        Srgba::new(0.30, 0.62, 0.95, 1.0),
+        Srgba::new(0.86, 0.42, 0.31, 1.0),
+        Srgba::new(0.36, 0.80, 0.55, 1.0),
+        Srgba::new(0.68, 0.44, 0.90, 1.0),
+    ];
+    // Relative luminance on colour that is ALREADY linear, which is what the shader is
+    // holding at this point. `Srgba::relative_luminance` applies the sRGB decode first, so
+    // handing it a linear value would decode it twice -- the weights are the shared part.
+    let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+
+    let labs: Vec<[f32; 3]> = tints
+        .iter()
+        .map(|t| {
+            let p = t.to_premul_linear_f32();
+            linear_rgb_to_oklab(shader::unpremultiply(p))
+        })
+        .collect();
+    let ends: Vec<f32> = tints
+        .iter()
+        .map(|t| {
+            let p = t.to_premul_linear_f32();
+            luminance([p[0], p[1], p[2]])
+        })
+        .collect();
+    let (lo, hi) = ends
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+
+    // Every combination of integer weights summing to 12 over four centres: 455 blends,
+    // including every pair, triple and the even mix.
+    const STEPS: i32 = 12;
+    let mut checked = 0;
+    for a in 0..=STEPS {
+        for b in 0..=(STEPS - a) {
+            for c in 0..=(STEPS - a - b) {
+                let d = STEPS - a - b - c;
+                let w = [a, b, c, d].map(|n| n as f32 / STEPS as f32);
+                let mut lab = [0.0_f32; 3];
+                for (centre, weight) in labs.iter().zip(w) {
+                    for (slot, channel) in lab.iter_mut().zip(centre) {
+                        *slot += channel * weight;
+                    }
+                }
+                let rgb = oklab_to_linear_rgb(lab);
+                let y = luminance([
+                    rgb[0].clamp(0.0, 1.0),
+                    rgb[1].clamp(0.0, 1.0),
+                    rgb[2].clamp(0.0, 1.0),
+                ]);
+                assert!(
+                    y >= lo - 1e-3 && y <= hi + 1e-3,
+                    "the blend at weights {w:?} has luminance {y}, outside the [{lo}, {hi}] \
+                     the gate checks -- the contrast gate would be measuring a surface the \
+                     renderer can exceed"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(
+        checked, 455,
+        "the simplex walk did not cover what it claims"
+    );
+}
+
+#[test]
+fn the_shader_draws_a_field_and_not_only_the_transcription() {
+    // Both sides of a floor fixture are the same rasterizer, so nothing above can see whether
+    // the GPU tiers grew the branch at all. Same shape of check as the sweep's and the rim's.
+    let source = include_str!("shaders/instance.wgsl");
+    let fs_main = source
+        .split_once("fn fs_main")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        fs_main.contains("KIND_FIELD") && fs_main.contains("field("),
+        "instance.wgsl's fragment stage has no KIND_FIELD branch, so nothing on the GPU tiers \
+         draws the ground however green the transcription is"
+    );
+    for needed in [
+        "fn field_weight",
+        "fn field(",
+        "field_place",
+        "field_tint",
+        "field_form",
+    ] {
+        assert!(
+            source.contains(needed),
+            "instance.wgsl is missing `{needed}`, so the field is not reading the scene"
+        );
+    }
+    // The dither reaches the field. This is the largest surface in the window and the interval
+    // it moves across is a handful of 8-bit levels, so an undithered field bands -- which is
+    // the one artefact here that is visible from across a room.
+    let body = source
+        .split_once("fn field(")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(body, _)| body)
+        .unwrap_or_default();
+    assert!(
+        body.contains("dithered("),
+        "the field does not dither, and a full-window ramp at 8 bits bands"
+    );
+}
+
+#[test]
+fn a_sweep_has_no_seam_where_the_angle_wraps() {
+    // The defect this primitive is not allowed to ship with, and the one no parity fixture
+    // can see: both tiers compute the parameter the same way, so two tiers agreeing on a hue
+    // step would measure zero divergence and the suite would stay green over a visible line
+    // down the middle of every swept surface.
+    //
+    // So this measures the parameter directly. Walk a full turn at a fine step and assert
+    // that no adjacent pair moves further than a step's worth of the ramp. The mirrored form
+    // has slope 2 in turns, so a step of `1/STEPS` of a turn can move `t` by at most
+    // `2 / STEPS`; a raw `fract` would jump the whole way from 1 to 0 in one step, which is
+    // `STEPS / 2` times the bound and cannot hide inside any tolerance worth writing.
+    const STEPS: usize = 2048;
+    let half = [1.0_f32, 1.0];
+    let bound = 2.0 / STEPS as f32 + 1e-5;
+
+    for phase in [0.0_f32, 0.7, -1.9, std::f32::consts::PI] {
+        let mut previous = None;
+        // Start at the wrap itself (-PI) so the discontinuity is inside the walk rather than
+        // at one end of it, where a comparison against the next sample would never happen.
+        for i in 0..=STEPS {
+            let angle = -std::f32::consts::PI + std::f32::consts::TAU * (i as f32 / STEPS as f32);
+            let local = [angle.cos(), angle.sin()];
+            let t = shader::sweep_t(local, half, phase);
+            assert!(
+                (0.0..=1.0).contains(&t),
+                "t left the ramp at angle {angle} phase {phase}: {t}"
+            );
+            if let Some(previous) = previous {
+                let step: f32 = t - previous;
+                assert!(
+                    step.abs() <= bound,
+                    "the sweep stepped {step} at angle {angle} phase {phase}, which is a hue \
+                     seam and not a ramp; the bound is {bound}"
+                );
+            }
+            previous = Some(t);
+        }
+    }
+
+    // And the wrap closes: one full turn returns to where it started, so the seam is absent
+    // rather than merely small.
+    for phase in [0.0_f32, 0.7, -1.9] {
+        let at = |angle: f32| shader::sweep_t([angle.cos(), angle.sin()], half, phase);
+        assert!(
+            (at(-std::f32::consts::PI) - at(std::f32::consts::PI)).abs() <= 1e-4,
+            "the two sides of the wrap disagree at phase {phase}"
+        );
+    }
+}
+
+#[test]
+fn the_phase_carries_the_highlight_around_the_shape() {
+    // What the primitive is *for*: the far stop travels with the phase rather than the shape
+    // being re-tinted in place. A sweep whose phase did nothing would satisfy every parity
+    // fixture above, because both tiers would draw the same still picture.
+    let half = [1.0_f32, 1.0];
+    let at = |angle: f32, phase: f32| shader::sweep_t([angle.cos(), angle.sin()], half, phase);
+
+    // At phase zero the far stop is at +x, and it is *the* far stop: t = 1 there and nowhere
+    // else on the turn.
+    assert!(
+        (at(0.0, 0.0) - 1.0).abs() <= 1e-5,
+        "the highlight is not at +x"
+    );
+    assert!(
+        at(std::f32::consts::PI, 0.0) <= 1e-5,
+        "the near stop is not opposite it"
+    );
+
+    // A quarter turn of phase moves the peak a quarter turn, in the same sense a gradient's
+    // angle turns its axis: through +y, which on this surface is downward.
+    let quarter = std::f32::consts::FRAC_PI_2;
+    assert!(
+        (at(quarter, quarter) - 1.0).abs() <= 1e-5,
+        "a quarter turn of phase did not move the highlight a quarter turn"
+    );
+    // And +x is now a quarter of a turn from the peak, which on a mirrored ramp is exactly
+    // the midpoint between the two stops. Asserting the exact value rather than "less than
+    // the peak": a sweep that merely dimmed everywhere would also be less than the peak.
+    assert!(
+        (at(0.0, quarter) - 0.5).abs() <= 1e-5,
+        "+x is not the ramp's midpoint a quarter turn after the highlight left it: {}",
+        at(0.0, quarter)
+    );
+}
+
+#[test]
+fn the_shader_sweeps_and_not_only_the_transcription() {
+    // The half `run_kind` cannot see: both sides of a parity fixture are Rust, so a shader
+    // that never grew the branch would still measure zero. Same shape of check as
+    // `the_shader_lights_the_inside_of_an_edge_and_not_only_the_transcription`.
+    let source = include_str!("shaders/instance.wgsl");
+    let fs_main = source
+        .split_once("fn fs_main")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        fs_main.contains("KIND_SWEEP") && fs_main.contains("sweep_t"),
+        "instance.wgsl's fragment stage has no KIND_SWEEP branch, so nothing on the GPU tiers \
+         draws a sweep however green the transcription is"
+    );
+    assert!(
+        source.contains("fn sweep_t") && source.contains("atan2"),
+        "the shader has no angular parameter"
+    );
+    // The shared helper, which is the acceptance criterion that a second ramp did not grow.
+    assert!(
+        source.contains("fn ramp_at"),
+        "instance.wgsl has no shared ramp_at, so the sweep and the gradient are two copies of \
+         the same Oklab walk"
+    );
+    let sweep_arm = fs_main
+        .split_once("KIND_SWEEP")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        sweep_arm
+            .split_once("else if")
+            .map(|(arm, _)| arm)
+            .unwrap_or(sweep_arm)
+            .contains("ramp_at"),
+        "the sweep branch does not walk the shared ramp"
+    );
+}
+
+/// The colour the CPU tier actually put at one pixel, back in straight sRGB.
+fn sampled_srgb(pixmap: &Pixmap, x: u32, y: u32) -> Srgba {
+    let p = pixmap.pixels()[(y * pixmap.width() + x) as usize];
+    let a = f32::from(p.alpha()) / 255.0;
+    let channel = |c: u8| -> f32 {
+        let linear = f32::from(c) / 255.0;
+        crate::color::linear_to_srgb(if a > 0.0 {
+            (linear / a).clamp(0.0, 1.0)
+        } else {
+            0.0
+        })
+    };
+    Srgba::new(channel(p.red()), channel(p.green()), channel(p.blue()), a)
+}
+
+#[test]
+fn the_ramp_is_walked_in_oklab_and_not_in_linear_srgb() {
+    // The one thing the parity fixtures structurally cannot check.
+    //
+    // Every `gradient/*` case above compares the CPU tier against a transcription of the
+    // shader. If both sides lerped in linear sRGB they would agree exactly and every
+    // fixture would be green -- so parity is evidence that the two tiers do the same
+    // thing, and no evidence at all about *which* thing. chunk:oklch-color-ramps put the
+    // palette in a perceptual space precisely so a ramp between two stops keeps its
+    // chroma; a linear-sRGB lerp between the same two stops sags toward grey in the
+    // middle while both endpoints stay correct, which is the failure that ships.
+    //
+    // The property being asserted is the one that *defines* a perceptual space: the
+    // midpoint of the ramp is the perceptual midpoint of its endpoints, so `l` at the
+    // centre is the mean of the two `l`s. A linear-light lerp has no such property --
+    // averaging light rather than lightness, it reaches the bright end early and spends
+    // most of the ramp's length near the top, which collapses the dark half of the
+    // gradient into a narrow band.
+    //
+    // My first attempt asserted the wrong thing: that the Oklab midpoint would be *more*
+    // chromatic, on the strength of the usual "blue to yellow goes through grey" story.
+    // That story is about interpolating in *gamma-encoded* sRGB. In linear light the
+    // midpoint of these two stops measures c = 0.103 against Oklab's 0.055 -- more
+    // colourful, not less, because it is also much lighter. Left here because the bounds
+    // below are the second attempt and the first one looked just as plausible.
+    let from = Srgba::new(0.145, 0.176, 0.278, 1.0); // deep steel blue
+    let to = Srgba::new(0.925, 0.706, 0.196, 1.0); // amber
+    let (x, y, w, h) = (8.0_f32, 8.0_f32, 48.0_f32, 24.0_f32);
+
+    let mut cpu = CpuRasterizer::new(SURFACE, SURFACE, ATLAS).unwrap();
+    let mut list = DrawList::default();
+    list.reset([SURFACE, SURFACE], Srgba::TRANSPARENT, 1);
+    list.instances
+        .push(Instance::gradient(x, y, w, h, 0.0, 0.0, from, to));
+    list.end_batch(None, false);
+    let measured = sampled_srgb(
+        cpu.render(&list),
+        (x + w * 0.5) as u32,
+        (y + h * 0.5) as u32,
+    );
+
+    // The midpoint a linear-light lerp would have produced, which is what the shader would
+    // do if `ramp` simply mixed the two premultiplied colours.
+    let lerp = |a: f32, b: f32| crate::color::linear_to_srgb((a + b) * 0.5);
+    let muddy = Srgba::new(
+        lerp(
+            crate::color::srgb_to_linear(from.r),
+            crate::color::srgb_to_linear(to.r),
+        ),
+        lerp(
+            crate::color::srgb_to_linear(from.g),
+            crate::color::srgb_to_linear(to.g),
+        ),
+        lerp(
+            crate::color::srgb_to_linear(from.b),
+            crate::color::srgb_to_linear(to.b),
+        ),
+        1.0,
+    );
+
+    let got = measured.to_oklch();
+    let linear = muddy.to_oklch();
+    let perceptual_mid = (from.to_oklch().l + to.to_oklch().l) * 0.5;
+    eprintln!(
+        "ramp midpoint: measured l={:.3} c={:.3} / linear-sRGB l={:.3} c={:.3} / \
+         perceptual mid l={:.3}",
+        got.l, got.c, linear.l, linear.c, perceptual_mid
+    );
+
+    // Guard the guard first. For two stops of similar lightness the two spaces agree at
+    // the midpoint, and this fixture would then be green on a ramp that never touched
+    // Oklab. The stops are far apart in lightness on purpose, and this is what refuses to
+    // let a later edit quietly bring them together.
+    assert!(
+        (linear.l - perceptual_mid).abs() > 0.05,
+        "a linear-light lerp landed within {:.4} of the perceptual midpoint, so these two \
+         stops cannot tell the two spaces apart and this fixture is proving nothing",
+        (linear.l - perceptual_mid).abs()
+    );
+
+    // 0.012 is the 8-bit sampling floor, not a tolerance for being slightly wrong: the
+    // pixel is read back through a linear premultiplied RGBA8 pixmap, and one step there
+    // is worth roughly 0.004 of OKLCH `l` in this range. The linear-light answer misses by
+    // 0.088, seven times the bound.
+    assert!(
+        (got.l - perceptual_mid).abs() < 0.012,
+        "the ramp's midpoint measured l={:.4} where the perceptual midpoint of its two \
+         stops is {:.4}. A ramp walked in Oklab lands on that number by construction; the \
+         linear-light lerp lands on {:.4} instead",
+        got.l,
+        perceptual_mid,
+        linear.l
+    );
 }
 
 #[test]
@@ -953,16 +2438,809 @@ fn the_cpu_tier_resolves_an_edge_to_a_quarter_of_a_pixel() {
     );
 }
 
+/// A white instance, for the floor checks below. Opaque on purpose: a faint one could
+/// satisfy a `Nothing` floor by rounding to zero and the guard would prove nothing.
+fn floor_probe(kind_of: impl Fn(Srgba) -> Instance) -> Instance {
+    kind_of(Srgba::new(1.0, 1.0, 1.0, 1.0))
+}
+
+#[test]
+fn the_floor_check_fails_when_the_cpu_tier_draws_more_than_its_floor() {
+    // The mutation check for the fidelity route, and the reason `Enhanced` is a contract
+    // rather than a permission slip.
+    //
+    // The failure it stands in for is concrete and well-meant: someone adds a glow to the
+    // CPU tier as a hard rounded rect, or as a stack of translucent rings, because a halo
+    // that vanishes on the fallback tier looks like a missing feature. The declared floor
+    // said `Nothing`, and this is what notices.
+    //
+    // Both directions of wrong are covered. Drawing *something* where the floor says
+    // nothing, and drawing the wrong *primitive* where the floor names one -- a ring is
+    // not a fill, and a check that only compared "is there ink" would pass it.
+    let solid = floor_probe(|c| Instance::rect(16.0, 20.0, 32.0, 24.0, 4.0, c));
+    assert!(
+        !cpu_output_is_the_floor(&solid, Floor::Nothing, &[]),
+        "a rect the CPU tier plainly draws was accepted against a floor of Nothing: the \
+         floor check cannot fail, so it is not checking anything"
+    );
+
+    let ring = floor_probe(|c| Instance::stroke(10.0, 10.0, 20.0, 20.0, 0.0, 2.0, c));
+    assert!(
+        !cpu_output_is_the_floor(&ring, Floor::Plain(PrimKind::Rect), &[]),
+        "a 2px ring was accepted as a filled rect: the floor check is comparing something \
+         weaker than the pixels"
+    );
+}
+
+#[test]
+fn the_floor_check_passes_when_the_cpu_tier_draws_exactly_its_floor() {
+    // The other half of the mutation pair. A check that can only fail is as useless as one
+    // that can only pass, and this is the one that would catch `cpu_pixels` rendering two
+    // different surfaces for reasons that have nothing to do with fidelity -- a stray
+    // atlas upload, a clear colour that drifted, an uninitialised pixmap.
+    let solid = floor_probe(|c| Instance::rect(16.0, 20.0, 32.0, 24.0, 4.0, c));
+    assert!(
+        cpu_output_is_the_floor(&solid, Floor::Plain(PrimKind::Rect), &[]),
+        "a rect was rejected as its own floor"
+    );
+
+    // A primitive that genuinely draws nothing satisfies a floor of nothing. This is the
+    // shape a real `Enhanced` kind takes on this tier once `cpu_floor` has dropped it.
+    let invisible = Instance::rect(16.0, 20.0, 32.0, 24.0, 4.0, Srgba::TRANSPARENT);
+    assert!(
+        cpu_output_is_the_floor(&invisible, Floor::Nothing, &[]),
+        "an instance that laid down no ink was rejected against a floor of Nothing"
+    );
+}
+
+// -- the glow's own geometry --------------------------------------------------------------
+//
+// Everything above this line compares two tiers. A glow has only one tier, so the floor
+// check says the CPU side draws nothing and *nothing at all* says the GPU side draws
+// something. These four tests are that half: they hold the reference -- the transcription of
+// `instance.wgsl` that the whole suite is built on -- to the halo the design asked for.
+
+/// The reference tier's pixels for one instance, alone on the fixture surface.
+fn reference_pixels(instance: Instance) -> Surface {
+    let mut list = DrawList::default();
+    list.reset([SURFACE, SURFACE], Srgba::TRANSPARENT, 1);
+    list.instances.push(instance);
+    list.end_batch(None, false);
+    render_reference(
+        &list,
+        &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
+        ATLAS,
+    )
+}
+
+/// The fixture glow: a rounded box whose right edge is at x = 44 and whose vertical centre
+/// is y = 32, so a horizontal scan out of its right flank meets no corner.
+const GLOW_RIGHT_EDGE: f32 = 44.0;
+const GLOW_FALLOFF: f32 = 8.0;
+
+fn fixture_glow(color: Srgba) -> Instance {
+    Instance::glow(20.0, 22.0, 24.0, 20.0, 6.0, GLOW_FALLOFF, color)
+}
+
+#[test]
+fn a_glow_reaches_beyond_its_shape_and_fades_to_nothing() {
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    let surface = reference_pixels(fixture_glow(white));
+
+    // Solid inside: the profile is 1 wherever the distance is negative, which is what makes
+    // a glow usable on its own and not only as something to hide under a fill.
+    assert!(
+        (surface.at(32, 32)[3] - 1.0).abs() < 1e-3,
+        "the glow is not opaque inside its own shape"
+    );
+
+    // The profile, measured against the curve it is supposed to be, one pixel at a time.
+    // Comparing against `(1 - d/falloff)^2` rather than against a recorded array is what
+    // makes this a statement about the design instead of a snapshot: a halo that changed
+    // shape but stayed monotonic would pass a monotonicity check and fail this one.
+    let mut previous = 1.0_f32;
+    for step in 0..=9 {
+        let px = GLOW_RIGHT_EDGE as u32 + step;
+        let distance = (px as f32 + 0.5) - GLOW_RIGHT_EDGE;
+        let fade = (1.0 - (distance / GLOW_FALLOFF).clamp(0.0, 1.0)).max(0.0);
+        let expected = fade * fade;
+        let measured = surface.at(px, 32)[3];
+        assert!(
+            (measured - expected).abs() < 2.0 / 255.0,
+            "at {distance:.1}px outside the shape the halo measured {measured:.4}, not the \
+             {expected:.4} a quadratic falloff over {GLOW_FALLOFF}px predicts"
+        );
+        assert!(
+            measured <= previous + 1e-6,
+            "the halo brightened at {distance:.1}px out -- a falloff has to be monotonic or \
+             it has a visible ring in it"
+        );
+        previous = measured;
+    }
+
+    // And it is genuinely gone by the limit, rather than merely faint. A halo that stops at
+    // a non-zero value has an edge, wherever the quad happens to end.
+    let past = GLOW_RIGHT_EDGE as u32 + GLOW_FALLOFF as u32;
+    assert_eq!(
+        surface.at(past, 32)[3],
+        0.0,
+        "the halo still had ink at its own falloff limit"
+    );
+}
+
+#[test]
+fn the_glow_quad_is_padded_by_its_whole_falloff_and_not_by_one_pixel() {
+    // The failure this chunk predicted, and the one that reads as clipping rather than as a
+    // bug in the padding. Every non-glyph quad grows by exactly one pixel so its
+    // antialiased edge has somewhere to live; a halo drawn into a one-pixel margin is a
+    // halo with a square edge, and at a small radius nobody notices until somebody asks for
+    // a big one.
+    //
+    // Reverting `quad_pad` to a flat 1.0 turns both halves of this red.
+    assert_eq!(
+        shader::quad_pad(shader::KIND_GLOW, GLOW_FALLOFF),
+        GLOW_FALLOFF + 1.0,
+        "the transcription pads a glow by something other than its falloff"
+    );
+
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    let surface = reference_pixels(fixture_glow(white));
+
+    // Five pixels out is inside the falloff and four pixels outside any one-pixel margin.
+    let far = surface.at(GLOW_RIGHT_EDGE as u32 + 5, 32)[3];
+    assert!(
+        far > 0.05,
+        "5px outside the shape the halo measured {far:.4}: the quad is not reaching its own \
+         falloff, so the effect is being cut off square"
+    );
+
+    // The corner diagonal, which catches padding applied on one axis only -- a mistake that
+    // leaves the flanks perfect and the corners sheared.
+    let corner = surface.at(GLOW_RIGHT_EDGE as u32 + 3, 22 + 20 + 3)[3];
+    assert!(
+        corner > 0.0,
+        "the halo has no ink diagonally past its corner: the quad grew in one axis only"
+    );
+
+    // The shader itself, not only the transcription. The suite's transcription is checked
+    // against `tiny-skia` everywhere else; here there is no CPU side to disagree with it, so
+    // the WGSL has to be read directly or a correct transcription of a wrong shader passes.
+    let source = include_str!("shaders/instance.wgsl");
+    let vs_main = source
+        .split_once("fn vs_main")
+        .and_then(|(_, rest)| rest.split_once("fn sd_rounded_box"))
+        .map(|(body, _)| body)
+        .unwrap_or_default();
+    assert!(
+        vs_main.contains("KIND_GLOW") && vs_main.contains("inst.param"),
+        "vs_main does not vary its quad padding with a glow's falloff; the transcription \
+         above is describing a shader that no longer exists"
+    );
+}
+
+#[test]
+fn the_halo_fades_without_drifting_through_black() {
+    // Why the glow mixes in premultiplied linear and the gradient does not.
+    //
+    // `unpremultiply` returns black for a zero-alpha stop, because a colour that is not
+    // there has no hue to recover. Walking the halo's ramp in Oklab -- the obvious thing to
+    // do, given the ramp function is right there -- would therefore fade every glow through
+    // black and leave a dark rim just inside the falloff, on exactly the surfaces a glow is
+    // for. Premultiplied, the same colour at decreasing alpha is bit-for-bit the same
+    // colour, which is what this measures.
+    let instance = fixture_glow(Srgba::new(0.2, 0.6, 1.0, 0.5));
+    let surface = reference_pixels(instance);
+    // Against the *packed* near stop, not against the `Srgba` it came from. The instance
+    // buffer holds premultiplied linear RGBA8, so a translucent colour loses a bit on the
+    // way in; measuring from the source would be measuring that quantisation, which has
+    // nothing to do with whether the ramp drifts.
+    let near = shader::unpremultiply(shader::unpack4x8unorm(instance.color));
+    let expected = near[0];
+
+    for step in 1..7 {
+        let px = GLOW_RIGHT_EDGE as u32 + step;
+        let p = surface.at(px, 32);
+        assert!(p[3] > 0.01, "no ink to measure the hue of at +{step}px");
+        let straight_r = p[0] / p[3];
+        assert!(
+            (straight_r - expected).abs() < 1e-5,
+            "at +{step}px the halo's red channel unpremultiplied to {straight_r:.5} against \
+             the {expected:.5} it started at -- the fade is dragging the colour somewhere"
+        );
+    }
+}
+
+#[test]
+fn a_glow_with_no_falloff_is_the_shape_and_nothing_around_it() {
+    // `glow_t` divides by the falloff, so zero is the input that has to be answered rather
+    // than computed. The answer is the plain fill: solid inside, nothing outside. Returning
+    // NaN would paint the whole padded quad, and returning 1 everywhere would paint nothing
+    // at all -- both are silent, because a glow that renders wrong still renders.
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    let surface = reference_pixels(Instance::glow(20.0, 22.0, 24.0, 20.0, 6.0, 0.0, white));
+
+    assert!(
+        (surface.at(32, 32)[3] - 1.0).abs() < 1e-3,
+        "the shape vanished"
+    );
+    assert_eq!(
+        surface.at(GLOW_RIGHT_EDGE as u32 + 1, 32)[3],
+        0.0,
+        "a glow with no falloff put ink outside its shape"
+    );
+}
+
+// -- the rim's own geometry ----------------------------------------------------------------
+//
+// The mirror of the glow's four tests above, and there for the same reason: the floor check
+// says the CPU tier draws nothing, and nothing else says the GPU side draws anything. A rim
+// branch that returned zero would satisfy every floor assertion in the file.
+
+/// The fixture rim uses the glow fixture's box, so a horizontal scan out of its right flank
+/// at y = 32 meets no corner and the distance is just the gap to that edge.
+const RIM_RIGHT_EDGE: f32 = 44.0;
+const RIM_WIDTH: f32 = 6.0;
+
+fn fixture_rim(color: Srgba) -> Instance {
+    Instance::rim(20.0, 22.0, 24.0, 20.0, 6.0, RIM_WIDTH, color)
+}
+
+#[test]
+fn rim_stays_at_its_floor_on_the_cpu_tier() {
+    run_kind(PrimKind::Rim);
+}
+
+#[test]
+fn a_rim_is_brightest_inside_its_own_edge_and_gone_by_its_width() {
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    let surface = reference_pixels(fixture_rim(white));
+
+    // Nothing outside the shape. This is what separates a rim from a glow, and it is the
+    // first thing a sign error breaks: `distance / width` instead of `-distance / width`
+    // lights the outside and leaves the inside dark, which still renders a picture.
+    assert_eq!(
+        surface.at(RIM_RIGHT_EDGE as u32, 32)[3],
+        0.0,
+        "the rim put ink outside its own shape"
+    );
+
+    // And nothing in the middle. A rim that filled its shape would be a fill with extra
+    // steps, which is the other way the sign can be wrong.
+    assert_eq!(
+        surface.at(32, 32)[3],
+        0.0,
+        "the rim laid ink at the centre of its shape, so it is a fill and not an edge light"
+    );
+
+    // The profile, one pixel at a time, against the curve rather than against a recorded
+    // array -- so a rim that changed shape but stayed monotonic fails here even though a
+    // monotonicity check would pass it.
+    let mut previous = f32::INFINITY;
+    for step in 1..=8u32 {
+        let px = RIM_RIGHT_EDGE as u32 - step;
+        // Negative: inside the shape.
+        let distance = (px as f32 + 0.5) - RIM_RIGHT_EDGE;
+        let fade = 1.0 - (-distance / RIM_WIDTH).clamp(0.0, 1.0);
+        let expected = (0.5 - distance).clamp(0.0, 1.0) * fade * fade;
+        let measured = surface.at(px, 32)[3];
+        assert!(
+            (measured - expected).abs() < 2.0 / 255.0,
+            "at {distance:.1}px inside the shape the rim measured {measured:.4}, not the \
+             {expected:.4} a quadratic ramp over {RIM_WIDTH}px predicts"
+        );
+        assert!(
+            measured <= previous + 1e-6,
+            "the rim brightened at {distance:.1}px in -- the ramp has to fall away from the \
+             edge or there is a visible band inside it"
+        );
+        previous = measured;
+    }
+
+    // The peak sits half a pixel inside the boundary rather than on it, because at the
+    // boundary the shape itself is only half covered. A rim brighter *at* the edge than just
+    // inside it would be a rim drawing outside its shape.
+    let peak = surface.at(RIM_RIGHT_EDGE as u32 - 1, 32)[3];
+    assert!(
+        peak > 0.75,
+        "the brightest pixel of the rim measured {peak:.4}: the light is not reaching the \
+         edge it is supposed to be lighting"
+    );
+
+    // Genuinely gone by its own width, rather than merely faint. A ramp that stops at a
+    // non-zero value has an inner edge, and an inner edge is a second line nobody asked for.
+    assert_eq!(
+        surface.at(RIM_RIGHT_EDGE as u32 - RIM_WIDTH as u32 - 1, 32)[3],
+        0.0,
+        "the rim still had ink past its own width"
+    );
+}
+
+#[test]
+fn a_rim_with_no_width_is_nothing_rather_than_the_whole_shape() {
+    // `rim_t` divides by the width, so zero is the input that has to be answered rather than
+    // computed -- and the two silent wrong answers are opposites. Returning 0 there would
+    // make `fade` 1 and paint the entire shape solid; NaN would paint whichever fragments the
+    // comparison happened to admit. The answer is nothing at all, because a light with no
+    // depth is not a light.
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    let surface = reference_pixels(Instance::rim(20.0, 22.0, 24.0, 20.0, 6.0, 0.0, white));
+
+    let ink: f32 = surface.pixels.iter().map(|p| p[3]).sum();
+    assert_eq!(
+        ink, 0.0,
+        "a rim with no width laid down ink somewhere: {ink} of it"
+    );
+}
+
+#[test]
+fn the_rim_fades_without_drifting_through_black() {
+    // Why the rim carries its whole ramp in the coverage and leaves the tint alone.
+    //
+    // The obvious thing to do, with `ramp` sitting right there, is to walk from the rim's
+    // colour to a transparent one in Oklab. `unpremultiply` returns black for a zero-alpha
+    // stop, so that would fade every rim through black and leave a dark line just inside the
+    // bright one -- on exactly the surfaces a rim is for. Premultiplied, the same colour at
+    // decreasing alpha is bit-for-bit the same colour, which is what this measures.
+    let instance = fixture_rim(Srgba::new(0.85, 0.92, 1.0, 0.6));
+    let surface = reference_pixels(instance);
+    // Against the *packed* colour, not the `Srgba` it came from: the instance buffer holds
+    // premultiplied linear RGBA8, so measuring from the source would be measuring that
+    // quantisation instead of whether the ramp drifts.
+    let expected = shader::unpremultiply(shader::unpack4x8unorm(instance.color))[0];
+
+    for step in 1..=5u32 {
+        let px = RIM_RIGHT_EDGE as u32 - step;
+        let p = surface.at(px, 32);
+        assert!(p[3] > 0.01, "no ink to measure the hue of at -{step}px");
+        let straight_r = p[0] / p[3];
+        assert!(
+            (straight_r - expected).abs() < 1e-5,
+            "at -{step}px the rim's red channel unpremultiplied to {straight_r:.5} against \
+             the {expected:.5} it started at -- the fade is dragging the colour somewhere"
+        );
+    }
+}
+
+#[test]
+fn the_shader_lights_the_inside_of_an_edge_and_not_only_the_transcription() {
+    // The suite's transcription is checked against `tiny-skia` everywhere else. A rim has no
+    // CPU side to disagree with it, so the WGSL is read directly -- otherwise a correct
+    // transcription of a shader that never grew the branch passes everything above.
+    let source = include_str!("shaders/instance.wgsl");
+    let fs_main = source
+        .split_once("fn fs_main")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    assert!(
+        fs_main.contains("KIND_RIM") && fs_main.contains("rim_t"),
+        "fs_main has no rim branch; the transcription above is describing a shader that \
+         does not exist"
+    );
+    assert!(
+        source.contains("fn rim_t") && source.contains("-distance / width"),
+        "the shader has no inward-reading ramp, so whatever fs_main is branching on is not \
+         a rim"
+    );
+}
+
+// -- the surface's own physics ------------------------------------------------------------
+//
+// The floor check says the CPU tier draws the albedo. Nothing in it says the GPU side shades
+// anything, and a BRDF that returned its input would satisfy every assertion above. These
+// tests are that half, and they are about the *physics* rather than about pixels: a wrong
+// normal, a non-conserving diffuse lobe or a metal with a diffuse term all still render.
+
+const PBR_BEVEL: f32 = 6.0;
+
+fn fixture_pbr(roughness: f32, metallic: f32, albedo: Srgba) -> Instance {
+    Instance::pbr(
+        20.0, 22.0, 24.0, 20.0, 6.0, PBR_BEVEL, roughness, metallic, 1.0, 0.0, albedo,
+    )
+}
+
+/// Where the emissive fixture sits: `x0, y0, x1, y1`.
+///
+/// Deliberately much larger than [`fixture_pbr`]'s 24x20. The interior more than a bevel from
+/// every edge is what `emission_never_reaches_the_middle_of_a_surface` measures, and on the
+/// smaller rectangle that interior is 60 pixels -- which the test refuses as too few to be a
+/// measurement. Widening the fixture is the honest fix; loosening that guard would have been
+/// the other one.
+const EMISSIVE_FIXTURE: (u32, u32, u32, u32) = (10, 12, 58, 52);
+
+/// A [`fixture_pbr`] that emits. Its own function rather than a parameter on that one, so every
+/// existing test keeps asking exactly the question it was written to ask.
+fn fixture_pbr_emissive(emission: f32) -> Instance {
+    let (x0, y0, x1, y1) = EMISSIVE_FIXTURE;
+    Instance::pbr(
+        x0 as f32,
+        y0 as f32,
+        (x1 - x0) as f32,
+        (y1 - y0) as f32,
+        6.0,
+        PBR_BEVEL,
+        0.35,
+        0.0,
+        1.0,
+        emission,
+        Srgba::new(0.30, 0.62, 0.95, 1.0),
+    )
+}
+
+#[test]
+fn pbr_stays_at_its_floor_on_the_cpu_tier() {
+    run_kind(PrimKind::Pbr);
+}
+
+#[test]
+fn emission_never_reaches_the_middle_of_a_surface() {
+    // The contrast argument, measured. It is the whole reason an emissive surface is allowed
+    // to exist at all, and it must not be a sentence in a comment.
+    //
+    // Contract rule 1a lets a meaning-bearing element emit and forbids it to light **the
+    // ground directly behind itself**, putting that boundary at the bevel. A label sits in the
+    // middle of its row. So the claim is not that the middle is dimmed, or changed within a
+    // tolerance -- it is that the middle is **bit-identical**, because `edge_emission` reaches
+    // exactly zero at `bevel` inward and stays there. `Material::composites` checks the albedo
+    // and cannot see shading, so anything weaker than equality here would be a moving ground
+    // under a green gate, which is the failure `qs_ui::substance` recorded three times.
+    let dark = reference_pixels(fixture_pbr_emissive(0.0));
+    let bright = reference_pixels(fixture_pbr_emissive(2.0));
+
+    // Anything more than `bevel` inside every edge is ground a label could sit on.
+    let inset = PBR_BEVEL.ceil() as u32 + 1;
+    let (x0, y0, x1, y1) = EMISSIVE_FIXTURE;
+    let mut compared = 0;
+    for y in (y0 + inset)..(y1 - inset) {
+        for x in (x0 + inset)..(x1 - inset) {
+            assert_eq!(
+                dark.at(x, y),
+                bright.at(x, y),
+                "emission reached ({x}, {y}), which is more than {inset}px inside the edge -- \
+                 that is the ground behind a label, and the contrast gate cannot see it move"
+            );
+            compared += 1;
+        }
+    }
+    assert!(
+        compared > 100,
+        "the interior sampled only {compared} pixels, which is not a measurement"
+    );
+
+    // And the other half, or the assertion above is satisfied by an emission that does nothing
+    // anywhere. The edge must actually change.
+    let edge_changed = (y0..y1).any(|y| {
+        (x0..x1).any(|x| {
+            let (a, b) = (dark.at(x, y), bright.at(x, y));
+            (0..3).any(|i| (a[i] - b[i]).abs() > 0.01)
+        })
+    });
+    assert!(
+        edge_changed,
+        "emission changed nothing anywhere, so the interior check above proves nothing"
+    );
+}
+
+#[test]
+fn emission_is_brightest_at_the_boundary_and_gone_by_the_bevel() {
+    // The profile, sampled rather than assumed. A surface whose emission fell off linearly, or
+    // reached past the bevel, would still satisfy the equality test above at a large enough
+    // inset while lighting ground it must not.
+    let weights: Vec<f32> = (0..=12)
+        .map(|i| {
+            // Distance from the boundary, inward: the SDF is negative inside.
+            let inward = PBR_BEVEL * i as f32 / 12.0;
+            shader::edge_emission(-inward, PBR_BEVEL)
+        })
+        .collect();
+
+    assert!(
+        (weights[0] - 1.0).abs() <= 1e-6,
+        "emission is not full at the boundary: {}",
+        weights[0]
+    );
+    assert!(
+        weights[12].abs() <= 1e-6,
+        "emission has not reached zero by the bevel: {}",
+        weights[12]
+    );
+    for pair in weights.windows(2) {
+        assert!(
+            pair[1] <= pair[0] + 1e-6,
+            "emission rose on the way inward: {pair:?}"
+        );
+    }
+    // Past the bevel it stays zero rather than going negative or wrapping.
+    for multiple in [1.0_f32, 1.5, 4.0, 40.0] {
+        let past = shader::edge_emission(-PBR_BEVEL * multiple, PBR_BEVEL);
+        assert_eq!(past, 0.0, "emission at {multiple}x the bevel was {past}");
+    }
+    // And a surface with no bevel has no edge to emit from.
+    assert_eq!(shader::edge_emission(-1.0, 0.0), 0.0);
+}
+
+#[test]
+fn the_shader_and_the_renderer_agree_about_where_the_light_is() {
+    // `LIGHT_DIR` used to be a WGSL constant and nothing else. It is now also a Rust constant,
+    // because a material can cast a contact shadow and the direction a shadow falls has to be
+    // the same vector the surface is shaded from -- a window whose shadows point one way and
+    // whose highlights point the other is the defect this comparison exists to prevent.
+    //
+    // Compared as text, for the reason the dither constants are: `instance.wgsl` is parsed by
+    // `cargo test` and never executed, so no fixture can catch the two drifting apart.
+    let source = include_str!("shaders/instance.wgsl");
+    let declared = source
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("const LIGHT_DIR: vec3<f32> =")?;
+            let inner = rest.trim().strip_prefix("vec3<f32>(")?;
+            let inner = inner.split(')').next()?;
+            let mut parts = inner.split(',').map(|p| p.trim().parse::<f32>().ok());
+            Some([parts.next()??, parts.next()??, parts.next()??])
+        })
+        .expect("LIGHT_DIR is not declared in instance.wgsl in the form this parses");
+
+    assert_eq!(
+        declared,
+        crate::frame::LIGHT_DIR,
+        "the shader lights from {declared:?} and qs_gpu::frame says {:?}",
+        crate::frame::LIGHT_DIR
+    );
+
+    // And the shadow direction really is derived from it rather than being a second opinion:
+    // down and to the right, unit length.
+    let shadow = crate::frame::shadow_direction();
+    assert!(
+        shadow[0] > 0.0 && shadow[1] > 0.0,
+        "the light is above and left, so shadows fall down and right; got {shadow:?}"
+    );
+    assert!(
+        (shadow[0].hypot(shadow[1]) - 1.0).abs() <= 1e-6,
+        "the shadow direction is not a unit vector: {shadow:?}"
+    );
+    let expected = [-declared[0], -declared[1]];
+    let length = expected[0].hypot(expected[1]);
+    assert!(
+        (shadow[0] - expected[0] / length).abs() <= 1e-6
+            && (shadow[1] - expected[1] / length).abs() <= 1e-6,
+        "the shadow is not the key light's own direction negated: {shadow:?}"
+    );
+}
+
+#[test]
+fn the_bevel_normal_turns_from_facing_the_viewer_to_facing_out_along_the_edge() {
+    // The geometric claim the whole BRDF rests on. A normal that stayed (0,0,1) would light
+    // the surface flatly and still produce a picture; one whose sign was inverted would light
+    // it from the wrong side and also still produce a picture.
+    let half = [12.0f32, 10.0];
+
+    // Deep inside: flat, facing the viewer.
+    let deep = shader::bevel_normal(-9.0, [1.0, 0.0], PBR_BEVEL);
+    assert!(
+        (deep[2] - 1.0).abs() < 1e-5 && deep[0].abs() < 1e-5,
+        "the middle of the surface is not flat: {deep:?}"
+    );
+
+    // At the boundary: vertical, facing out along the gradient.
+    let edge = shader::bevel_normal(0.0, [1.0, 0.0], PBR_BEVEL);
+    assert!(
+        (edge[0] - 1.0).abs() < 1e-5 && edge[2].abs() < 1e-5,
+        "the edge does not face outward: {edge:?}"
+    );
+
+    // Every sample is unit length, or the BRDF's cosines are not cosines.
+    for step in 0..=12 {
+        let d = -(step as f32) * 0.5;
+        let g = shader::sd_rounded_box_grad([11.0, 0.0], half, 6.0);
+        let n = shader::bevel_normal(d, g, PBR_BEVEL);
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-4, "normal at d={d} has length {len}");
+    }
+
+    // The gradient points away from the nearest edge, on the flanks and in a corner.
+    assert_eq!(
+        shader::sd_rounded_box_grad([11.0, 0.0], half, 6.0),
+        [1.0, 0.0]
+    );
+    assert_eq!(
+        shader::sd_rounded_box_grad([-11.0, 0.0], half, 6.0),
+        [-1.0, 0.0]
+    );
+    assert_eq!(
+        shader::sd_rounded_box_grad([0.0, 9.0], half, 6.0),
+        [0.0, 1.0]
+    );
+    let corner = shader::sd_rounded_box_grad([11.0, 9.0], half, 6.0);
+    assert!(
+        corner[0] > 0.0 && corner[1] > 0.0,
+        "the corner gradient does not point out of the corner: {corner:?}"
+    );
+}
+
+#[test]
+fn the_brdf_conserves_energy_and_a_metal_has_no_diffuse_lobe() {
+    // Two claims a plausible-looking BRDF gets wrong silently.
+    //
+    // The first: at the flat normal -- the diffuse-dominated case, and the one every surface
+    // in this application is mostly made of -- a surface returns no more light than fell on
+    // it. A separable Smith term, a missing `kd`, or a `D` without its normalisation all break
+    // this and all still look like shading.
+    //
+    // Deliberately not asserted at the specular peak, where a near-mirror exceeds one and is
+    // *right* to: a mirror shows a light source brighter than any surface, and a test that
+    // forbade it would be asserting an artefact rather than energy conservation. The honest
+    // strong form is a hemispherical integral of the BRDF, which is a bigger unit than this.
+    let dark = [0.0f32; 3];
+    let flat = [0.0f32, 0.0, 1.0];
+    for rough in [0.05f32, 0.2, 0.5, 0.8, 1.0] {
+        for metal in [0.0f32, 1.0] {
+            let out = shader::shade_pbr(flat, [1.0, 1.0, 1.0], rough, metal, 0.0, 0.0, dark, dark);
+            for c in out {
+                assert!(
+                    (0.0..=1.0).contains(&c),
+                    "roughness {rough} metal {metal} returned {c}, which is more light than \
+                     the one light in the scene emitted"
+                );
+            }
+        }
+    }
+
+    // The second: a metal has no diffuse lobe. Measured off the specular direction, because
+    // facing the highlight a metal is *brighter* than a dielectric -- its Fresnel is its
+    // albedo rather than 0.04 -- and comparing there would assert the opposite of the physics.
+    // This normal points down-right while the key light comes from up-left, so the specular
+    // lobe is nearly gone and what is left is the diffuse term that only the dielectric has.
+    let off_specular = [0.4511, 0.5513, 0.7017];
+    let metal = shader::shade_pbr(
+        off_specular,
+        [0.8, 0.1, 0.1],
+        0.6,
+        1.0,
+        0.0,
+        0.0,
+        dark,
+        dark,
+    );
+    let dielectric = shader::shade_pbr(
+        off_specular,
+        [0.8, 0.1, 0.1],
+        0.6,
+        0.0,
+        0.0,
+        0.0,
+        dark,
+        dark,
+    );
+    assert!(
+        metal[0] < dielectric[0] * 0.35,
+        "metal {metal:?} kept a diffuse lobe against dielectric {dielectric:?}"
+    );
+    assert!(
+        dielectric[0] > 0.01,
+        "the dielectric returned nothing to compare against"
+    );
+
+    // And facing the highlight the order reverses, which is the other half of the same fact
+    // and the one that stops the assertion above from being satisfied by a shader that simply
+    // darkens everything it is told is metal.
+    let lit_metal = shader::shade_pbr(flat, [0.8, 0.1, 0.1], 0.6, 1.0, 0.0, 0.0, dark, dark);
+    let lit_dielectric = shader::shade_pbr(flat, [0.8, 0.1, 0.1], 0.6, 0.0, 0.0, 0.0, dark, dark);
+    assert!(
+        lit_metal[0] > lit_dielectric[0] * 0.6,
+        "metal lost its tinted specular as well as its diffuse lobe: {lit_metal:?} against          {lit_dielectric:?}"
+    );
+}
+
+#[test]
+fn roughness_widens_the_highlight_rather_than_only_dimming_it() {
+    // The property that distinguishes a microfacet distribution from a fudge factor: a
+    // rougher surface spreads the same energy over a wider lobe. A shader that multiplied the
+    // highlight by `1 - roughness` would dim it correctly and never widen it, and every still
+    // image of a single surface would look plausible.
+    let dark = [0.0f32; 3];
+    let at = |angle: f32, rough: f32| -> f32 {
+        let n = [angle.sin(), 0.0, angle.cos()];
+        shader::shade_pbr(n, [0.5, 0.5, 0.5], rough, 1.0, 0.0, 0.0, dark, dark)[0]
+    };
+    // Sharpness measured as the ratio between the lobe's centre and its shoulder.
+    let sharp = at(0.0, 0.1) / at(0.45, 0.1).max(1e-6);
+    let broad = at(0.0, 0.6) / at(0.45, 0.6).max(1e-6);
+    assert!(
+        sharp > broad * 2.0,
+        "the highlight did not narrow as roughness fell: sharp {sharp:.3}, broad {broad:.3}"
+    );
+}
+
+#[test]
+fn the_environment_is_a_reflection_and_not_a_constant_added_on() {
+    // A sky the surface genuinely reflects moves when the sky moves, and moves *differently*
+    // at different normals -- which is what separates an environment term from an ambient
+    // constant, the thing it is most often quietly replaced by.
+    let dim = [0.05f32, 0.05, 0.05];
+    let bright = [0.9f32, 0.9, 0.9];
+    let flat = [0.0f32, 0.0, 1.0];
+    let tilted = [0.6f32, 0.0, 0.8];
+
+    let flat_dim = shader::shade_pbr(flat, [0.5; 3], 0.15, 1.0, 1.0, 0.0, dim, dim)[0];
+    let flat_bright = shader::shade_pbr(flat, [0.5; 3], 0.15, 1.0, 1.0, 0.0, dim, bright)[0];
+    assert!(
+        flat_bright > flat_dim + 0.05,
+        "raising the zenith did not reach a surface facing it"
+    );
+
+    // A tilted surface reflects toward the horizon, so the same zenith change reaches it less.
+    let tilt_dim = shader::shade_pbr(tilted, [0.5; 3], 0.15, 1.0, 1.0, 0.0, dim, dim)[0];
+    let tilt_bright = shader::shade_pbr(tilted, [0.5; 3], 0.15, 1.0, 1.0, 0.0, dim, bright)[0];
+    assert!(
+        (flat_bright - flat_dim) > (tilt_bright - tilt_dim),
+        "the sky reached both normals equally, so it is being added rather than reflected"
+    );
+}
+
+#[test]
+fn a_lit_surface_covers_exactly_the_pixels_its_floor_would() {
+    // Why the floor can be `Plain(Rect)` at all. Shading replaces what is inside a shape and
+    // must not touch which pixels the shape covers -- if it did, the fallback tier would draw
+    // a differently shaped object and 10.7's "plainer, never inconsistent" would be broken.
+    let albedo = Srgba::new(0.6, 0.7, 0.9, 1.0);
+    let lit = reference_pixels(fixture_pbr(0.3, 0.0, albedo));
+    let unlit = reference_pixels(Instance::rect(20.0, 22.0, 24.0, 20.0, 6.0, albedo));
+    for y in 0..SURFACE {
+        for x in 0..SURFACE {
+            let a = lit.at(x, y)[3];
+            let b = unlit.at(x, y)[3];
+            assert!(
+                (a - b).abs() < 1e-5,
+                "coverage differs at ({x}, {y}): lit {a}, unlit {b}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_shader_shades_a_surface_and_not_only_the_transcription() {
+    // The transcription above is checked against `tiny-skia` nowhere, because a floored PBR
+    // instance never reaches it. So the WGSL is read directly, or a faithful transcription of
+    // a shader that never grew the branch passes everything here.
+    let source = include_str!("shaders/instance.wgsl");
+    for needle in [
+        "fn sd_rounded_box_grad",
+        "fn bevel_normal",
+        "fn distribution_ggx",
+        "fn visibility_smith",
+        "fn fresnel_schlick",
+        "fn environment",
+        "KIND_PBR",
+    ] {
+        assert!(
+            source.contains(needle),
+            "instance.wgsl has no `{needle}`; the transcription describes a shader that does \
+             not exist"
+        );
+    }
+    // The call form, not the word: the shader says "no `fwidth`" in three comments explaining
+    // why there isn't one, and a check that matched those would be red on a correct file.
+    assert!(
+        !source.contains("fwidth(") && !source.contains("dpdx(") && !source.contains("dpdy("),
+        "a derivative reached the shader, which the CPU tier cannot reproduce and the whole \
+         analytic-normal argument exists to avoid"
+    );
+}
+
 #[test]
 fn no_prim_kind_can_ship_without_a_parity_test() {
     // The compile-time half of this guard is `cases_for`'s exhaustive match. This is the
     // run-time half: an arm that exists but returns nothing, or returns fixtures for the
     // wrong primitive, would satisfy the compiler and prove nothing.
+    //
+    // Fidelity does not enter into it. An `Enhanced` kind is checked by a different
+    // question, not by a shorter list, and the reading it has to be refused is that
+    // declaring a floor is a way to stop owing a fixture.
     for kind in PrimKind::ALL {
         let cases = cases_for(kind);
         assert!(
             !cases.is_empty(),
-            "{kind:?} has an arm in cases_for but no fixtures: it would ship unchecked"
+            "{kind:?} has an arm in cases_for but no fixtures: it would ship unchecked, \
+             whatever fidelity class it declares"
         );
         for case in &cases {
             assert_eq!(
@@ -1006,6 +3284,98 @@ fn the_shader_and_prim_kind_declare_the_same_primitives() {
          side gained one, the parity suite is not covering it"
     );
     assert!(!declared.is_empty(), "the KIND_ parser matched nothing");
+}
+
+#[test]
+fn the_shader_and_the_palette_dither_by_the_same_numbers() {
+    // The dither is the one piece of arithmetic that has to be *identical* on the two
+    // tiers rather than merely close: it decides which of two adjacent output values a
+    // pixel takes, so a constant that drifts by a per cent does not shift the picture by a
+    // per cent -- it picks the other value on a scattering of pixels, everywhere, and the
+    // gradient fixtures would go red with no clue as to why.
+    //
+    // Every other transcription in this file is checked by the parity fixtures running the
+    // same maths. These constants cannot be, because `instance.wgsl` is never executed by
+    // `cargo test` -- only parsed. So they are compared as text.
+    let source = include_str!("shaders/instance.wgsl");
+    let declared = |name: &str| -> f32 {
+        source
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix(&format!("const {name}: f32 ="))?;
+                rest.trim().trim_end_matches(';').trim().parse().ok()
+            })
+            .unwrap_or_else(|| panic!("{name} is not declared in instance.wgsl"))
+    };
+
+    for (name, ours) in [
+        ("DITHER_SLOPE", crate::color::DITHER_SLOPE),
+        ("DITHER_EXPONENT", crate::color::DITHER_EXPONENT),
+        ("DITHER_TOE", crate::color::DITHER_TOE),
+        ("DITHER_TOE_SLOPE", crate::color::DITHER_TOE_SLOPE),
+    ] {
+        let theirs = declared(name);
+        assert!(
+            (theirs - ours).abs() <= ours.abs() * 1e-6,
+            "{name}: the shader says {theirs}, qs_gpu::color says {ours}"
+        );
+    }
+
+    // The mixer's own constants, which have no name on either side. Comparing them as
+    // literals is crude and is the point: there is nothing else holding the two hashes
+    // together, and a hash that differs by one constant is a hash that agrees nowhere.
+    for word in ["0x27d4eb2du", "0x165667b1u", "0x2c1b3c6du", "0x297a2d39u"] {
+        assert!(
+            source.contains(word),
+            "instance.wgsl no longer mixes with {word}; qs_gpu::color::dither_hash still does"
+        );
+    }
+    for shift in ["h >> 15u", "h >> 12u"] {
+        assert!(source.contains(shift), "the shader's mixer lost {shift}");
+    }
+}
+
+#[test]
+fn the_shader_compiles_and_validates() {
+    // Until this existed, nothing in `cargo test` had ever compiled `instance.wgsl`. The
+    // whole suite above transcribes the shader into Rust and checks the transcription
+    // against `tiny-skia`, which is a strong check on the *maths* and no check at all on
+    // whether the file is valid WGSL -- a missing semicolon would leave every test green
+    // and every GPU tier rendering nothing, because the only thing that had ever parsed
+    // it was `create_shader_module` at device startup, which no test reaches.
+    //
+    // `naga` is a dev-dependency at `wgpu`'s own major version, so this is the same front
+    // end the device uses, minus the device.
+    let source = include_str!("shaders/instance.wgsl");
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|e| {
+        panic!(
+            "instance.wgsl does not parse:\n{}",
+            e.emit_to_string(source)
+        )
+    });
+
+    // Parsing is not enough on its own: a type error, a bad swizzle or an entry point with
+    // the wrong signature all parse and then fail validation, which is where a driver
+    // would reject them.
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap_or_else(|e| panic!("instance.wgsl does not validate:\n{e:?}"));
+
+    // Guard the guard: an `include_str!` pointed at the wrong file, or a shader that lost
+    // its entry points, would validate perfectly and prove nothing.
+    let entry_points: Vec<&str> = module
+        .entry_points
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        entry_points,
+        ["vs_main", "fs_main"],
+        "the pipeline binds these two by name"
+    );
 }
 
 #[test]

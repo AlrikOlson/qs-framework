@@ -19,15 +19,18 @@
 //! architecture cannot express it would be catastrophic. M4 is where accessibility is
 //! *audited*; M0 is where it is proven possible.
 
-use accesskit::{Node, NodeId, Rect, Role, Tree, TreeUpdate};
+use accesskit::{Live, Node, NodeId, Rect, Role, Tree, TreeUpdate};
 
 use crate::recycler::ViewportLayout;
-use crate::row_source::{RowBuf, RowFlags, RowView};
+use crate::row::Interaction;
+use crate::row_source::{LoadState, RowBuf, RowFlags, RowView};
 
 /// Node id of the window. Fixed, because it never changes.
 pub const WINDOW_ID: NodeId = NodeId(0);
 /// Node id of the list container.
 pub const LIST_ID: NodeId = NodeId(1);
+/// Node id of the polite live region that announces the selection count.
+pub const SELECTION_STATUS_ID: NodeId = NodeId(2);
 /// Row node ids start here, offset by the row's **logical** index.
 const ROW_ID_BASE: u64 = 16;
 
@@ -52,6 +55,9 @@ pub struct SemanticNode {
     pub bounds: Option<(f64, f64, f64, f64)>,
     pub selected: bool,
     pub focusable: bool,
+    /// Announced when its label changes, without taking focus. Only the selection status
+    /// node sets this.
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,8 +67,12 @@ pub struct SemanticTree {
 
 impl SemanticTree {
     /// Build the tree for one frame.
-    pub fn build(buf: &RowBuf, layout: &ViewportLayout, focused: Option<u64>) -> Self {
-        let mut nodes = Vec::with_capacity(buf.len() + 2);
+    ///
+    /// Selection comes from `interaction`, not from the row flags: selection is view state,
+    /// so a `RowSource` never sets `IS_SELECTED` and a tree built from the buffer alone
+    /// would report a screen-reader user's selection as permanently empty.
+    pub fn build(buf: &RowBuf, layout: &ViewportLayout, interaction: Interaction<'_>) -> Self {
+        let mut nodes = Vec::with_capacity(buf.len() + 3);
 
         nodes.push(SemanticNode {
             id: WINDOW_ID,
@@ -73,6 +83,7 @@ impl SemanticTree {
             bounds: None,
             selected: false,
             focusable: false,
+            live: false,
         });
 
         nodes.push(SemanticNode {
@@ -85,6 +96,22 @@ impl SemanticTree {
             bounds: Some((0.0, 0.0, f64::from(layout.width), f64::from(layout.height))),
             selected: false,
             focusable: false,
+            live: false,
+        });
+
+        // A polite live region rather than a focus move: selecting forty files by dragging
+        // must tell the user how many they have without stealing the focus they are dragging
+        // from, and without an announcement per row on the way.
+        nodes.push(SemanticNode {
+            id: SELECTION_STATUS_ID,
+            role: Role::Status,
+            label: selection_announcement(interaction.selection.len()),
+            index_in_set: None,
+            set_size: None,
+            bounds: None,
+            selected: false,
+            focusable: false,
+            live: true,
         });
 
         for (slot, row) in buf.rows().iter().enumerate() {
@@ -103,12 +130,13 @@ impl SemanticTree {
                     f64::from(layout.width),
                     top + f64::from(layout.row_height),
                 )),
-                selected: row.flags.contains(RowFlags::IS_SELECTED),
+                selected: row.flags.contains(RowFlags::IS_SELECTED)
+                    || interaction.selection.contains(logical),
                 focusable: true,
+                live: false,
             });
         }
 
-        let _ = focused;
         Self { nodes }
     }
 
@@ -140,8 +168,11 @@ impl SemanticTree {
             if node.selected {
                 built.set_selected(true);
             }
+            if node.live {
+                built.set_live(Live::Polite);
+            }
             match node.id {
-                WINDOW_ID => built.set_children(vec![LIST_ID]),
+                WINDOW_ID => built.set_children(vec![LIST_ID, SELECTION_STATUS_ID]),
                 LIST_ID => built.set_children(row_ids.clone()),
                 _ => {}
             }
@@ -162,6 +193,19 @@ impl SemanticTree {
             tree_id: accesskit::TreeId::ROOT,
             focus,
         }
+    }
+}
+
+/// What the live region says about a selection of `count`.
+///
+/// Empty at zero rather than "0 selected": a live region whose label goes from "3 selected"
+/// to "0 selected" announces the number nobody asked for, where an empty one simply stops
+/// talking.
+fn selection_announcement(count: u64) -> String {
+    match count {
+        0 => String::new(),
+        1 => "1 selected".to_string(),
+        n => format!("{n} selected"),
     }
 }
 
@@ -187,7 +231,120 @@ fn describe(buf: &RowBuf, row: &RowView) -> String {
     if row.flags.contains(RowFlags::IS_HIDDEN) {
         description.push_str(", hidden");
     }
+
+    // Everything `crate::substance` puts into the surface is said here too, and that is what
+    // makes the encoding legal rather than decorative. Constitution IX refuses an effect that
+    // is the sole carrier of a fact; a roughness nobody can hear is exactly that. This is the
+    // same granularity as the encoding -- one row, its own attributes -- and it costs no I/O,
+    // because the row being described is a row the fill window already covers.
+    //
+    // The original plan was a sort per fact. That cannot be built: `FillWindow` holds
+    // attributes for the visible window only, so ordering a million entries by size needs a
+    // million stats. See roadmap chunk `row-sort-order`.
+    //
+    // Nothing is said for a stub. `size` and `mtime` are undefined there, not stale, and a
+    // screen reader announcing "0 bytes, 1970" about a row that is still loading is worse
+    // than one that says only its name -- it is a confident wrong answer where silence was
+    // available.
+    if row.state != LoadState::Stub {
+        if !row.flags.contains(RowFlags::IS_DIR) {
+            description.push_str(", ");
+            description.push_str(&crate::format_size(row.size));
+        }
+        description.push_str(", modified ");
+        description.push_str(&crate::format_mtime(row.mtime));
+    }
+    // Said whatever the load state, because the flag is only ever set from a positive
+    // answer -- see `RowFlags::IS_READONLY`. Its absence is no claim, and no claim is
+    // correctly announced as nothing at all.
+    if row.flags.contains(RowFlags::IS_READONLY) {
+        description.push_str(", read-only");
+    }
     description
+}
+
+#[cfg(test)]
+mod describe_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use crate::row_source::{KindId, RowId};
+
+    fn buf_with(row: RowView, name: &[u8]) -> (RowBuf, RowView) {
+        let mut buf = RowBuf::new();
+        buf.push(row.clone(), name);
+        let stored = buf.rows()[0].clone();
+        (buf, stored)
+    }
+
+    fn file(state: LoadState, flags: RowFlags) -> RowView {
+        RowView {
+            id: RowId(0),
+            name: 0..0,
+            size: 4_194_304,
+            mtime: 1_786_060_800,
+            kind: KindId(0),
+            flags,
+            state,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn every_fact_the_surface_encodes_is_also_announced() {
+        // Constitution IX: an effect may not be the sole carrier of a fact. `substance` puts
+        // age into roughness, size into the bevel and permission into the environment, and
+        // this is the route that does not require eyes. If an encoding is ever added there
+        // without a clause here, the surface is carrying something alone.
+        let (buf, row) = buf_with(file(LoadState::Basic, RowFlags::IS_READONLY), b"notes.txt");
+        let said = describe(&buf, &row);
+
+        assert!(said.starts_with("notes.txt"), "{said}");
+        assert!(said.contains("4.0 MB"), "size must be announced: {said}");
+        assert!(
+            said.contains("modified 2026-08-07"),
+            "age must be announced, and as a real date rather than the epoch: {said}"
+        );
+        assert!(
+            said.contains("read-only"),
+            "permission must be announced: {said}"
+        );
+    }
+
+    #[test]
+    fn a_stub_announces_its_name_and_makes_no_claims() {
+        // `size` and `mtime` are undefined on a stub, not stale. "0 bytes, modified
+        // 1970-01-01" is a confident wrong answer where silence was available, and a screen
+        // reader user has no way to tell it from a real answer.
+        let (buf, row) = buf_with(file(LoadState::Stub, RowFlags::EMPTY), b"waiting.bin");
+        let said = describe(&buf, &row);
+
+        assert_eq!(said, "waiting.bin");
+        assert!(!said.contains("1970"), "{said}");
+        assert!(!said.contains("modified"), "{said}");
+    }
+
+    #[test]
+    fn a_folder_is_not_given_a_size() {
+        // A directory's `size` is whatever the filesystem puts in the inode -- 4096 on ext4,
+        // zero on NTFS -- and none of it is the number a user means by "how big is this
+        // folder". Announcing it would be announcing an implementation detail as a fact.
+        // `recursive-size-rollup` is the chunk that would make this answerable.
+        let (buf, row) = buf_with(file(LoadState::Basic, RowFlags::IS_DIR), b"src");
+        let said = describe(&buf, &row);
+
+        assert!(said.contains("folder"), "{said}");
+        assert!(!said.contains("MB"), "{said}");
+        assert!(
+            said.contains("modified"),
+            "a folder still has a date: {said}"
+        );
+    }
 }
 
 /// One audit finding.
@@ -291,7 +448,7 @@ mod tests {
     fn the_tree_reports_the_corpus_size_not_the_recycled_row_count() {
         // "item 4,312 of 1,204,883", never "item 4 of 60".
         let (buf, layout) = million_row_frame();
-        let tree = SemanticTree::build(&buf, &layout, None);
+        let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
         let items: Vec<_> = tree
             .nodes
@@ -318,7 +475,7 @@ mod tests {
     #[test]
     fn index_in_set_is_one_based_and_contiguous() {
         let (buf, layout) = million_row_frame();
-        let tree = SemanticTree::build(&buf, &layout, None);
+        let tree = SemanticTree::build(&buf, &layout, Interaction::default());
         let indices: Vec<usize> = tree
             .nodes
             .iter()
@@ -335,7 +492,7 @@ mod tests {
     #[test]
     fn the_audit_passes_on_a_correct_tree() {
         let (buf, layout) = million_row_frame();
-        let tree = SemanticTree::build(&buf, &layout, None);
+        let tree = SemanticTree::build(&buf, &layout, Interaction::default());
         let findings = audit(&tree, layout.row_count);
         assert!(findings.is_empty(), "{findings:#?}");
     }
@@ -345,7 +502,7 @@ mod tests {
         // The test has to be able to fail, or it is decoration. Publish the recycled-row
         // count as `set_size` -- the exact mistake -- and confirm the audit names it.
         let (buf, layout) = million_row_frame();
-        let mut tree = SemanticTree::build(&buf, &layout, None);
+        let mut tree = SemanticTree::build(&buf, &layout, Interaction::default());
         let visible = buf.len();
         for node in &mut tree.nodes {
             if node.role == Role::ListItem {
@@ -377,7 +534,7 @@ mod tests {
         );
         recycler.fill(&source, &layout);
 
-        let tree = SemanticTree::build(recycler.rows(), &layout, None);
+        let tree = SemanticTree::build(recycler.rows(), &layout, Interaction::default());
         for node in &tree.nodes {
             if node.focusable {
                 assert!(!node.label.trim().is_empty(), "{node:?}");
@@ -390,7 +547,7 @@ mod tests {
     fn an_accesskit_update_names_a_focus_node_that_exists() {
         // A dangling focus id is rejected by AccessKit and takes the whole update with it.
         let (buf, layout) = million_row_frame();
-        let tree = SemanticTree::build(&buf, &layout, None);
+        let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
         let update = tree.to_update(Some(layout.visible.first));
         assert!(update.nodes.iter().any(|(id, _)| *id == update.focus));

@@ -18,6 +18,16 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Examples only, to encode a PNG. `CpuRasterizer::render` leaves a linear premultiplied
+# buffer and `to_srgb_rgba8` is what makes it displayable, so a looking harness has to
+# build its own pixmap from those bytes rather than saving the working one.
+tiny-skia.workspace = true
+# `gpu_strip` only. The CPU harness cannot show an `Enhanced` primitive at all -- `cpu_floor`
+# drops it before tiny-skia is reached -- so the one way to look at a glow or a rim is to run
+# the real WGSL on a real adapter and read the texture back.
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
 # A dev-dependency cycle (qs-bench depends on qs-ui). Cargo permits this, and it is the
 # right shape here: the RS-1 test needs a source that would genuinely block, and the only
 # honest one lives beside the corpus generator rather than being reimplemented in a fixture.

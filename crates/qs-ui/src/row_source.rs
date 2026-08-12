@@ -57,6 +57,15 @@ impl RowFlags {
     /// being selected while the keyboard moves through the list, and collapsing the two
     /// makes keyboard navigation invisible.
     pub const IS_FOCUSED: Self = Self(1 << 5);
+    /// **Known** read-only. Absent means "not known to be read-only", never "writable".
+    ///
+    /// `Attrs::readonly` is an `Option` precisely so that "nobody looked" stays distinct
+    /// from "it is false", and a bit cannot carry three states. So the bit is set only for
+    /// `Some(true)`, and every consumer reads its absence as *no claim* — which for the
+    /// material encoding means the ordinary surface, the same one an unfilled stub gets.
+    /// Collapsing `None` into `false` here would reintroduce the lie `Attrs` exists to
+    /// prevent, one layer up.
+    pub const IS_READONLY: Self = Self(1 << 6);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -97,6 +106,13 @@ pub struct RowView {
     /// Range into [`RowBuf::names`].
     pub name: Range<u32>,
     pub size: u64,
+    /// Modification time in **unix seconds**, and the unit is load-bearing.
+    ///
+    /// `qs-shell` fills it from `SystemTime::duration_since(UNIX_EPOCH).as_secs()` and
+    /// [`crate::format_mtime`] reads it as seconds. Those two used to disagree — this said
+    /// nothing about its unit and `format_mtime` divided by a billion — so every real file
+    /// rendered as `1970-01-01`. Both sides now say seconds here, in one place, because the
+    /// bug lived in the gap between two crates that agreed on `i64` and nothing else.
     pub mtime: i64,
     pub kind: KindId,
     pub flags: RowFlags,

@@ -18,6 +18,7 @@ tracing.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
+naga.workspace = true
 pollster.workspace = true
 
 # `loom` replaces std's atomics under `cfg(loom)` and must not be linked into a

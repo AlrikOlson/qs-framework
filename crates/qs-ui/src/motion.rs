@@ -23,6 +23,22 @@
 //! actually good at: deciding what reduced motion *does* to a pattern. A fade may survive,
 //! capped; a layout change becomes instant.
 //!
+//! # A duration is not a speed
+//!
+//! UXDD 10.3 gives each pattern one number, and one number is only right for one distance.
+//! Arrowing down a single row moves the selection region a row height; `End` after a page of
+//! scrolling moves it most of a viewport. Spending the table's 120 ms on both makes the short
+//! move *feel slow*, and specifically it feels slow in the way that reads as lag rather than
+//! as animation: a cubic ease-out lays 94 % of the travel into the first 60 % of the time and
+//! then creeps through what is left, so over 28 pixels the last 50 ms move under two pixels.
+//! Nothing is broken and nothing measures wrong; the interface simply feels like it is
+//! waiting for something.
+//!
+//! So a pattern that has a distance scales its duration by one -- see [`duration_for`] --
+//! between a floor and the table's number, which becomes the *ceiling* rather than the
+//! answer. A pattern with no distance keeps its single number, because inventing a distance
+//! to scale a fade by would be worse than the problem.
+//!
 //! # Every animation retires, and that is the whole of SC-003
 //!
 //! The frame loop stays awake exactly as long as one [`Animation`] is live. Idle is not a
@@ -41,6 +57,7 @@
 //!    particularly bad way to fail.
 
 use crate::density::{Density, DensityTransition};
+use crate::material::Drive;
 use crate::row::Interaction;
 
 /// The user's motion preference, as reported by the OS.
@@ -53,6 +70,24 @@ pub enum MotionPreference {
 
 /// Cross-fade duration under reduced motion, in seconds.
 pub const REDUCED_CROSSFADE: f32 = 0.080;
+
+/// How long one turn of the material cycle takes, in seconds of **awake** time.
+///
+/// Provisional, and stated as provisional rather than tuned: nothing in the build consumes a
+/// phase yet at a speed anyone can look at. `prim-conic-sweep` is the first unit that will
+/// be able to judge it against a moving highlight, and it should change this number rather
+/// than work around it.
+///
+/// Six seconds is chosen to be slower than any pattern in UXDD 10.3 by an order of
+/// magnitude, so a cyclic effect reads as ambience the eye can ignore rather than as a
+/// second animation competing with the one the user caused.
+pub const CYCLE_SECONDS: f32 = 6.0;
+
+/// Where the cycle sits under Reduce Motion. See [`InteractionMotion::phase`].
+///
+/// Zero rather than a mid-cycle value because a layer's authored angle *is* its angle at
+/// phase zero, so this makes the reduced picture the one in `design/tokens.json`.
+pub const PINNED_PHASE: f32 = 0.0;
 
 /// What kind of change is being animated.
 ///
@@ -154,7 +189,34 @@ impl MotionPattern {
         Self::DensityChange,
     ];
 
+    /// The floor and the span for a distance-scaled duration, or `None` for a pattern with
+    /// no distance to scale by.
+    ///
+    /// The floor is what the shortest possible move takes; the span is how far a move has to
+    /// be, in the pattern's own units, before it earns the whole of [`MotionPattern::duration`].
+    ///
+    /// Two of the four patterns are `None`, and neither is an oversight:
+    ///
+    /// - Hover and press are **opacity**. A fade is the same fade wherever it happens, and a
+    ///   distance for it would have to be made up.
+    /// - A density change reflows every row, so what moves is not one row height but each
+    ///   row's accumulated offset -- the bottom of a full viewport travels forty times what
+    ///   the top does. There is no single distance, and the one that matters is already long,
+    ///   which is exactly the case a fixed duration suits.
+    pub fn distance_scaling(self) -> Option<(f32, f32)> {
+        match self {
+            // Sixteen rows is roughly the distance past which a viewer stops reading the
+            // move as "the region stepped" and starts reading it as "the region travelled".
+            // Below it the region should arrive; at or above it, it should be seen going.
+            Self::SelectionChange => Some((0.045, 16.0)),
+            Self::HoverFeedback | Self::PressFeedback | Self::DensityChange => None,
+        }
+    }
+
     /// Full-motion duration in seconds, from UXDD 10.3.
+    ///
+    /// For a pattern with [`MotionPattern::distance_scaling`] this is the **ceiling**, spent
+    /// only by a move at least a span long. Everything shorter gets less.
     pub fn duration(self) -> f32 {
         match self {
             Self::HoverFeedback => 0.080,
@@ -190,10 +252,50 @@ impl MotionPattern {
         }
     }
 
-    /// Resolve this pattern against a preference.
+    /// Resolve this pattern against a preference, at its full duration.
+    ///
+    /// For a pattern that scales with distance this is the longest move's plan. Prefer
+    /// [`MotionPattern::plan_over`] wherever the distance is known, which for the selection
+    /// morph is everywhere it is actually started.
     pub fn plan(self, preference: MotionPreference) -> MotionPlan {
         plan(preference, self.kind(), self.duration(), self.curve())
     }
+
+    /// Resolve this pattern for a move of `distance`, in the pattern's own units.
+    ///
+    /// A pattern with no [`MotionPattern::distance_scaling`] ignores the argument rather than
+    /// pretending to use it.
+    pub fn plan_over(self, preference: MotionPreference, distance: f32) -> MotionPlan {
+        let duration = match self.distance_scaling() {
+            Some((shortest, span)) => duration_for(distance, span, shortest, self.duration()),
+            None => self.duration(),
+        };
+        plan(preference, self.kind(), duration, self.curve())
+    }
+}
+
+/// How long a move of `distance` should take: `shortest` for a standing start, rising to
+/// `longest` once the move is `span` or more.
+///
+/// The growth is a **square root**, and the two straight-line alternatives are both worse.
+/// A constant duration is a speed that varies with distance, which is where "a short move
+/// looks artificially slow" comes from. A constant *speed* -- duration linear in distance --
+/// fixes the short move and ruins the long one: a viewport-long slide at a one-row pace takes
+/// most of a second, and the user is waiting for a region they can already see the
+/// destination of. A square root keeps the short move short and lets a long one take only
+/// somewhat longer, which is about how far anyone's patience actually scales with distance.
+///
+/// A non-finite or non-positive `distance` or `span` returns `shortest`: no distance to
+/// spend means nothing to spend it on, and it keeps a NaN out of an animation's clock, where
+/// it would make [`Animation::advance`] never terminate and take SC-003 with it.
+pub fn duration_for(distance: f32, span: f32, shortest: f32, longest: f32) -> f32 {
+    // Spelled out rather than negated, because `!(x > 0.0)` and `x <= 0.0` differ on NaN and
+    // the difference is the one that matters here.
+    if distance.is_nan() || distance <= 0.0 || span.is_nan() || span <= 0.0 {
+        return shortest;
+    }
+    let t = (distance / span).clamp(0.0, 1.0).sqrt();
+    shortest + (longest - shortest) * t
 }
 
 /// Decide how to present a change.
@@ -413,6 +515,8 @@ pub struct InteractionMotion {
     pressed: Phase<Option<u64>>,
     selected: Phase<Option<u64>>,
     density: Option<DensityTransition>,
+    /// Where the material cycle is, in turns. See [`InteractionMotion::phase`].
+    cycle: f32,
 }
 
 impl InteractionMotion {
@@ -423,6 +527,7 @@ impl InteractionMotion {
             pressed: Phase::settled(None),
             selected: Phase::settled(None),
             density: None,
+            cycle: 0.0,
         }
     }
 
@@ -432,10 +537,13 @@ impl InteractionMotion {
 
     /// Bring the animated state in line with the interaction state. Idempotent: calling this
     /// every frame with unchanged input starts nothing.
-    pub fn sync(&mut self, interaction: Interaction) {
+    /// The morph follows [`Selection::morph_target`](crate::selection::Selection::morph_target)
+    /// rather than the selection itself: a multiple selection has no single region to move,
+    /// and the renderer draws its rows directly instead.
+    pub fn sync(&mut self, interaction: Interaction<'_>) {
         self.set_hovered(interaction.hovered);
         self.set_pressed(interaction.pressed);
-        self.set_selected(interaction.selected);
+        self.set_selected(interaction.selection.morph_target());
     }
 
     pub fn set_hovered(&mut self, row: Option<u64>) {
@@ -456,8 +564,22 @@ impl InteractionMotion {
         self.pressed.set(row, plan);
     }
 
+    /// The one place the selection morph's distance is known, which is why the duration is
+    /// decided here rather than read off the pattern.
+    ///
+    /// The distance is measured from where the region is currently *heading*, not from where
+    /// it started: hold an arrow key and each press restarts the morph from the row the last
+    /// one was aimed at, so a run of single-row steps stays a run of short, snappy moves
+    /// instead of the second press inheriting the first one's length.
+    ///
+    /// Appearing or disappearing has no distance -- it is a fade in place -- so it takes the
+    /// floor, which is also the shortest thing this pattern can do.
     pub fn set_selected(&mut self, row: Option<u64>) {
-        let plan = MotionPattern::SelectionChange.plan(self.preference);
+        let distance = match (self.selected.to(), row) {
+            (Some(from), Some(to)) => from.abs_diff(to) as f32,
+            _ => 0.0,
+        };
+        let plan = MotionPattern::SelectionChange.plan_over(self.preference, distance);
         self.selected.set(row, plan);
     }
 
@@ -491,6 +613,23 @@ impl InteractionMotion {
     /// would leave the later ones frozen for as long as an earlier one runs, and a frozen
     /// animation is a ticket that never retires.
     pub fn advance(&mut self, dt: f32) -> bool {
+        // The material cycle, and the one line in this function whose result is deliberately
+        // *not* in the expression returned below.
+        //
+        // That exclusion is the whole safety argument. A phase is a position, so something
+        // has to move it, and anything that both moves it and reports "still running" would
+        // make every frame an animating frame -- which is precisely the defect
+        // `frame-pacing-bound` was opened to remove. Here the cycle rides wakefulness that
+        // some other animation already bought and can never buy any of its own: for the
+        // phase to hold the loop open, someone would have to add `cycle` to a boolean it is
+        // not part of, which is a visible edit rather than an oversight.
+        //
+        // It also means `dt` only arrives while the loop is awake, so a travelling highlight
+        // resumes where it stopped instead of jumping by the length of the sleep. Reading a
+        // wall clock in `phase()` would have been the same number of lines and would have
+        // shipped that jump.
+        self.cycle = (self.cycle + dt.max(0.0) / CYCLE_SECONDS).rem_euclid(1.0);
+
         let hover = self.hover.advance(dt);
         let pressed = self.pressed.advance(dt);
         let selected = self.selected.advance(dt);
@@ -532,6 +671,59 @@ impl InteractionMotion {
     /// travelling: it reads as a flash, and at a million rows the naive version would try to
     /// slide the region across half the corpus in 120 ms. The viewport is the bound because
     /// it is exactly the distance beyond which the start and the end cannot both be seen.
+    /// How hard the selection is being *moved*, `0.0..=1.0`.
+    ///
+    /// The drive an animated material reads: `1.0` the instant the selection changes,
+    /// falling to `0.0` as the region settles, and exactly `0.0` whenever nothing is
+    /// animating. Materials multiply their swell by it, so a halo flares as the region
+    /// leaves and has settled by the time it lands.
+    ///
+    /// `1 - progress` rather than a bump curve, and the difference matters because the
+    /// pattern's curve is an `ease-out`: about 94% of the travel happens in the first 60% of
+    /// the time, so the drive is already low while the region is still visibly arriving. The
+    /// flare is on the *departure*, which is the half the eye is following.
+    ///
+    /// Reduce Motion needs no branch here. A reduced plan is instant, `Phase::set` never
+    /// opens a ticket for it, `is_animating` is false and this is `0.0` — so an animated
+    /// material is simply a still one, which is what UXDD 10.3 asks for.
+    #[must_use]
+    pub fn selection_swell(&self) -> f32 {
+        if !self.selected.is_animating() {
+            return 0.0;
+        }
+        (1.0 - self.selected.progress()).clamp(0.0, 1.0)
+    }
+
+    /// Where the material cycle is, in turns, `0.0..1.0`.
+    ///
+    /// The **position** half of a [`Drive`], and a different question from
+    /// [`InteractionMotion::selection_swell`]: a swell says how loud a material is, and no
+    /// amount of loudness says a highlight is three-quarters of the way round a border.
+    ///
+    /// Under Reduce Motion this is **pinned**, not frozen, and the distinction is the whole
+    /// of UXDD 10.3's "instant" for a cyclic effect. Freezing would hand back whatever
+    /// `cycle` happened to hold when the preference was read, so the still frame would
+    /// depend on when the user turned the setting on — a different picture on different
+    /// machines, none of them drawn by anyone. Pinned to zero, the still frame is the layer
+    /// at its authored angle, which is a picture a designer chose.
+    #[must_use]
+    pub fn phase(&self) -> f32 {
+        match self.preference {
+            MotionPreference::Reduced => PINNED_PHASE,
+            MotionPreference::Full => self.cycle,
+        }
+    }
+
+    /// What to hand [`crate::tokens::Tokens::paint_driven`] this frame.
+    ///
+    /// One call rather than two so a surface cannot pick up the swell and forget the phase,
+    /// which would show as a material that animates its opacity and not its geometry — the
+    /// kind of half-wired effect that reads as a rendering bug.
+    #[must_use]
+    pub fn drive(&self) -> Drive {
+        Drive::new(self.selection_swell(), self.phase())
+    }
+
     pub fn selection_draw(&self, viewport_rows: u32) -> Option<SelectionDraw> {
         if !self.selected.is_animating() {
             return self.selected.to().map(|row| SelectionDraw {
@@ -676,6 +868,142 @@ mod tests {
         );
         assert!(!reduced.is_instant());
         assert!((reduced.duration() - 0.4).abs() < 1e-6);
+    }
+
+    // -- distance-scaled duration ---------------------------------------------------------
+
+    #[test]
+    fn a_duration_grows_with_distance_and_stops_growing_at_the_span() {
+        let (shortest, longest, span) = (0.045, 0.120, 16.0);
+        let at = |d: f32| duration_for(d, span, shortest, longest);
+
+        assert!(
+            (at(0.0) - shortest).abs() < 1e-6,
+            "a standing start is the floor"
+        );
+        assert!(
+            (at(span) - longest).abs() < 1e-6,
+            "a span-long move is the ceiling"
+        );
+        assert!(
+            (at(span * 4.0) - longest).abs() < 1e-6,
+            "a move four spans long still takes one span's time -- past the span the region \
+             cross-fades rather than travelling, so there is nothing longer to pay for"
+        );
+
+        // Monotonic, with no step in it: a duration that jumped would make two nearly equal
+        // moves feel unequal, which is more noticeable than either being slightly off.
+        let mut previous = at(0.0);
+        for i in 1..=64 {
+            let next = at(span * i as f32 / 64.0);
+            assert!(next >= previous - 1e-6, "duration fell between samples");
+            previous = next;
+        }
+
+        // The square root, stated as the property that distinguishes it from the linear
+        // alternative: four times the distance is *half* the extra time, not four times it.
+        let quarter = at(span * 0.25) - shortest;
+        let full = longest - shortest;
+        assert!(
+            (quarter - full * 0.5).abs() < 1e-6,
+            "a quarter-span move spent {quarter:.4}s of the range rather than half of it -- \
+             the growth is not sqrt, so either short moves crawl or long ones do"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_distance_is_the_floor_and_never_a_nan() {
+        // A NaN duration makes `Animation::advance` compare false forever, the ticket never
+        // retires, and the frame loop never sleeps -- an SC-003 failure arriving through the
+        // motion table. Cheaper to make impossible than to detect.
+        for bad in [0.0, -3.0, f32::NAN, f32::INFINITY] {
+            for span in [0.0, -1.0, f32::NAN, 16.0] {
+                let d = duration_for(bad, span, 0.045, 0.120);
+                assert!(d.is_finite(), "distance {bad} over span {span} gave {d}");
+                assert!((0.045 - 1e-6..=0.120 + 1e-6).contains(&d));
+            }
+        }
+    }
+
+    /// Frames at 120 Hz for a morph to settle.
+    fn frames_to_settle(motion: &mut InteractionMotion) -> u32 {
+        let mut frames = 0;
+        while motion.advance(1.0 / 120.0) {
+            frames += 1;
+            assert!(frames < 10_000, "the morph never retired");
+        }
+        frames
+    }
+
+    #[test]
+    fn a_one_row_move_finishes_much_sooner_than_a_screen_long_one() {
+        // The complaint this exists to answer: at one fixed duration a single-row step spends
+        // the same time as a move across the viewport, and the short one reads as lag. What
+        // is asserted is the *ratio*, not either number -- the two constants may be tuned,
+        // and the thing that must not come back is them being equal.
+        let mut short = InteractionMotion::new(MotionPreference::Full);
+        short.set_selected(Some(0));
+        short.set_selected(Some(1));
+        let short_frames = frames_to_settle(&mut short);
+
+        let mut long = InteractionMotion::new(MotionPreference::Full);
+        long.set_selected(Some(0));
+        long.set_selected(Some(40));
+        let long_frames = frames_to_settle(&mut long);
+
+        assert!(
+            short_frames * 3 < long_frames * 2,
+            "a one-row step took {short_frames} frames against {long_frames} for a forty-row \
+             one: the duration is barely reading the distance"
+        );
+        assert!(
+            short_frames > 0,
+            "a one-row step became instant, which is a different bug -- the region would \
+             teleport and the morph would be pointless"
+        );
+    }
+
+    #[test]
+    fn each_press_of_a_held_arrow_key_starts_a_fresh_short_move() {
+        // Distance is measured from where the region is *heading*, not from where it started.
+        // Measured from the origin instead, the second press of a held arrow key would be a
+        // two-row move, the third a three-row one, and holding the key would make each step
+        // slower than the last while the key repeat stayed constant -- which reads as the
+        // list bogging down.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        motion.set_selected(Some(0));
+        motion.set_selected(Some(1));
+        let first = frames_to_settle(&mut motion);
+
+        motion.set_selected(Some(2));
+        // Interrupted a third of the way through, exactly as a key repeat would.
+        motion.advance(1.0 / 120.0);
+        motion.set_selected(Some(3));
+        let interrupted = frames_to_settle(&mut motion);
+
+        assert!(
+            interrupted <= first + 1,
+            "an interrupted single-row step took {interrupted} frames against {first} for an \
+             uninterrupted one: the distance is being measured from the wrong end"
+        );
+    }
+
+    #[test]
+    fn a_fade_ignores_the_distance_rather_than_inventing_one() {
+        // Hover and press are opacity. There is no distance, and scaling their duration by a
+        // row count would be a number with no meaning behind it.
+        for pattern in [MotionPattern::HoverFeedback, MotionPattern::PressFeedback] {
+            assert_eq!(pattern.distance_scaling(), None, "{pattern:?}");
+            for distance in [0.0, 1.0, 500.0] {
+                let scaled = pattern
+                    .plan_over(MotionPreference::Full, distance)
+                    .duration();
+                assert!(
+                    (scaled - pattern.duration()).abs() < 1e-6,
+                    "{pattern:?} changed length with a distance it does not have"
+                );
+            }
+        }
     }
 
     // -- the UXDD table -----------------------------------------------------------------
@@ -909,10 +1237,12 @@ mod tests {
     fn syncing_unchanged_interaction_state_starts_nothing() {
         // `sync` runs once per event. If it started an animation on unchanged input, every
         // scroll notch would open three tickets.
+        let mut selection = crate::selection::Selection::new();
+        selection.select_only(4);
         let interaction = Interaction {
             hovered: Some(4),
             focused: Some(4),
-            selected: Some(4),
+            selection: &selection,
             pressed: None,
         };
         let mut motion = InteractionMotion::new(MotionPreference::Full);
@@ -1226,6 +1556,170 @@ mod tests {
         assert!(
             motion.selection_draw(40).is_none(),
             "a deselected list must draw no selection region at all"
+        );
+    }
+
+    #[test]
+    fn the_selection_swell_peaks_on_departure_and_is_zero_under_reduce_motion() {
+        // The drive an animated material reads. Two properties, and the second is an
+        // accessibility requirement rather than a preference: UXDD 10.3 says Reduce Motion
+        // makes every pattern instant, and a halo that still flares would be the setting
+        // ignored in the one channel nobody thought to check.
+        let mut full = InteractionMotion::new(MotionPreference::Full);
+        // Run the first selection's own fade-in to rest. Appearing from nothing is a
+        // selection change too, and it swells like one -- which is correct, and is why the
+        // resting assertion below has to come after it rather than before.
+        full.set_selected(Some(0));
+        while full.advance(FRAME) {}
+        assert_eq!(full.selection_swell(), 0.0, "a settled list must not swell");
+
+        full.set_selected(Some(9));
+        let departure = full.selection_swell();
+        assert!(
+            departure > 0.9,
+            "the flare is on the departure: {departure}"
+        );
+
+        // Monotonically down, and exactly zero once the ticket retires -- a drive that
+        // settled at 0.02 would hold a material a hair brighter than its token says forever.
+        let mut previous = departure;
+        while full.advance(FRAME) {
+            let now = full.selection_swell();
+            assert!(
+                now <= previous + 1e-6,
+                "the swell rose again: {previous} → {now}"
+            );
+            previous = now;
+        }
+        assert_eq!(full.selection_swell(), 0.0);
+
+        // Reduce Motion needs no branch anywhere: the plan is instant, so no ticket opens,
+        // so the drive is zero from the first frame and the material is simply a still one.
+        let mut reduced = InteractionMotion::new(MotionPreference::Reduced);
+        reduced.set_selected(Some(0));
+        reduced.set_selected(Some(9));
+        assert!(!reduced.is_animating());
+        assert_eq!(reduced.selection_swell(), 0.0);
+    }
+
+    #[test]
+    fn an_animation_takes_the_same_wall_clock_time_at_any_frame_rate() {
+        // The property `frame-pacing-bound` rests on, and the reason pacing is allowed to
+        // drop frames at all: the clock is advance-to-advance, so a loop running at a
+        // quarter of the rate hands over four times the `dt` and the plan finishes at the
+        // same instant. Without this, pacing would not be a saving -- it would be a
+        // slowdown, and one that only shows up as "the interface feels sluggish now".
+        //
+        // The rates are the ones actually measured on the machine this was written on: an
+        // unpaced loop reached 3,937 Hz and the paced loop reaches 119, so the ratio under
+        // test is the real one rather than a round number.
+        let elapsed_to_settle = |hz: f32| -> f32 {
+            let mut motion = InteractionMotion::new(MotionPreference::Full);
+            motion.set_selected(Some(0));
+            let _ = motion.advance(0.0);
+            motion.set_selected(Some(8));
+            assert!(motion.is_animating(), "nothing to measure");
+
+            let dt = 1.0 / hz;
+            let mut elapsed = 0.0;
+            let mut frames = 0u32;
+            while motion.advance(dt) {
+                elapsed += dt;
+                frames += 1;
+                assert!(frames < 100_000, "an animation never retired at {hz} Hz");
+            }
+            elapsed + dt
+        };
+
+        let fast = elapsed_to_settle(3937.0);
+        let paced = elapsed_to_settle(119.0);
+
+        // Within one frame of the slower rate, which is the granularity the slower rate can
+        // express at all. A pacing bug would not be off by a frame -- it would be off by the
+        // ratio, 33x here.
+        let tolerance = 1.0 / 119.0;
+        assert!(
+            (fast - paced).abs() <= tolerance,
+            "the same animation took {fast:.4}s at 3937 Hz and {paced:.4}s at 119 Hz: \
+             pacing the loop changed how long the animation lasts, which means `dt` is not \
+             advance-to-advance somewhere"
+        );
+    }
+    #[test]
+    fn the_phase_advances_without_ever_holding_the_frame_loop_open() {
+        // The hazard the chunk named: an always-advancing phase makes every frame an
+        // animating frame, which is exactly what `frame-pacing-bound` was opened to remove.
+        //
+        // Nothing here is animating -- no hover, no press, no selection, no density -- so
+        // `advance` must report false however long it is given, while the phase still moves.
+        // Those two facts together are the whole safety argument, and asserting only one of
+        // them would pass with the feature deleted.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        assert!(!motion.is_animating());
+
+        let before = motion.phase();
+        let still_running = motion.advance(CYCLE_SECONDS / 4.0);
+
+        assert!(
+            !still_running,
+            "the cycle reported the loop as still animating, so the application would never              sleep again"
+        );
+        assert!(!motion.is_animating(), "the cycle opened a ticket");
+        assert!(
+            (motion.phase() - before - 0.25).abs() < 1e-5,
+            "a quarter of a cycle moved the phase to {}",
+            motion.phase()
+        );
+    }
+
+    #[test]
+    fn the_phase_wraps_rather_than_running_away() {
+        // A cycle that accumulated would drift out of `0..1` and, in an f32, eventually stop
+        // resolving small steps at all -- the same class of failure as an absolute scroll
+        // offset at a million rows, and just as invisible until it is enormous.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        for _ in 0..1000 {
+            motion.advance(CYCLE_SECONDS * 0.7);
+            assert!(
+                (0.0..1.0).contains(&motion.phase()),
+                "the phase left its range: {}",
+                motion.phase()
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_motion_pins_the_phase_rather_than_freezing_it() {
+        // The distinction UXDD 10.3 needs for a cyclic effect, and it is not pedantry.
+        //
+        // Freezing means "stop advancing and keep what you had", so the still frame depends
+        // on when the preference was read -- a different picture on every machine, none of
+        // them drawn by anyone. Pinning means a stated value, and a layer's authored angle is
+        // its angle at phase zero, so the reduced picture is the one in design/tokens.json.
+        //
+        // The cycle is deliberately still advanced underneath: reduced motion is a
+        // presentation choice, not a broken clock, and a preference that can be turned back
+        // off must not resume from a stale value.
+        let mut reduced = InteractionMotion::new(MotionPreference::Reduced);
+        let mut full = InteractionMotion::new(MotionPreference::Full);
+        for _ in 0..5 {
+            reduced.advance(CYCLE_SECONDS / 8.0);
+            full.advance(CYCLE_SECONDS / 8.0);
+        }
+
+        assert_eq!(
+            reduced.phase(),
+            PINNED_PHASE,
+            "a reduced-motion frame is showing whatever the cycle happened to reach"
+        );
+        assert!(
+            full.phase() != PINNED_PHASE,
+            "the comparison arm never moved, so this test cannot fail"
+        );
+        assert_eq!(
+            reduced.drive().phase,
+            PINNED_PHASE,
+            "the pin is applied by `phase` and skipped by `drive`, so a call site can reach              around it"
         );
     }
 }

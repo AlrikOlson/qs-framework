@@ -14,13 +14,46 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::PendingUpload;
 use crate::device::GpuContext;
-use crate::frame::{DrawList, Instance};
+use crate::frame::{DrawList, FIELD_CENTRES, Instance, PrimKind};
+use crate::target::OffscreenTarget;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 struct Globals {
     viewport: [f32; 2],
     _pad: [f32; 2],
+    /// Premultiplied linear RGBA. See `qs_gpu::frame::Environment`.
+    ///
+    /// `vec4` alignment in a uniform block is 16 bytes, which the two `[f32; 2]` above
+    /// happen to satisfy exactly. A field inserted between them and these would silently
+    /// shift the shader's view of the struct, so anything added goes after.
+    env_horizon: [f32; 4],
+    env_zenith: [f32; 4],
+    /// The ambient field, laid out as three `vec4` arrays rather than an array of structs.
+    ///
+    /// A uniform block pads every struct member to 16 bytes, so an array of a 3-`vec4` struct
+    /// and three arrays of `vec4` occupy the same 192 bytes — and three flat arrays have one
+    /// layout instead of one layout per driver's opinion about the struct's stride. See
+    /// `qs_gpu::frame::FieldWash` for what the three carry.
+    field_place: [[f32; 4]; FIELD_CENTRES],
+    field_tint: [[f32; 4]; FIELD_CENTRES],
+    field_form: [[f32; 4]; FIELD_CENTRES],
+}
+
+/// One row of the field uniform, taken from the draw list's [`crate::frame::FieldWash`].
+///
+/// Three of these rather than one loop building three arrays, because the alternative is
+/// three indices kept in step by hand across a `for` body — and a field whose tint came from
+/// one centre and whose reach came from another is a bug that renders as *almost* right.
+fn field_of(
+    list: &DrawList,
+    row: impl Fn(&crate::frame::FieldCentre) -> [f32; 4],
+) -> [[f32; 4]; FIELD_CENTRES] {
+    let mut out = [[0.0; 4]; FIELD_CENTRES];
+    for (slot, centre) in out.iter_mut().zip(&list.field.centres) {
+        *slot = row(centre);
+    }
+    out
 }
 
 /// Initial instance-buffer capacity, in instances. Grown geometrically on demand; the
@@ -36,6 +69,26 @@ pub struct Renderer {
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
     format: wgpu::TextureFormat,
+    /// The resolve half of the two-pass path. See [`crate::target`].
+    resolve_pipeline: wgpu::RenderPipeline,
+    resolve_layout: wgpu::BindGroupLayout,
+    resolve_sampler: wgpu::Sampler,
+    /// Allocated on the first frame that needs it and never before, so an installation with
+    /// no neighbourhood effect enabled does not carry 33 MB at 4K for nothing.
+    offscreen: Option<OffscreenTarget>,
+    /// Take the two-pass path even when no effect asks for it.
+    ///
+    /// For tests and harnesses. It exists because the path would otherwise be unreachable
+    /// until the first effect built on it lands, and unreachable code is untested code — the
+    /// blur would then be debugging the target and the blur at once. See
+    /// [`Renderer::force_offscreen`].
+    force_offscreen: bool,
+    /// How many times a target has been allocated over this renderer's life.
+    ///
+    /// Reported rather than assumed, in the same spirit as `glyphs_dropped`: "the target is
+    /// recreated only on resize" is a claim about a thing that is otherwise invisible, and a
+    /// per-frame reallocation of 33 MB looks exactly like a correct render.
+    offscreen_allocations: u32,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -43,6 +96,7 @@ impl std::fmt::Debug for Renderer {
         f.debug_struct("Renderer")
             .field("format", &self.format)
             .field("instance_capacity", &self.instance_capacity)
+            .field("offscreen", &self.offscreen)
             .finish()
     }
 }
@@ -61,7 +115,15 @@ impl Renderer {
             label: Some("qs-globals-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                // Both stages. The vertex stage has always needed the viewport; the fragment
+                // stage now needs the environment, because a lit surface reflects a sky and a
+                // sky is a per-frame constant rather than a per-instance one.
+                //
+                // Worth knowing how this fails: a fragment shader reading a binding declared
+                // vertex-only is a *validation* error, and `on_uncaptured_error` logs it to
+                // `tracing`, so a harness with no subscriber renders a blank frame and says
+                // nothing at all. It cost a confused minute; it would cost longer in a window.
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -215,6 +277,93 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // The resolve half. Built at construction rather than lazily beside the target,
+        // because a pipeline is cheap to hold and expensive to compile: creating it on the
+        // first frame that needs a backdrop would put a shader compile inside that frame,
+        // which is the one frame a neighbourhood effect is already making expensive. The
+        // *target* is still lazy — that is where the megabytes are.
+        let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("qs-resolve-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/resolve.wgsl").into()),
+        });
+        let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qs-resolve-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // Nearest, and clamped. The resolve is a 1:1 blit — the target is exactly the
+        // viewport's size — so linear filtering would sample the same texel and cost
+        // nothing, right up until a fractional viewport or a half-texel offset made it
+        // sample two and blur the whole frame by a hair that nobody could attribute.
+        let resolve_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("qs-resolve-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let resolve_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("qs-resolve-pipeline-layout"),
+                bind_group_layouts: &[Some(&resolve_layout)],
+                immediate_size: 0,
+            });
+        let resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("qs-resolve-pipeline"),
+            layout: Some(&resolve_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &resolve_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &resolve_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // `None`, not premultiplied source-over. The offscreen target already
+                    // holds the composited frame; blending it *again* over the surface would
+                    // composite every translucent pixel twice. The resolve replaces.
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             globals_buffer,
@@ -224,6 +373,12 @@ impl Renderer {
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             format,
+            resolve_pipeline,
+            resolve_layout,
+            resolve_sampler,
+            offscreen: None,
+            force_offscreen: false,
+            offscreen_allocations: 0,
         }
     }
 
@@ -277,7 +432,63 @@ impl Renderer {
         self.instance_capacity = capacity;
     }
 
+    /// Take the two-pass path on every frame, whatever the draw list asks for.
+    ///
+    /// Off by default and never set by the application. Its only callers are tests and
+    /// harnesses, and it exists so the offscreen path is exercised **before** the first
+    /// effect is built on it — otherwise the blur chunk debugs the target and the blur
+    /// simultaneously, with no way to tell which one is wrong.
+    pub fn force_offscreen(&mut self, force: bool) {
+        self.force_offscreen = force;
+    }
+
+    /// The offscreen target, if one has been allocated.
+    ///
+    /// `None` until a frame needs it. Exposed so the memory it holds can be reported rather
+    /// than estimated: `renderer.offscreen().map_or(0, OffscreenTarget::bytes)`.
+    #[must_use]
+    pub fn offscreen(&self) -> Option<&OffscreenTarget> {
+        self.offscreen.as_ref()
+    }
+
+    /// How many offscreen targets this renderer has allocated, ever.
+    ///
+    /// One after the first frame that needs one, and one more per resize. Anything else is
+    /// the per-frame reallocation this counter exists to make visible.
+    #[must_use]
+    pub fn offscreen_allocations(&self) -> u32 {
+        self.offscreen_allocations
+    }
+
+    /// Whether this frame needs the offscreen target.
+    ///
+    /// Derived from the draw list rather than declared on it, and that is acceptance's "the
+    /// draw-list handoff is unchanged" holding: the UI thread does not learn a second thing.
+    /// A primitive that samples its neighbourhood says so on [`PrimKind::needs_backdrop`],
+    /// and the renderer notices.
+    ///
+    /// Scanning the instance list is O(n) over a few thousand instances, which is far cheaper
+    /// than the upload that follows it on the same data. Making it O(1) would mean a flag
+    /// somebody has to remember to set, and a flag that disagrees with the instances is a
+    /// frame that samples an unallocated target.
+    fn needs_offscreen(&self, list: &DrawList) -> bool {
+        self.force_offscreen
+            || list
+                .instances
+                .iter()
+                .any(|i| PrimKind::from_raw(i.kind).is_some_and(PrimKind::needs_backdrop))
+    }
+
     /// Encode one frame.
+    ///
+    /// # Two paths, and the first one is still the normal one
+    ///
+    /// With no primitive asking to sample its neighbourhood, this renders straight to
+    /// `target` exactly as it always has: one pass, one command buffer, no extra allocation.
+    /// With one, the instance pass renders into an offscreen colour target and a resolve pass
+    /// puts it back. `the_two_pass_path_is_pixel_identical_to_the_one_pass_path` asserts the
+    /// two produce the same image when nothing has actually sampled the backdrop, which is
+    /// what keeps the addition from being a silent regression.
     pub fn render(
         &mut self,
         ctx: &GpuContext,
@@ -286,6 +497,7 @@ impl Renderer {
         timing: Option<&mut crate::timing::GpuTimer>,
     ) -> wgpu::CommandBuffer {
         self.ensure_capacity(ctx, list.instances.len() as u64);
+        let offscreen = self.ensure_offscreen(ctx, list);
 
         ctx.queue.write_buffer(
             &self.globals_buffer,
@@ -293,6 +505,11 @@ impl Renderer {
             bytemuck::bytes_of(&Globals {
                 viewport: [list.viewport[0] as f32, list.viewport[1] as f32],
                 _pad: [0.0; 2],
+                env_horizon: list.environment.horizon.to_premul_linear_f32(),
+                env_zenith: list.environment.zenith.to_premul_linear_f32(),
+                field_place: field_of(list, |c| [c.at[0], c.at[1], c.drift[0], c.drift[1]]),
+                field_tint: field_of(list, |c| c.tint.to_premul_linear_f32()),
+                field_form: field_of(list, |c| [c.reach, c.phase, 0.0, 0.0]),
             }),
         );
         if !list.instances.is_empty() {
@@ -311,12 +528,20 @@ impl Renderer {
 
         let timestamp_writes = timing.and_then(|t| t.begin(&mut encoder));
 
+        // Where the instance pass draws. The offscreen target when something will sample it,
+        // the surface otherwise -- and the branch is here, once, rather than duplicated as
+        // two copies of the batch loop that could drift apart.
+        let instance_target = match (offscreen, self.offscreen.as_ref()) {
+            (true, Some(t)) => t.view(),
+            _ => target,
+        };
+
         {
             let clear = list.clear;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("qs-main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: instance_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         // The clear colour goes through the same linear conversion as every
@@ -364,7 +589,71 @@ impl Renderer {
             }
         }
 
+        // The resolve. Nothing at all on the single-pass path, which is the shape acceptance
+        // asks for: the existing path stays the path when no effect wants the target.
+        if let (true, Some(offscreen)) = (offscreen, self.offscreen.as_ref()) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("qs-resolve-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // `Load`, not `Clear`. The triangle covers every pixel, so clearing
+                        // would be a full-surface write that is immediately overwritten --
+                        // and on a tiler it would also discard the very contents some later
+                        // effect might want. Nothing here depends on the prior contents; the
+                        // saving is the point.
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                // The timestamp pair belongs to the instance pass. A second pair would need a
+                // second query slot and would report the resolve separately, which is worth
+                // doing when the resolve stops being a copy and not before.
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.resolve_pipeline);
+            pass.set_bind_group(0, offscreen.bind_group(), &[]);
+            pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
+            pass.draw(0..3, 0..1);
+        }
+
         encoder.finish()
+    }
+
+    /// Allocate or resize the offscreen target if this frame needs one.
+    ///
+    /// Returns whether the two-pass path should run. Returning a bool rather than a
+    /// reference is what keeps this callable from `render` without borrowing `self` for the
+    /// rest of the frame — the target is read back out of `self.offscreen` at each use.
+    fn ensure_offscreen(&mut self, ctx: &GpuContext, list: &DrawList) -> bool {
+        if !self.needs_offscreen(list) {
+            // Deliberately does NOT free an existing target. A frame that happens to contain
+            // no blurred surface is followed by one that does, and freeing on the first would
+            // reallocate on the second -- once per scroll past a popover. The target is freed
+            // when the renderer is, or when a resize replaces it.
+            return false;
+        }
+        let size = [list.viewport[0].max(1), list.viewport[1].max(1)];
+        let fits = self
+            .offscreen
+            .as_ref()
+            .is_some_and(|t| t.fits(size, self.format));
+        if !fits {
+            self.offscreen_allocations = self.offscreen_allocations.saturating_add(1);
+            self.offscreen = Some(OffscreenTarget::new(
+                &ctx.device,
+                &self.resolve_layout,
+                &self.resolve_sampler,
+                self.format,
+                size,
+            ));
+        }
+        true
     }
 }
 

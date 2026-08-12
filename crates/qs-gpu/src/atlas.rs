@@ -28,6 +28,33 @@
 //! new glyphs at once would spend the whole frame on them. The bound spreads that across
 //! frames: some glyphs are missing for a frame or two during a violent scroll, which is
 //! far less visible than a 40 ms stall, and it is recorded either way.
+//!
+//! # How the bound is spent, and why it is not first-come
+//!
+//! A bound alone says how much may be uploaded, not *what*. Spending it on whoever asked
+//! first means spending it in draw order, and draw order is top-to-bottom: a cold frame of
+//! realistic filenames wants around 73 distinct glyphs against the CPU tier's 64, so the
+//! first rows got their text and the last rows rendered shredded. That is not a budget
+//! problem -- the budget is nearly enough -- it is an *allocation* problem, and the atlas
+//! had no vocabulary for it. It has two now.
+//!
+//! **[`UploadClass`] separates the bounded from the unbounded.** Icons and emblems are
+//! [`UploadClass::Structural`]: there are at most a dozen of them in any frame, each one
+//! serves every row of its kind, and once resident they never cost anything again. Glyphs
+//! are [`UploadClass::Content`]: there is no bound on how many distinct ones a corpus can
+//! want, so they are the thing that has to be rationed. Rationing them against the *same*
+//! counter meant a page of text could starve the folder icon, which is why the row builder
+//! grew a hand-written prepass that resolved icons before asking for a single glyph. The
+//! two classes have separate bounds now, so that ordering is a rule here rather than a
+//! property of which loop a caller happened to run first.
+//!
+//! **Within content, admission is demand-ordered.** [`GlyphAtlas::want`] records that a
+//! draw wants a key without rasterizing it; [`GlyphAtlas::admit_demanded`] then spends the
+//! content bound on the keys the frame wanted *most*. A letter in forty filenames is
+//! admitted before a letter in one, so the first cold frame reads as text with a few
+//! characters missing rather than as the top half of a list. The caller pays for this by
+//! deferring the instances it could not emit until after `admit_demanded` -- see
+//! `qs_ui::ListRenderer::flush_text`, which is the only correct way to use `want`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -61,6 +88,32 @@ impl From<IconKey> for AtlasKey {
     }
 }
 
+/// Which bound a request is rationed against, and why the two are not one number.
+///
+/// The distinction is *how many distinct entries the class can ever want in one frame*, and
+/// it is the whole argument for the split. See the module docs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum UploadClass {
+    /// Bounded by construction: the icon kinds and emblems, at most a dozen, each serving
+    /// every row that uses it. Drawn from [`STRUCTURAL_UPLOADS_PER_FRAME`], a separate and
+    /// deliberately small bound, so no amount of text can starve them.
+    Structural,
+    /// Unbounded by construction: glyphs. A corpus decides how many distinct ones a frame
+    /// wants, so this is the class the per-frame bound exists to ration.
+    #[default]
+    Content,
+}
+
+/// The structural bound, in entries per frame.
+///
+/// Nine icon kinds plus two emblem shapes is eleven, so twelve is one frame's worst case
+/// with a slot to spare. It is a constant rather than tier configuration because it is a
+/// fact about `crate::icon` and not about the machine: a tier that could afford more would
+/// have nothing to spend it on. Twelve 20px coverage masks is under 5 KB, which is why
+/// giving structural entries their own bound costs less than taking twelve uploads away
+/// from text would.
+pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 12;
+
 /// Glyph heights are rounded up to a multiple of this before choosing a shelf. Quantizing
 /// means glyphs of similar height share shelves and their slots are interchangeable when
 /// freed; without it every shelf holds one height and the atlas fragments immediately.
@@ -91,10 +144,25 @@ pub struct AtlasEntry {
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct AtlasStats {
-    /// Glyphs rasterized and uploaded since the last [`GlyphAtlas::begin_frame`].
+    /// Glyphs rasterized and uploaded since the last [`GlyphAtlas::begin_frame`]. Counts
+    /// both classes, because it answers "what did this frame cost".
     pub uploaded_this_frame: u32,
     /// Glyphs wanted this frame that were deferred by the per-frame upload bound.
     pub deferred_this_frame: u32,
+    /// Distinct content keys this frame wanted but did not have. The denominator of the
+    /// convergence question: `deferred_this_frame` says how many draws went without,
+    /// this says how many *entries* the frame is still short of, which is what decides how
+    /// many more frames it takes to converge.
+    pub demanded_this_frame: u32,
+    /// Structural entries uploaded since the last [`GlyphAtlas::begin_frame`], against
+    /// [`STRUCTURAL_UPLOADS_PER_FRAME`]. Reported separately because a structural
+    /// deferral means [`crate::icon`] wanted more shapes in one frame than exist, which is
+    /// a different bug from text not keeping up.
+    pub structural_this_frame: u32,
+    /// Content entries uploaded since the last [`GlyphAtlas::begin_frame`], against the
+    /// configured per-frame bound. This is the number the bound actually gates;
+    /// [`AtlasStats::uploaded_this_frame`] is the two classes together.
+    pub content_this_frame: u32,
     pub evictions: u64,
     /// Times the atlas could not make room because every resident glyph was in use this
     /// frame. **This is the R8 cliff.** Non-zero means the visible working set does not
@@ -145,6 +213,12 @@ pub struct GlyphAtlas {
     stats: AtlasStats,
     pending: Vec<PendingUpload>,
     allocated_area: u64,
+    /// This frame's content demand: how many draws wanted each key the atlas did not have.
+    /// Cleared rather than reallocated each frame -- steady-state frame building must not
+    /// allocate, and the same reasoning applies here as to `DrawList::reset`.
+    demand: HashMap<AtlasKey, u32>,
+    /// Scratch for sorting `demand`, kept for its capacity for the same reason.
+    ranked: Vec<(AtlasKey, u32)>,
 }
 
 /// A bitmap that needs to reach the GPU texture.
@@ -174,6 +248,8 @@ impl GlyphAtlas {
             stats: AtlasStats::default(),
             pending: Vec::new(),
             allocated_area: 0,
+            demand: HashMap::new(),
+            ranked: Vec::new(),
         }
     }
 
@@ -196,7 +272,26 @@ impl GlyphAtlas {
         self.frame += 1;
         self.stats.uploaded_this_frame = 0;
         self.stats.deferred_this_frame = 0;
+        self.stats.demanded_this_frame = 0;
+        self.stats.structural_this_frame = 0;
+        self.stats.content_this_frame = 0;
         self.pending.clear();
+        self.demand.clear();
+    }
+
+    /// The per-frame content bound this atlas was configured with.
+    pub fn content_bound(&self) -> u32 {
+        self.max_uploads_per_frame
+    }
+
+    /// Whether the frame that just finished was fully served: nothing deferred, and nothing
+    /// demanded that [`GlyphAtlas::admit_demanded`] could not admit.
+    ///
+    /// This is the convergence predicate, and it is only meaningful *after* the frame's
+    /// `admit_demanded` -- before it, every content key the frame wanted is still
+    /// outstanding by construction.
+    pub fn converged(&self) -> bool {
+        self.stats.deferred_this_frame == 0 && self.stats.demanded_this_frame == 0
     }
 
     /// Hand the frame's uploads to the caller, which copies them into the GPU texture.
@@ -221,6 +316,103 @@ impl GlyphAtlas {
     /// `None` means the glyph is not available *this frame*: either it has no ink, the
     /// per-frame upload bound was reached, or the atlas overflowed. All three are
     /// survivable and all three are counted.
+    /// Look up `key` without rasterizing it, recording that one more draw wanted it.
+    ///
+    /// `Some` means resident: draw it now. `None` means the atlas does not have it yet and
+    /// the caller must **defer the instance** until after [`GlyphAtlas::admit_demanded`],
+    /// which is where the content bound is actually spent. A caller that treats `None` as
+    /// "dropped" throws away exactly the glyphs this mechanism exists to rescue.
+    ///
+    /// Demand is counted per *draw*, not per key, and that is the ranking: a letter that
+    /// appears in forty visible filenames is wanted forty times and outranks one that
+    /// appears once.
+    pub fn want(&mut self, key: impl Into<AtlasKey>) -> Option<AtlasEntry> {
+        let key = key.into();
+        if let Some(res) = self.resident.get_mut(&key) {
+            res.last_used_frame = self.frame;
+            res.referenced = true;
+            self.stats.hits += 1;
+            return Some(res.entry);
+        }
+        self.stats.misses += 1;
+        *self.demand.entry(key).or_insert(0) += 1;
+        None
+    }
+
+    /// Spend the content bound on the keys this frame wanted most.
+    ///
+    /// Ranks everything [`GlyphAtlas::want`] recorded by how many draws wanted it, admits
+    /// down that order until the per-frame bound is spent, and leaves the rest for a later
+    /// frame. Ties break on the key so a given frame always admits the same set: a
+    /// screenshot that changed between runs because a `HashMap` iterated differently would
+    /// make every visual test flaky for a reason nobody could reproduce.
+    ///
+    /// `render` produces the coverage bitmap for a key, and is called at most once per key
+    /// admitted -- never for one the bound could not reach, so a caller whose rasterization
+    /// is expensive does not pay for work this frame could not have used.
+    ///
+    /// An inkless content key is a space. It is memoized as a blank exactly as
+    /// [`GlyphAtlas::get_or_insert`] does and costs no upload, so a page full of spaces
+    /// cannot consume the bound.
+    pub fn admit_demanded(&mut self, mut render: impl FnMut(AtlasKey) -> Option<RasterizedGlyph>) {
+        self.ranked.clear();
+        self.ranked
+            .extend(self.demand.iter().map(|(&k, &n)| (k, n)));
+        // Descending demand, then ascending key. `sort_unstable_by` is fine because the
+        // second term makes the order total.
+        self.ranked
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        for index in 0..self.ranked.len() {
+            if self.stats.content_this_frame >= self.max_uploads_per_frame {
+                break;
+            }
+            let Some(&(key, _)) = self.ranked.get(index) else {
+                break;
+            };
+            match render(key) {
+                Some(bitmap) if !bitmap.is_blank() => {
+                    if self.insert(key, &bitmap, UploadClass::Content).is_some() {
+                        self.demand.remove(&key);
+                    }
+                }
+                Some(_) => {
+                    // A space. Memoizing costs one rasterization ever instead of one per
+                    // frame, and no upload -- see `get_or_render`.
+                    self.insert_blank(key);
+                    self.demand.remove(&key);
+                }
+                // The face could not raster it. Dropping it from demand stops the atlas
+                // retrying a glyph that will fail identically every frame, which would
+                // otherwise hold a slot at the head of the ranking forever.
+                None => {
+                    self.demand.remove(&key);
+                }
+            }
+        }
+
+        // Whatever is left is this frame's shortfall. Two different numbers, and the
+        // difference matters: `demanded` counts distinct *entries* still missing, which is
+        // what decides how many more frames convergence takes, while `deferred` counts the
+        // *draws* that went without, which is what the reader actually sees missing.
+        self.stats.demanded_this_frame = self.demand.len() as u32;
+        self.stats.deferred_this_frame += self.demand.values().copied().sum::<u32>();
+        self.demand.clear();
+    }
+
+    /// Resident lookup with no demand recorded and no insertion.
+    ///
+    /// The second half of [`GlyphAtlas::want`]: the deferring caller calls this after
+    /// [`GlyphAtlas::admit_demanded`] to find out which of its parked draws can now be
+    /// emitted. Counting demand again here would double every glyph's rank.
+    pub fn get(&mut self, key: impl Into<AtlasKey>) -> Option<AtlasEntry> {
+        let key = key.into();
+        let res = self.resident.get_mut(&key)?;
+        res.last_used_frame = self.frame;
+        res.referenced = true;
+        Some(res.entry)
+    }
+
     pub fn get_or_insert(
         &mut self,
         db: &dyn FontDb,
@@ -232,7 +424,9 @@ impl GlyphAtlas {
         // instead of one per frame. Nothing else in the atlas has a legitimate blank, which
         // is why `blank_is_ok` is a parameter of this call rather than a property of the
         // atlas -- see `crate::icon`.
-        self.get_or_render(key, true, |slot| raster.rasterize(db, slot))
+        self.get_or_render(key, true, UploadClass::Content, |slot| {
+            raster.rasterize(db, slot)
+        })
     }
 
     /// Look up any atlas entry, producing its coverage bitmap on a miss.
@@ -244,10 +438,17 @@ impl GlyphAtlas {
     /// `blank_is_ok` decides what an inkless bitmap means. For glyphs it is a space and gets
     /// memoized, so [`GlyphAtlas::is_blank`] can tell callers to stop counting it as a
     /// missing glyph. For icons it is a bug, and refusing to memoize keeps it visible.
+    ///
+    /// `class` decides which bound the request is rationed against -- see [`UploadClass`].
+    /// This is the *immediate* path: it admits on the spot and therefore in call order,
+    /// which is correct for [`UploadClass::Structural`] (bounded by construction, so order
+    /// cannot starve anything) and is the thing [`GlyphAtlas::want`] exists to replace for
+    /// content.
     pub fn get_or_render<K>(
         &mut self,
         key: K,
         blank_is_ok: bool,
+        class: UploadClass,
         render: impl FnOnce(K) -> Option<RasterizedGlyph>,
     ) -> Option<AtlasEntry>
     where
@@ -263,7 +464,14 @@ impl GlyphAtlas {
 
         self.stats.misses += 1;
 
-        if self.stats.uploaded_this_frame >= self.max_uploads_per_frame {
+        let (spent, bound) = match class {
+            UploadClass::Structural => (
+                self.stats.structural_this_frame,
+                STRUCTURAL_UPLOADS_PER_FRAME,
+            ),
+            UploadClass::Content => (self.stats.content_this_frame, self.max_uploads_per_frame),
+        };
+        if spent >= bound {
             // Spread the work rather than blowing the budget. The entry will be picked up
             // next frame; see the module docs.
             self.stats.deferred_this_frame += 1;
@@ -278,7 +486,7 @@ impl GlyphAtlas {
             return None;
         }
 
-        self.insert(atlas_key, &bitmap)
+        self.insert(atlas_key, &bitmap, class)
     }
 
     fn insert_blank(&mut self, key: AtlasKey) {
@@ -304,7 +512,12 @@ impl GlyphAtlas {
         self.clock.push_back(key);
     }
 
-    fn insert(&mut self, key: AtlasKey, bitmap: &RasterizedGlyph) -> Option<AtlasEntry> {
+    fn insert(
+        &mut self,
+        key: AtlasKey,
+        bitmap: &RasterizedGlyph,
+        class: UploadClass,
+    ) -> Option<AtlasEntry> {
         let padded_w = bitmap.width + GUTTER * 2;
         let padded_h = bitmap.height + GUTTER * 2;
         if padded_w > self.size || padded_h > self.size {
@@ -353,6 +566,10 @@ impl GlyphAtlas {
             coverage: bitmap.coverage.clone(),
         });
         self.stats.uploaded_this_frame += 1;
+        match class {
+            UploadClass::Structural => self.stats.structural_this_frame += 1,
+            UploadClass::Content => self.stats.content_this_frame += 1,
+        }
         self.allocated_area += u64::from(padded_w) * u64::from(padded_h);
 
         self.resident.insert(
@@ -478,6 +695,7 @@ impl GlyphAtlas {
         self.resident.clear();
         self.clock.clear();
         self.pending.clear();
+        self.demand.clear();
         self.allocated_area = 0;
         self.generation += 1;
     }
@@ -667,6 +885,152 @@ mod tests {
             "the atlas emptied itself instead of recycling"
         );
         assert!(stats.occupancy <= 1.0);
+    }
+
+    #[test]
+    fn the_content_bound_goes_to_the_most_wanted_keys_not_the_first_asked() {
+        let Some((db, mut raster, glyphs)) = fixture() else {
+            return;
+        };
+        if glyphs.len() < 3 {
+            return;
+        }
+        // One upload for three keys, so exactly one can win and the choice is forced to be
+        // visible. The rare key is asked for *first*: under the old first-come rule it
+        // would take the slot, which is the defect this whole mechanism replaces.
+        let mut atlas = GlyphAtlas::new(1024, 1);
+        atlas.begin_frame();
+
+        let (rare_id, rare_font) = glyphs[0];
+        let (common_id, common_font) = glyphs[1];
+        let rare = key(rare_font, rare_id);
+        let common = key(common_font, common_id);
+
+        assert!(atlas.want(rare).is_none());
+        for _ in 0..40 {
+            assert!(atlas.want(common).is_none());
+        }
+        atlas.admit_demanded(|k| match k {
+            AtlasKey::Glyph(g) => raster.rasterize(db.as_ref(), g),
+            AtlasKey::Icon(_) => None,
+        });
+
+        assert!(
+            atlas.get(common).is_some(),
+            "the key forty draws wanted did not get the frame's one upload"
+        );
+        assert!(
+            atlas.get(rare).is_none(),
+            "the key one draw wanted took the slot because it asked first"
+        );
+        assert_eq!(atlas.stats().content_this_frame, 1);
+        assert_eq!(
+            atlas.stats().demanded_this_frame,
+            1,
+            "one distinct entry is still owed"
+        );
+        assert_eq!(
+            atlas.stats().deferred_this_frame,
+            1,
+            "and exactly one draw went without"
+        );
+    }
+
+    #[test]
+    fn structural_entries_draw_from_their_own_bound_and_text_cannot_starve_them() {
+        // The rule that let the row builder's icon prepass go. The content bound is spent
+        // to the last upload before the structural request arrives; under one shared
+        // counter it would be refused, which is exactly how a cold frame used to lose its
+        // icons to the text above them.
+        let Some((db, mut raster, glyphs)) = fixture() else {
+            return;
+        };
+        if glyphs.len() < 4 {
+            return;
+        }
+        let mut atlas = GlyphAtlas::new(1024, 2);
+        atlas.begin_frame();
+        for &(id, font) in glyphs.iter().take(4) {
+            atlas.want(key(font, id));
+        }
+        atlas.admit_demanded(|k| match k {
+            AtlasKey::Glyph(g) => raster.rasterize(db.as_ref(), g),
+            AtlasKey::Icon(_) => None,
+        });
+        assert_eq!(
+            atlas.stats().content_this_frame,
+            2,
+            "the content bound was not exhausted, so this proves nothing"
+        );
+
+        // A structural request now, with the content bound gone.
+        let shape = IconKey {
+            shape: crate::icon::IconShape::Kind(crate::icon::IconKind::Folder),
+            px: 20,
+        };
+        let entry = atlas.get_or_render(
+            shape,
+            false,
+            UploadClass::Structural,
+            crate::icon::rasterize,
+        );
+        assert!(
+            entry.is_some(),
+            "text spent the frame and the icon was refused -- the two classes share a bound"
+        );
+        assert_eq!(atlas.stats().structural_this_frame, 1);
+    }
+
+    #[test]
+    fn the_structural_bound_holds_every_shape_the_icon_module_can_produce() {
+        // `STRUCTURAL_UPLOADS_PER_FRAME` is a claim about `crate::icon`, not about the
+        // machine, so it is only correct as long as that claim is. A tenth icon kind added
+        // without raising the constant would silently start dropping one icon per frame.
+        let shapes = crate::icon::IconKind::ALL.len() + crate::icon::Emblem::ALL.len();
+        assert!(
+            shapes as u32 <= STRUCTURAL_UPLOADS_PER_FRAME,
+            "qs_gpu::icon can produce {shapes} distinct shapes in one frame but the \
+             structural bound is {STRUCTURAL_UPLOADS_PER_FRAME}"
+        );
+    }
+
+    #[test]
+    fn a_blank_is_memoized_by_demanded_admission_and_costs_no_upload() {
+        // Spaces are common, so they rank high, and a space that spent an upload every
+        // frame would take a slot from a letter forever.
+        let Some((db, mut raster, glyphs)) = fixture() else {
+            return;
+        };
+        let Some(&(id, font)) = glyphs.first() else {
+            return;
+        };
+        let mut atlas = GlyphAtlas::new(1024, 4);
+        atlas.begin_frame();
+        let k = key(font, id);
+        atlas.want(k);
+        // Force the blank path: render reports an inkless bitmap for this key.
+        atlas.admit_demanded(|_| {
+            Some(RasterizedGlyph {
+                width: 0,
+                height: 0,
+                left: 0,
+                top: 0,
+                coverage: Vec::new(),
+                was_color: false,
+            })
+        });
+        assert!(atlas.is_blank(k), "the blank was not memoized");
+        assert_eq!(
+            atlas.stats().content_this_frame,
+            0,
+            "a blank spent an upload"
+        );
+        assert_eq!(atlas.stats().demanded_this_frame, 0);
+
+        // And it stays memoized: a second frame must not re-rasterize it.
+        atlas.begin_frame();
+        assert!(atlas.want(k).is_some());
+        let _ = (&mut raster, db);
     }
 
     #[test]

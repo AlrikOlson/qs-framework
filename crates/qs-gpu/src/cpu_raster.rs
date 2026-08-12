@@ -26,16 +26,25 @@
 //! in dark-theme shadows, this is why.
 
 use tiny_skia::{
-    BlendMode, FillRule, Paint, PathBuilder, Pixmap, PremultipliedColorU8, Rect, Stroke, Transform,
+    BlendMode, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, PremultipliedColorU8,
+    Rect, SpreadMode, Stroke, Transform,
 };
 
 use crate::atlas::PendingUpload;
-use crate::color::linear_to_srgb;
+use crate::color::{dithered, linear_rgb_to_oklab, linear_to_srgb, oklab_to_linear_rgb};
 use crate::frame::{DrawList, Instance, PrimKind};
 
 /// Circle-to-bezier constant. Four cubics with control points at this fraction of the
 /// radius approximate a quarter circle to within about 0.02% -- far below a pixel.
 const KAPPA: f32 = 0.552_284_8;
+
+/// How far past a gradient's rectangle its pattern is evaluated, in pixels.
+///
+/// `fill_path` antialiases, so it asks for colour at pixels the rectangle only partly
+/// covers. One pixel of margin is enough for that, and `SpreadMode::Pad` covers anything
+/// beyond it with the edge colour -- which is what the shader's `clamp(t, 0, 1)` produces
+/// there anyway.
+const GRADIENT_MARGIN: i32 = 1;
 
 pub struct CpuRasterizer {
     pixmap: Pixmap,
@@ -132,17 +141,71 @@ impl CpuRasterizer {
     }
 
     fn draw_instance(&mut self, instance: &Instance, clip: Option<Rect>) {
+        // Fidelity is resolved here and nowhere else. An enhanced primitive -- one this
+        // tier cannot draw at any tolerance -- becomes the floor its `PrimKind` declares,
+        // or becomes nothing, before a single `tiny-skia` call is reached. Approximating
+        // one further down instead is the change `tier_parity`'s floor check exists to
+        // catch: it would put a difference back into the tiers that nobody wrote down.
+        let Some(instance) = instance.cpu_floor() else {
+            return;
+        };
+        let instance = &instance;
+
         let [x, y, w, h] = instance.rect;
         if !(w > 0.0 && h > 0.0) {
             return;
         }
         let (r, g, b, a) = unpack_premul_linear(instance.color);
-        if a <= 0.0 {
+        // A gradient's `color` is only its *near* stop, so an invisible one says nothing
+        // about the far end. Skipping on it alone would silently drop every fade-in --
+        // the exact shape a transparent-to-opaque wash takes.
+        let peak_alpha = if instance.kind == PrimKind::Gradient as u32
+            || instance.kind == PrimKind::Sweep as u32
+        {
+            a.max(instance.uv[3])
+        } else {
+            a
+        };
+        if peak_alpha <= 0.0 {
             return;
         }
 
         match instance.kind {
             k if k == PrimKind::Glyph as u32 => self.draw_glyph(instance, r, g, b, a, clip),
+            // One arm for both ramps. The conic sweep is the linear gradient with a different
+            // parameter -- same stops, same Oklab walk, same dither, same coverage -- so it
+            // takes the same per-pixel pattern and the same `tiny-skia` fill, and `ramp_pixmap`
+            // is where the one difference lives.
+            k if k == PrimKind::Gradient as u32 || k == PrimKind::Sweep as u32 => {
+                let Some(path) = rounded_rect(x, y, w, h, instance.radius) else {
+                    return;
+                };
+                let Some((ramp, origin)) = ramp_pixmap(instance) else {
+                    return;
+                };
+                let paint = Paint {
+                    // `Nearest` and an integer translate together are what make this a
+                    // per-pixel handoff rather than a resample: device pixel (X, Y) reads
+                    // pattern pixel (X - origin.0, Y - origin.1) and nothing in between.
+                    shader: Pattern::new(
+                        ramp.as_ref(),
+                        SpreadMode::Pad,
+                        FilterQuality::Nearest,
+                        1.0,
+                        Transform::from_translate(origin.0 as f32, origin.1 as f32),
+                    ),
+                    anti_alias: true,
+                    blend_mode: BlendMode::SourceOver,
+                    ..Paint::default()
+                };
+                self.pixmap.fill_path(
+                    &path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    clip_mask(clip).as_ref(),
+                );
+            }
             k if k == PrimKind::Stroke as u32 => {
                 // The shader strokes **inside** the shape: its band spans the signed
                 // distance range [-width, 0], so a ring on a rect sits entirely within the
@@ -334,6 +397,172 @@ fn clip_mask(_clip: Option<Rect>) -> Option<tiny_skia::Mask> {
     // its batch's scissor, the GPU tiers will clip it and this one will not, and the parity
     // suite will catch it as a diff.
     None
+}
+
+/// One point on a gradient's Oklab ramp, premultiplied, matching `ramp` in
+/// `shaders/instance.wgsl`.
+///
+/// Both stops arrive premultiplied because that is the only form the instance buffer
+/// carries. They have to be undone before interpolating: a ramp walked in premultiplied
+/// colour drags a fading stop's hue toward black on the way out, which is a different
+/// picture from the same colour becoming transparent.
+///
+/// `pixel` is the **framebuffer** pixel, and it is what the dither is seeded from. The
+/// shader seeds from `@builtin(position)` for the same reason this does not derive it from
+/// the shape: a position relative to the rectangle is only an exact integer when the
+/// rectangle is, and the parity fixtures deliberately include geometry that is not.
+fn ramp_colour(near: [f32; 4], far: [f32; 4], t: f32, pixel: [u32; 2]) -> [f32; 4] {
+    let straight = |c: [f32; 4]| -> [f32; 3] {
+        if c[3] <= 0.0 {
+            [0.0; 3]
+        } else {
+            [c[0] / c[3], c[1] / c[3], c[2] / c[3]]
+        }
+    };
+    let from = linear_rgb_to_oklab(straight(near));
+    let to = linear_rgb_to_oklab(straight(far));
+    let lab = [
+        from[0] + (to[0] - from[0]) * t,
+        from[1] + (to[1] - from[1]) * t,
+        from[2] + (to[2] - from[2]) * t,
+    ];
+    // Alpha is coverage, not colour: there is no perceptual space for "how much of this
+    // is there", so it lerps linearly.
+    let alpha = near[3] + (far[3] - near[3]) * t;
+    let rgb = oklab_to_linear_rgb(lab);
+    let rgb = dithered(
+        [
+            rgb[0].clamp(0.0, 1.0),
+            rgb[1].clamp(0.0, 1.0),
+            rgb[2].clamp(0.0, 1.0),
+        ],
+        pixel[0],
+        pixel[1],
+    );
+    [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha, alpha]
+}
+
+/// How far around the shape one point is, on the same two-stop ramp a gradient walks.
+///
+/// Matches `sweep_t` in `shaders/instance.wgsl`. The mirror -- near to far and back over one
+/// full turn -- is what makes this continuous where the angle wraps; see [`PrimKind::Sweep`]
+/// for why a seam is the defect this primitive is not allowed to have.
+///
+/// `atan2(0.0, 0.0)` is `0.0` here and *indeterminate* in WGSL, so the shader answers the
+/// exact centre explicitly rather than leaving it to the platform. The guard is written on
+/// both sides so the two tiers cannot disagree about the one fragment that can reach it.
+fn sweep_t(local: [f32; 2], half_size: [f32; 2], phase: f32) -> f32 {
+    let nx = local[0] / half_size[0].max(1e-4);
+    let ny = local[1] / half_size[1].max(1e-4);
+    let angle = if nx == 0.0 && ny == 0.0 {
+        0.0
+    } else {
+        ny.atan2(nx)
+    };
+    let turns = (angle - phase) / std::f32::consts::TAU + 0.5;
+    let f = turns - turns.floor();
+    1.0 - (f * 2.0 - 1.0).abs()
+}
+
+/// The ramp evaluated at every pixel it can reach, plus where that block sits.
+///
+/// This used to be a `LinearGradient` of 33 stops, which was a chord approximation of an
+/// Oklab curve and the whole reason `gradient/*` carried a bound at all. It cannot survive
+/// the dither: `tiny-skia` interpolates *between* the stops it is handed and has nowhere to
+/// put a per-pixel offset, so a dithered shader and a stop-list CPU tier would differ by up
+/// to a level everywhere, and the only way to keep the suite green would be to widen the
+/// bound over a difference nobody wrote down.
+///
+/// Evaluating per pixel removes both problems at once. `tiny-skia` still owns coverage and
+/// antialiasing, which is the part it is better at than a hand-rolled loop; the colour it
+/// covers with is now the same arithmetic the shader runs, so the tiers agree by
+/// construction rather than by tolerance.
+///
+/// The cost is one pixmap the size of the gradient per gradient per frame. On the fallback
+/// tier that is the right trade -- it is the tier that already accepts being slower -- but a
+/// full-window wash would allocate a full-window pixmap, which is worth knowing before one
+/// exists.
+///
+/// Both ramps come through here. What differs between a [`PrimKind::Gradient`] and a
+/// [`PrimKind::Sweep`] is one line -- where `t` comes from -- and keeping them in one function
+/// is the same argument the shader's `ramp_at` makes: a second copy is how the two would come
+/// to disagree about the palette rather than about the parameter.
+fn ramp_pixmap(instance: &Instance) -> Option<(Pixmap, (i32, i32))> {
+    let [x, y, w, h] = instance.rect;
+    let (half_w, half_h) = (w * 0.5, h * 0.5);
+    let (centre_x, centre_y) = (x + half_w, y + half_h);
+
+    // `None` for a sweep: an angular ramp has no axis to take the box's support along, and
+    // the two stops are placed by the angle rather than by an extent.
+    let axis = if instance.kind == PrimKind::Sweep as u32 {
+        None
+    } else {
+        let (sin, cos) = instance.param.sin_cos();
+        // The box's support along the axis -- the same quantity the shader divides by, so the
+        // two tiers put the same colour at the same place.
+        let extent = (half_w * cos).abs() + (half_h * sin).abs();
+        // `is_finite` rather than a bare `<= 0.0`, because a NaN angle would slip past that
+        // comparison and reach the loop below as a NaN `t`.
+        if !extent.is_finite() || extent <= 0.0 {
+            return None;
+        }
+        Some((sin, cos, extent))
+    };
+
+    let (r, g, b, a) = unpack_premul_linear(instance.color);
+    let near = [r, g, b, a];
+    let far = instance.uv;
+
+    // The pixels `fill_path` can ask about: the rectangle's, plus the antialiasing margin.
+    // Negative origins are kept rather than clamped to zero, because the pattern's transform
+    // is what maps this block back onto the surface and clamping would slide it.
+    let left = (x.floor() as i32).saturating_sub(GRADIENT_MARGIN);
+    let top = (y.floor() as i32).saturating_sub(GRADIENT_MARGIN);
+    let right = ((x + w).ceil() as i32).saturating_add(GRADIENT_MARGIN);
+    let bottom = ((y + h).ceil() as i32).saturating_add(GRADIENT_MARGIN);
+    let width = u32::try_from(right - left).ok()?;
+    let height = u32::try_from(bottom - top).ok()?;
+    let mut pixmap = Pixmap::new(width, height)?;
+
+    for (index, slot) in pixmap.pixels_mut().iter_mut().enumerate() {
+        let index = index as u32;
+        let device_x = left + (index % width) as i32;
+        let device_y = top + (index / width) as i32;
+        // The shader shades at the pixel centre, so this does too.
+        let local = [
+            device_x as f32 + 0.5 - centre_x,
+            device_y as f32 + 0.5 - centre_y,
+        ];
+        let t = match axis {
+            Some((sin, cos, extent)) => {
+                ((local[0] * cos + local[1] * sin) / extent * 0.5 + 0.5).clamp(0.0, 1.0)
+            }
+            None => sweep_t(local, [half_w, half_h], instance.param),
+        };
+        // A pixel left of or above the surface has no framebuffer coordinate to seed from.
+        // It is also never sampled -- `fill_path` only shades pixels the surface holds --
+        // so zero is a value that is never read rather than a wrong one.
+        let seed = [
+            u32::try_from(device_x).unwrap_or(0),
+            u32::try_from(device_y).unwrap_or(0),
+        ];
+        let [pr, pg, pb, pa] = ramp_colour(near, far, t, seed);
+        let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        // Rounding each channel independently can put a premultiplied component one above
+        // the alpha it was multiplied by, which `from_rgba` refuses. Clamping is the same
+        // colour: a component can only exceed alpha by the rounding that produced it.
+        let alpha = byte(pa);
+        if let Some(px) = PremultipliedColorU8::from_rgba(
+            byte(pr).min(alpha),
+            byte(pg).min(alpha),
+            byte(pb).min(alpha),
+            alpha,
+        ) {
+            *slot = px;
+        }
+    }
+
+    Some((pixmap, (left, top)))
 }
 
 fn unpack_premul_linear(packed: u32) -> (f32, f32, f32, f32) {

@@ -20,6 +20,7 @@ use qs_ui::a11y::{LIST_ID, SemanticTree, WINDOW_ID, audit, row_node_id};
 use qs_ui::density::Density;
 use qs_ui::fenwick::Heights;
 use qs_ui::recycler::{Recycler, ViewportLayout};
+use qs_ui::row::Interaction;
 use qs_ui::row_source::{RowBuf, StubbornSource};
 
 const CORPUS: u64 = 1_000_000;
@@ -46,7 +47,7 @@ fn frame_at(scroll: f64, rows: u64) -> (RowBuf, ViewportLayout) {
 #[test]
 fn the_list_reports_the_corpus_size_not_the_recycled_row_count() {
     let (buf, layout) = frame_at(0.0, CORPUS);
-    let tree = SemanticTree::build(&buf, &layout, None);
+    let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
     let list = tree
         .nodes
@@ -73,7 +74,7 @@ fn index_in_set_is_the_corpus_ordinal_at_a_deep_scroll_position() {
     // Scroll to row 4,311 (0-based), which announces as "item 4,312".
     let scroll = 4311.0 * 28.0;
     let (buf, layout) = frame_at(scroll, CORPUS);
-    let tree = SemanticTree::build(&buf, &layout, None);
+    let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
     let first = tree
         .nodes
@@ -90,7 +91,7 @@ fn index_in_set_is_the_corpus_ordinal_at_a_deep_scroll_position() {
 fn zero_focusable_nodes_lack_a_role_name_or_bounds() {
     for scroll in [0.0, 1.0, 27.5, 120_736.0, 27_998_919.0] {
         let (buf, layout) = frame_at(scroll, CORPUS);
-        let tree = SemanticTree::build(&buf, &layout, None);
+        let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
         for node in &tree.nodes {
             if !node.focusable {
@@ -116,7 +117,7 @@ fn zero_focusable_nodes_lack_a_role_name_or_bounds() {
 #[test]
 fn published_indices_are_contiguous_and_match_the_visible_range() {
     let (buf, layout) = frame_at(500_000.0, CORPUS);
-    let tree = SemanticTree::build(&buf, &layout, None);
+    let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
     let indices: Vec<usize> = tree
         .nodes
@@ -140,7 +141,7 @@ fn the_audit_can_actually_fail() {
     // A test that only ever passes is decoration. Inject the canonical bug -- publish the
     // recycled-row count as `set_size` -- and confirm the audit names it.
     let (buf, layout) = frame_at(120_736.0, CORPUS);
-    let mut tree = SemanticTree::build(&buf, &layout, None);
+    let mut tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
     let visible = buf.len();
     for node in &mut tree.nodes {
@@ -161,7 +162,7 @@ fn the_audit_can_actually_fail() {
 #[test]
 fn a_nameless_row_is_caught() {
     let (buf, layout) = frame_at(0.0, CORPUS);
-    let mut tree = SemanticTree::build(&buf, &layout, None);
+    let mut tree = SemanticTree::build(&buf, &layout, Interaction::default());
     if let Some(node) = tree.nodes.iter_mut().find(|n| n.focusable) {
         node.label = "   ".into();
     }
@@ -172,7 +173,7 @@ fn a_nameless_row_is_caught() {
 #[test]
 fn the_accesskit_update_is_well_formed() {
     let (buf, layout) = frame_at(120_736.0, CORPUS);
-    let tree = SemanticTree::build(&buf, &layout, None);
+    let tree = SemanticTree::build(&buf, &layout, Interaction::default());
     let update = tree.to_update(Some(layout.visible.first));
 
     // Focus must name a node in the update, or AccessKit rejects the whole thing.
@@ -193,7 +194,7 @@ fn an_empty_corpus_still_publishes_a_usable_tree() {
     // A window with nothing in it must still announce a list, not an empty tree that a
     // screen reader reports as a blank window.
     let (buf, layout) = frame_at(0.0, 0);
-    let tree = SemanticTree::build(&buf, &layout, None);
+    let tree = SemanticTree::build(&buf, &layout, Interaction::default());
 
     assert!(tree.nodes.iter().any(|n| n.id == LIST_ID));
     assert!(audit(&tree, 0).is_empty());

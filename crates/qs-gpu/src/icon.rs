@@ -48,6 +48,20 @@ pub const MIN_PX: u16 = 8;
 /// a caller that computed its size wrongly, not a limit any real display reaches.
 pub const MAX_PX: u16 = 96;
 
+/// The fraction of the icon box one emblem occupies.
+///
+/// Arrived at by rendering the set at 20 px and looking, which is the only way this number can
+/// be chosen. At 0.5 the emblem is not a modifier -- it eats the left bracket off `Code`, the
+/// bottom two rules off `Text` and a third of the `Config` hex, so the row loses the kind it
+/// was reading and gains only "this is a link". The criterion is that a symlink stays
+/// distinguishable *from its target's kind*, and 0.5 fails it for four of the nine.
+pub const EMBLEM_FRACTION: f32 = 0.42;
+
+/// Emblem stroke weight, in grid units. Heavier than [`STROKE`] because an emblem is drawn at
+/// half the icon's pixel size: 1.5 units there is 0.4 device pixels at a 20 px icon, which is
+/// the grey smudge [`MIN_PX`] exists to refuse.
+pub const EMBLEM_STROKE: f32 = 3.0;
+
 /// The icon set. One variant per visually distinct silhouette, not one per file extension:
 /// mapping many extensions onto one icon is the *point* of an icon set, and is done by the
 /// caller (see `qs_ui::row::icon_for`).
@@ -103,28 +117,102 @@ impl IconKind {
     }
 }
 
+/// A mark drawn *over* a kind icon rather than instead of one.
+///
+/// # Why an emblem is its own shape and not a field on [`IconKey`]
+///
+/// The tempting key is `{ kind, emblem: Option<Emblem>, px }`, and it is the same mistake as
+/// giving icons their own texture: it makes an entry's identity the *pair*, so the atlas
+/// stores one rasterization per (kind, emblem) and the count is `K * (E + 1)` per size --
+/// 36 here against 13 for keying them separately. The cold frame is the one that cannot
+/// afford it (see `qs_ui::row::ListRenderer::render`, which resolves icons in a prepass
+/// precisely because the CPU tier's per-frame upload bound is contested there).
+///
+/// Keying separately also keeps the two tints independent, which is not a nicety: an emblem
+/// is a different colour from the icon it modifies, and one coverage mask carries one colour.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Emblem {
+    /// The flat well an emblem's mark sits in, drawn first in the surface colour.
+    ///
+    /// Without it the mark is a stroke laid over another stroke: the silhouette's lines show
+    /// through the gaps and both read as noise. This is the only *filled* shape in the module.
+    Plate,
+    /// The link arrow. Drawn over [`Emblem::Plate`].
+    Symlink,
+}
+
+impl Emblem {
+    /// Every emblem, in declaration order. The index into this slice is [`Emblem::index`],
+    /// which callers use to size a per-frame cache -- the same contract as [`IconKind::ALL`].
+    pub const ALL: [Self; 2] = [Self::Plate, Self::Symlink];
+
+    /// Position in [`Emblem::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            Self::Plate => 0,
+            Self::Symlink => 1,
+        }
+    }
+}
+
+/// What one rasterization is a picture of: a file kind, or a mark drawn over one.
+///
+/// This is the discriminator that keeps the atlas additive. See [`Emblem`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum IconShape {
+    Kind(IconKind),
+    Emblem(Emblem),
+}
+
 /// Identity of one rasterized icon. This is the atlas key.
 ///
-/// `px` is the *device* pixel size of the square the icon occupies -- scale is already
+/// `px` is the *device* pixel size of the square the shape occupies -- scale is already
 /// folded in. See the module docs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct IconKey {
-    pub kind: IconKind,
+    pub shape: IconShape,
     pub px: u16,
 }
 
 impl IconKey {
-    /// Build a key for a logical grid size at a device scale.
+    /// Build a key for a kind at a logical grid size and a device scale.
     ///
     /// Rounding here rather than at the draw site is deliberate: the rounded value is both
     /// the cache key and the drawn size, so they cannot drift apart and leave the icon
     /// resampled by a fraction of a pixel.
     pub fn new(kind: IconKind, logical_px: f32, scale: f32) -> Self {
         Self {
-            kind,
+            shape: IconShape::Kind(kind),
             px: device_px(logical_px, scale),
         }
     }
+
+    /// Build a key for an emblem. `logical_px` is the emblem's own box, not the icon's --
+    /// the caller applies [`EMBLEM_FRACTION`], because the caller is also the one that has to
+    /// decide whether the result is large enough to ask for at all. See [`emblem_px`].
+    pub fn emblem(emblem: Emblem, logical_px: f32, scale: f32) -> Self {
+        Self {
+            shape: IconShape::Emblem(emblem),
+            px: device_px(logical_px, scale),
+        }
+    }
+}
+
+/// The emblem size for an icon of `icon_px` device pixels, or `None` when that is below
+/// [`MIN_PX`].
+///
+/// `None` means **do not draw an emblem**, and the caller must honour that by not asking:
+/// [`rasterize`] would refuse the same size, and a refusal is counted as a dropped icon.
+/// Conflating "too small to be worth drawing" with "the atlas could not supply it" would put
+/// a design decision into a telemetry counter that exists to detect an upload-budget failure.
+pub fn emblem_px(icon_px: u16) -> Option<u16> {
+    let px = (f32::from(icon_px) * EMBLEM_FRACTION).round();
+    let px = if px.is_finite() {
+        px.clamp(0.0, f32::from(u16::MAX)) as u16
+    } else {
+        0
+    };
+    (MIN_PX..=MAX_PX).contains(&px).then_some(px)
 }
 
 /// The device pixel size a logical icon box resolves to. Saturating rather than wrapping,
@@ -151,19 +239,26 @@ pub fn rasterize(key: IconKey) -> Option<RasterizedGlyph> {
     let px = u32::from(key.px);
     let scale = f32::from(key.px) / GRID;
 
-    let path = path_for(key.kind)?;
+    let (path, ink) = path_for(key.shape)?;
     // Transform *then* stroke, not the reverse. Stroking on the 20-unit grid and scaling the
     // resulting outline would flatten the curves at grid resolution and then magnify the
     // flattening error; this way every curve is flattened against the pixel grid it will
     // actually be sampled on, which is what "rasterized at exact device resolution" means.
     let path = path.transform(Transform::from_scale(scale, scale))?;
-    let stroke = Stroke {
-        width: STROKE * scale,
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Stroke::default()
+    let outline = match ink {
+        Ink::Stroke(width) => {
+            let stroke = Stroke {
+                width: width * scale,
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Stroke::default()
+            };
+            path.stroke(&stroke, 1.0)?
+        }
+        // A filled shape is already its own outline. Stroking it would produce a ring, and a
+        // ring knocks nothing out -- which is the entire job of `Emblem::Plate`.
+        Ink::Fill => path,
     };
-    let outline = path.stroke(&stroke, 1.0)?;
 
     let mut mask = Mask::new(px, px)?;
     // Winding, not even-odd: a stroker emits an outer contour and an inner contour with
@@ -189,13 +284,62 @@ pub fn rasterize(key: IconKey) -> Option<RasterizedGlyph> {
     })
 }
 
-/// The path for one kind, on the 20-unit grid.
+/// How a path becomes coverage. Carried next to the geometry rather than inferred from the
+/// variant, because the two are chosen together: the plate's inset assumes a fill and would
+/// be wrong by half a stroke if anything decided to stroke it instead.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ink {
+    /// Stroke at this width, in grid units.
+    Stroke(f32),
+    Fill,
+}
+
+/// The path for one shape, on the 20-unit grid, and how to ink it.
 ///
-/// Every path stays inside `[1.25, 18.75]` on both axes so that half of the 1.5-unit stroke
-/// cannot cross the mask edge and get clipped. Silhouettes are chosen to differ at the
+/// Every stroked path stays inside `[1.25, 18.75]` on both axes so that half of the 1.5-unit
+/// stroke cannot cross the mask edge and get clipped. Silhouettes are chosen to differ at the
 /// *shape* level rather than by a badge on a shared page outline, because a badge is three
 /// pixels wide at 20 px and every icon would read as "a document".
-fn path_for(kind: IconKind) -> Option<Path> {
+///
+/// An emblem is the one case where a badge *is* the right answer, and it does not contradict
+/// that rule: it is drawn on its own grid at its own size, and it modifies an icon the reader
+/// has already identified rather than being what distinguishes one icon from another.
+fn path_for(shape: IconShape) -> Option<(Path, Ink)> {
+    match shape {
+        IconShape::Kind(kind) => kind_path(kind).map(|p| (p, Ink::Stroke(STROKE))),
+        IconShape::Emblem(emblem) => emblem_path(emblem),
+    }
+}
+
+/// The plate and the marks that sit on it, each on its own 20-unit grid.
+fn emblem_path(emblem: Emblem) -> Option<(Path, Ink)> {
+    let mut b = PathBuilder::new();
+    match emblem {
+        Emblem::Plate => {
+            // A disc, not a rounded square. Both knock the silhouette out; the disc removes
+            // about a fifth less of it for the same mark, which at 20 px is the difference
+            // between the `Code` brackets surviving and not. Half a unit of inset so the
+            // antialiased edge has somewhere to land instead of being clipped square.
+            circle(&mut b, 10.0, 10.0, 9.5);
+            b.finish().map(|p| (p, Ink::Fill))
+        }
+        Emblem::Symlink => {
+            // An arrow leaving to the upper right: shaft on the diagonal, two barbs at the
+            // head. Two barbs rather than a filled triangle because a triangle at eight device
+            // pixels is a blob, and the open head keeps the diagonal readable. Held inside a
+            // radius of about 7 so the round cap on every end stays within the disc.
+            b.move_to(6.0, 14.0);
+            b.line_to(13.5, 6.5);
+            b.move_to(13.5, 6.5);
+            b.line_to(13.5, 11.0);
+            b.move_to(13.5, 6.5);
+            b.line_to(9.0, 6.5);
+            b.finish().map(|p| (p, Ink::Stroke(EMBLEM_STROKE)))
+        }
+    }
+}
+
+fn kind_path(kind: IconKind) -> Option<Path> {
     let mut b = PathBuilder::new();
     match kind {
         IconKind::Generic => page(&mut b),
@@ -346,7 +490,12 @@ fn rounded_rect(b: &mut PathBuilder, x: f32, y: f32, w: f32, h: f32, r: f32) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
 
     /// Mean coverage, 0.0..=1.0. The share of the icon's box that is ink.
@@ -355,11 +504,25 @@ mod tests {
         sum as f32 / (bitmap.coverage.len() as f32 * 255.0)
     }
 
+    fn kind_key(kind: IconKind, px: u16) -> IconKey {
+        IconKey {
+            shape: IconShape::Kind(kind),
+            px,
+        }
+    }
+
+    fn emblem_key(emblem: Emblem, px: u16) -> IconKey {
+        IconKey {
+            shape: IconShape::Emblem(emblem),
+            px,
+        }
+    }
+
     #[test]
     fn every_kind_rasterizes_to_a_square_of_the_requested_size() {
         for kind in IconKind::ALL {
             for px in [16u16, 20, 30, 40] {
-                let bitmap = rasterize(IconKey { kind, px })
+                let bitmap = rasterize(kind_key(kind, px))
                     .unwrap_or_else(|| panic!("{kind:?} at {px}px produced nothing"));
                 assert_eq!(
                     (bitmap.width, bitmap.height),
@@ -375,7 +538,7 @@ mod tests {
         // Both ends matter. Nothing means the path is wrong; everything means the strokes
         // merged into a smudge and the icon carries no shape.
         for kind in IconKind::ALL {
-            let bitmap = rasterize(IconKey { kind, px: 20 }).unwrap();
+            let bitmap = rasterize(kind_key(kind, 20)).unwrap();
             let ink = ink(&bitmap);
             assert!(
                 ink > 0.04,
@@ -394,11 +557,7 @@ mod tests {
         // ink to the mask edge. A border row with meaningful coverage is that bug.
         for kind in IconKind::ALL {
             let px = 40usize;
-            let bitmap = rasterize(IconKey {
-                kind,
-                px: px as u16,
-            })
-            .unwrap();
+            let bitmap = rasterize(kind_key(kind, px as u16)).unwrap();
             let at = |x: usize, y: usize| bitmap.coverage[y * px + x];
             for i in 0..px {
                 for (x, y, edge) in [
@@ -424,7 +583,7 @@ mod tests {
         // difference in coverage, as a fraction of full scale.
         let rendered: Vec<_> = IconKind::ALL
             .iter()
-            .map(|&kind| (kind, rasterize(IconKey { kind, px: 20 }).unwrap()))
+            .map(|&kind| (kind, rasterize(kind_key(kind, 20)).unwrap()))
             .collect();
 
         let mut worst = (f32::MAX, IconKind::Generic, IconKind::Generic);
@@ -474,5 +633,129 @@ mod tests {
         // The atlas caches on the assumption that a key names one bitmap forever.
         let key = IconKey::new(IconKind::Archive, 20.0, 2.0);
         assert_eq!(rasterize(key), rasterize(key));
+    }
+
+    #[test]
+    fn the_plate_is_solid_and_the_mark_is_not() {
+        // Two different jobs, and the numbers are the jobs. A plate that is not nearly solid
+        // knocks nothing out and the mark goes back to sitting on the silhouette's strokes; a
+        // mark that *is* nearly solid is a blob rather than an arrow.
+        let px = emblem_px(20).expect("the 20px list icon carries an emblem");
+        let bitmap = rasterize(emblem_key(Emblem::Plate, px)).unwrap();
+        // The plate is a disc inset by half a unit, so its mean coverage cannot exceed
+        // (pi/4) * (19/20)^2 = 0.709 however opaque it is. The bar is set against that
+        // ceiling. It was 0.80 while the plate was a rounded square, and rewriting it here
+        // rather than loosening it is the point: the number describes the shape.
+        let plate = ink(&bitmap);
+        assert!(
+            plate > 0.65,
+            "the plate is not opaque enough (ink {plate:.3})"
+        );
+        // Mean coverage alone would be satisfied by a uniformly translucent disc, which knocks
+        // nothing out. The middle -- where the mark goes -- has to be *fully* opaque.
+        let mid = usize::from(px) / 2;
+        assert_eq!(
+            bitmap.coverage[mid * usize::from(px) + mid],
+            255,
+            "the plate is translucent"
+        );
+
+        let mark = ink(&rasterize(emblem_key(Emblem::Symlink, px)).unwrap());
+        assert!(
+            (0.10..0.60).contains(&mark),
+            "the symlink mark is a blob or a ghost at {px}px (ink {mark:.3})"
+        );
+    }
+
+    #[test]
+    fn an_emblem_costs_one_entry_per_emblem_and_not_one_per_pair() {
+        // The whole reason `IconShape` exists. Drawing every kind with the symlink emblem must
+        // need `kinds + emblems` distinct atlas keys, not `kinds * (emblems + 1)`.
+        let mut keys = std::collections::BTreeSet::new();
+        for kind in IconKind::ALL {
+            keys.insert(kind_key(kind, 20));
+            for emblem in Emblem::ALL {
+                keys.insert(emblem_key(emblem, 10));
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            IconKind::ALL.len() + Emblem::ALL.len(),
+            "the key is keying the pair, so the atlas will store one entry per combination"
+        );
+    }
+
+    #[test]
+    fn emblem_px_never_asks_for_a_size_rasterize_would_refuse() {
+        // The hazard this pair of functions exists to prevent: `icon_entry` counts a refused
+        // rasterization as a dropped icon, and a dropped icon is the CPU tier's upload-budget
+        // failure. "Too small to draw" must be answered *before* the atlas is asked, or a
+        // design decision shows up in telemetry as a rendering fault.
+        for icon_px in 0..=MAX_PX {
+            if let Some(px) = emblem_px(icon_px) {
+                for emblem in Emblem::ALL {
+                    assert!(
+                        rasterize(emblem_key(emblem, px)).is_some(),
+                        "emblem_px({icon_px}) offered {px}px, which rasterize refuses for {emblem:?}"
+                    );
+                }
+            }
+        }
+        // And the boundary is where MIN_PX puts it, not somewhere rounding drifted to.
+        // Stated as a property rather than as arithmetic, so tuning EMBLEM_FRACTION against a
+        // rendered image does not silently move it.
+        let smallest = (0..=MAX_PX)
+            .find(|&px| emblem_px(px).is_some())
+            .expect("no icon size at all carries an emblem");
+        assert_eq!(
+            emblem_px(smallest),
+            Some(MIN_PX),
+            "the first emblem offered is not at the legibility floor"
+        );
+        assert_eq!(emblem_px(smallest - 1), None);
+        // And the size the emblem was actually judged at has to be one of them.
+        assert!(
+            emblem_px(GRID as u16).is_some(),
+            "the 20px list icon carries no emblem"
+        );
+    }
+
+    #[test]
+    fn the_emblem_changes_every_icon_it_sits_on_at_twenty_pixels() {
+        // Criterion 1 is settled by looking, not by this. But a symlink that stopped altering
+        // its target's picture would be a silent regression, and this is the cheap guard: the
+        // emblem is composited over each kind exactly as the renderer layers it, and the
+        // result has to differ from the bare icon by more than antialiasing noise.
+        let px = 20usize;
+        let e_px = emblem_px(px as u16).expect("a 20px icon carries an emblem");
+        let plate = rasterize(emblem_key(Emblem::Plate, e_px)).unwrap();
+        let mark = rasterize(emblem_key(Emblem::Symlink, e_px)).unwrap();
+
+        // Bottom-left corner, the same origin `qs_ui::row` uses.
+        let (ox, oy) = (0usize, px - e_px as usize);
+        for kind in IconKind::ALL {
+            let base = rasterize(kind_key(kind, px as u16)).unwrap();
+            let mut over = base.coverage.clone();
+            for layer in [&plate, &mark] {
+                for y in 0..layer.height as usize {
+                    for x in 0..layer.width as usize {
+                        let c = layer.coverage[y * layer.width as usize + x];
+                        let dst = &mut over[(oy + y) * px + ox + x];
+                        *dst = (*dst).max(c);
+                    }
+                }
+            }
+            let diff: u64 = base
+                .coverage
+                .iter()
+                .zip(&over)
+                .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                .sum();
+            let d = diff as f32 / (base.coverage.len() as f32 * 255.0);
+            assert!(
+                d > 0.05,
+                "the symlink emblem barely changes {kind:?} at 20px (differs by {d:.3})"
+            );
+        }
     }
 }
