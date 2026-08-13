@@ -21,6 +21,20 @@ const UI: &[&str] = &[
     "ubuntu-r.ttf",
 ];
 
+/// The monospaced faces a mainstream distribution actually ships, most-preferred first.
+///
+/// DejaVu Sans Mono is the one that is nearly always present -- it is the fontconfig
+/// `monospace` alias's target on Debian, Fedora and Arch alike. Noto Sans Mono is the
+/// modern preference where the Noto set is installed, and Liberation Mono is the
+/// metric-compatible Courier substitute that comes with most office installs.
+const MONO: &[&str] = &[
+    "dejavusansmono.ttf",
+    "notosansmono-regular.ttf",
+    "liberationmono-regular.ttf",
+    "ubuntumono-r.ttf",
+    "freemono.ttf",
+];
+
 const PREFERENCE: &[(ScriptClass, &[&str])] = &[
     (
         ScriptClass::Latin,
@@ -109,6 +123,7 @@ pub fn platform_fonts() -> PlatformFonts {
     PlatformFonts {
         dirs,
         ui: UI,
+        mono: MONO,
         preference: PREFERENCE,
         weights: WEIGHTS,
     }

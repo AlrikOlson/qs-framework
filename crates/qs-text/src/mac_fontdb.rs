@@ -19,6 +19,18 @@ const UI: &[&str] = &[
     "helveticaneue.ttc",
 ];
 
+/// SF Mono is the system monospaced face from macOS 10.15, but it lives under
+/// `/System/Applications/Utilities/Terminal.app` rather than in a scanned font directory,
+/// so it is named last and usually will not be found. Menlo is the Terminal default before
+/// it, is in `/System/Library/Fonts`, and is on every install from 10.6 onward; Monaco is
+/// the floor beneath that.
+const MONO: &[&str] = &[
+    "menlo.ttc",
+    "sfmono-regular.otf",
+    "monaco.ttf",
+    "couriernew.ttf",
+];
+
 const PREFERENCE: &[(ScriptClass, &[&str])] = &[
     (
         ScriptClass::Latin,
@@ -87,6 +99,7 @@ pub fn platform_fonts() -> PlatformFonts {
     PlatformFonts {
         dirs,
         ui: UI,
+        mono: MONO,
         preference: PREFERENCE,
         weights: WEIGHTS,
     }

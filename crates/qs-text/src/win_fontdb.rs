@@ -13,6 +13,20 @@ use crate::fontdb::{PlatformFonts, ScriptClass};
 /// and Hebrew. Arial is the floor: present on every Windows install ever shipped.
 const UI: &[&str] = &["segoeui.ttf", "arial.ttf", "tahoma.ttf"];
 
+/// Cascadia Mono is the terminal face Windows has shipped since 2019 and is what a stock
+/// Windows Terminal draws with. Consolas is the pre-Cascadia floor and is on every install
+/// from Vista onward; Courier New is the floor beneath that.
+///
+/// `cascadiamono.ttf` before `cascadiacode.ttf`: Code is the same design with programming
+/// ligatures, and a ligature in a terminal grid puts two cells' worth of ink in one cell.
+const MONO: &[&str] = &[
+    "cascadiamono.ttf",
+    "consola.ttf",
+    "cascadiacode.ttf",
+    "lucon.ttf",
+    "cour.ttf",
+];
+
 const PREFERENCE: &[(ScriptClass, &[&str])] = &[
     (
         ScriptClass::Latin,
@@ -101,6 +115,7 @@ pub fn platform_fonts() -> PlatformFonts {
     PlatformFonts {
         dirs,
         ui: UI,
+        mono: MONO,
         preference: PREFERENCE,
         weights: WEIGHTS,
     }

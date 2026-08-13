@@ -161,6 +161,17 @@ pub trait FontDb: Send + Sync + fmt::Debug {
         self.ui_font()
     }
 
+    /// The face to use where every cell must be the same width: a terminal grid.
+    ///
+    /// Defaults to [`FontDb::ui_font`] rather than failing, for the reason every other
+    /// resolution here does — a machine with no monospaced face renders text that is
+    /// misaligned, which a person can read, instead of no text at all, which they cannot.
+    /// A caller that needs to know whether the request was honoured compares the two ids,
+    /// which is what `qs::terminal` does to decide between drawing runs and drawing cells.
+    fn mono_font(&self) -> FontId {
+        self.ui_font()
+    }
+
     /// Resolve a family name to a face. `None` when the family is not installed.
     fn query(&self, family: &str, weight: FontWeight, style: FontStyle) -> Option<FontId>;
 
@@ -189,6 +200,14 @@ pub struct PlatformFonts {
     pub dirs: Vec<PathBuf>,
     /// Filenames (lowercase, no directory) to try for the UI font, in order.
     pub ui: &'static [&'static str],
+    /// Filenames to try for the monospaced font, in order.
+    ///
+    /// A fourth table rather than a `query("Consolas", ...)` call, and for the reason
+    /// [`PlatformFonts::weights`] gives at length: `query` is a linear scan that parses and
+    /// permanently resides every face it touches, which is 975 ms and several hundred
+    /// megabytes on a stock Windows 11 install. A terminal opened on a keystroke cannot pay
+    /// that, and it would pay it for a question a filename answers.
+    pub mono: &'static [&'static str],
     /// Filenames to try per script class, in order.
     pub preference: &'static [(ScriptClass, &'static [&'static str])],
     /// `(weight class, filename)` for the UI family's weights, ascending.
@@ -232,6 +251,11 @@ pub struct SystemFontDb {
     /// Faces named by the preference chain, in chain order, per script class.
     chains: HashMap<ScriptClass, Vec<FontId>>,
     ui: FontId,
+    /// The monospaced face, or the UI face when this machine has none of the named ones.
+    ///
+    /// Equal to `ui` is the *reported* degraded state rather than a hidden one: see
+    /// [`FontDb::mono_font`].
+    mono: FontId,
     /// Resolved `(weight class, face)` for the UI family, ascending by weight. Only entries
     /// whose file actually exists on this machine are present, so the nearest-weight search
     /// never selects a face that cannot be loaded.
@@ -293,6 +317,18 @@ impl SystemFontDb {
             .find_map(|n| index_of(n))
             .unwrap_or(FontId(0));
 
+        // Same rule, and the same survivable failure: a machine with none of the named
+        // monospaced faces gets the UI face and says so by returning the same id, rather
+        // than getting a face that cannot be loaded.
+        let mono = platform.mono.iter().find_map(|n| index_of(n)).unwrap_or(ui);
+        if mono == ui {
+            tracing::info!(
+                target: "qs::text",
+                "no monospaced face was found; grid text will be drawn cell by cell in the \
+                 UI face"
+            );
+        }
+
         // Only weights whose file is actually present. A table entry naming a face this
         // machine does not have must not become a resolution target, or `ui_font_at` would
         // hand back an id that `face_data` cannot load.
@@ -308,6 +344,7 @@ impl SystemFontDb {
             slots,
             chains,
             ui,
+            mono,
             weights,
             loaded: RwLock::new(HashMap::new()),
             info_cache: RwLock::new(HashMap::new()),
@@ -349,6 +386,10 @@ impl SystemFontDb {
 impl FontDb for SystemFontDb {
     fn ui_font(&self) -> FontId {
         self.ui
+    }
+
+    fn mono_font(&self) -> FontId {
+        self.mono
     }
 
     fn ui_font_at(&self, weight: FontWeight) -> FontId {

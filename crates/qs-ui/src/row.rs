@@ -730,6 +730,52 @@ impl ListRenderer {
         }
     }
 
+    /// Resolve a monospaced role at an explicit pixel size.
+    ///
+    /// Not a named token role, and deliberately: a terminal's type size is the *user's*, set
+    /// against how much of a grid fits in a pane, and running it through the type scale would
+    /// make the density control silently resize somebody's shell. The size arrives as a
+    /// number for that reason.
+    ///
+    /// Falls back to the UI face on a machine with no monospaced one; the caller can tell,
+    /// because [`ListRenderer::cell_advance`] measures whether the resolved face actually
+    /// advances every character equally rather than trusting that it does.
+    pub fn resolve_mono(&mut self, px: f32) -> ResolvedRole {
+        let size = PxSize::new(px.max(1.0));
+        let font = self.db.mono_font();
+        let (ascent, line_height) = match self.shaper.metrics(font, size) {
+            Some(m) => (m.ascent, m.line_height),
+            None => (size.to_f32() * 0.8, size.to_f32() * 1.25),
+        };
+        ResolvedRole {
+            size,
+            font,
+            ascent,
+            line_height,
+        }
+    }
+
+    /// One cell's advance in a monospaced role, and whether the face really is one.
+    ///
+    /// Measured rather than assumed. A machine with none of the named monospaced faces
+    /// resolves to the UI face, and a grid drawn as runs of text in a proportional face
+    /// drifts a little further out of its columns with every character — legible for six
+    /// characters and unreadable across eighty. Knowing which it is lets the caller pay for
+    /// per-cell placement only where it is needed.
+    ///
+    /// The probe is `i` against `M`, the narrowest and widest ASCII letters in almost every
+    /// proportional design. Comparing two *similar* characters would report a proportional
+    /// face as monospaced.
+    pub fn cell_advance(&mut self, role: ResolvedRole) -> (f32, bool) {
+        let features = Features::default();
+        let wide = self.measure("M", role, features);
+        let narrow = self.measure("i", role, features);
+        // A tenth of a pixel: two glyphs from a monospaced face have identical advances up to
+        // the rounding the shaper does, and nothing proportional is this close.
+        let monospaced = (wide - narrow).abs() < 0.1;
+        (wide.max(1.0), monospaced)
+    }
+
     /// Draw one line of arbitrary text in a resolved role, ellipsized at `max_width`.
     ///
     /// `baseline` is absolute, not relative to a row: this is the entry point for text that
