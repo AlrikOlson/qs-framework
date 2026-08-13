@@ -16,6 +16,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+use accesskit::Role;
 use qs_ui::a11y::{LIST_ID, SemanticTree, WINDOW_ID, audit, audit_columns, row_node_id};
 use qs_ui::density::Density;
 use qs_ui::fenwick::Heights;
@@ -285,7 +286,53 @@ fn a_missing_column_is_caught_rather_than_ignored() {
 
     let findings = audit_columns(&tree, &[layout.row_count, 42]);
     assert!(
-        findings.iter().any(|f| f.problem.contains("List nodes")),
+        findings
+            .iter()
+            .any(|f| f.problem.contains("container nodes")),
         "a column that was never published went unreported: {findings:#?}"
+    );
+}
+
+#[test]
+fn a_region_that_is_not_a_list_is_still_audited_and_still_owns_its_own_length() {
+    // ADR 013's window: the file list, and an inspector beside it. The preview is a `Group`
+    // and the terminal is a `Terminal` -- publishing either as a `List` to get it checked
+    // would be telling assistive technology something false in order to pass a check about
+    // telling the truth, so the audit keys on being a container rather than on the role.
+    let (buf, layout) = frame_at(0.0, 10);
+    let mut tree = SemanticTree::window_only();
+    tree.push_list(0, "Files", &buf, &layout, Interaction::default(), 0.0);
+    tree.push_region(1, Role::Group, "Preview", 0, (900.0, 0.0, 1200.0, 600.0));
+    tree.push_region(
+        2,
+        Role::Terminal,
+        "Terminal",
+        0,
+        (900.0, 600.0, 1200.0, 900.0),
+    );
+
+    assert!(
+        audit_columns(&tree, &[layout.row_count, 0, 0]).is_empty(),
+        "a correct three-region tree was rejected"
+    );
+
+    // And the failure the criterion names by hand: the preview claiming the list's length.
+    // A single expected size would pass this tree, which is the whole reason `expected` is
+    // one number per region.
+    let mut lying = SemanticTree::window_only();
+    lying.push_list(0, "Files", &buf, &layout, Interaction::default(), 0.0);
+    lying.push_region(
+        1,
+        Role::Group,
+        "Preview",
+        layout.row_count,
+        (900.0, 0.0, 1200.0, 600.0),
+    );
+    let findings = audit_columns(&lying, &[layout.row_count, 0]);
+    assert!(
+        findings.iter().any(|f| f
+            .problem
+            .contains(&format!("set_size {}", layout.row_count))),
+        "the preview claimed the list's length and nothing said so: {findings:#?}"
     );
 }

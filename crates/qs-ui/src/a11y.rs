@@ -84,6 +84,13 @@ pub struct SemanticNode {
     /// Announced when its label changes, without taking focus. Only the selection status
     /// node sets this.
     pub live: bool,
+    /// One of the tree's **regions**: something that holds items and declares how many.
+    ///
+    /// Stated rather than inferred from the role, because ADR 013's inspector publishes
+    /// containers that are not lists — a preview is a `Group`, a terminal is a `Terminal` —
+    /// and inferring from `set_size` instead would make a container that *forgot* its
+    /// `set_size` invisible to the very audit whose job is to notice that.
+    pub container: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -110,6 +117,7 @@ impl SemanticTree {
             selected: false,
             focusable: false,
             live: false,
+            container: false,
         });
 
         nodes.push(SemanticNode {
@@ -123,6 +131,7 @@ impl SemanticTree {
             selected: false,
             focusable: false,
             live: false,
+            container: true,
         });
 
         // A polite live region rather than a focus move: selecting forty files by dragging
@@ -138,6 +147,7 @@ impl SemanticTree {
             selected: false,
             focusable: false,
             live: true,
+            container: false,
         });
 
         for (slot, row) in buf.rows().iter().enumerate() {
@@ -160,10 +170,46 @@ impl SemanticTree {
                     || interaction.selection.contains(logical),
                 focusable: true,
                 live: false,
+                container: false,
             });
         }
 
         Self { nodes }
+    }
+
+    /// Append a region that publishes a container and no items of its own.
+    ///
+    /// The inspector's preview and terminal (ADR 013). They are containers with a length
+    /// like the file list is, and the length is **their own** — a preview that inherited the
+    /// list's `set_size` would tell a screen-reader user there were 1,204,883 things in it.
+    /// [`audit_columns`] is what refuses that, which is why this pushes a real `set_size`
+    /// rather than leaving it `None`: an absent length cannot be wrong, and cannot be checked
+    /// either.
+    ///
+    /// `role` is the region's own — a preview is a `Group`, a terminal is a `Terminal`.
+    /// Publishing either as a `List` to make the audit happy would be telling assistive
+    /// technology something false in order to pass a check about telling the truth.
+    pub fn push_region(
+        &mut self,
+        column: u32,
+        role: Role,
+        label: &str,
+        set_size: u64,
+        bounds: (f64, f64, f64, f64),
+    ) {
+        let (x0, y0, x1, y1) = bounds;
+        self.nodes.push(SemanticNode {
+            id: column_list_node_id(column),
+            role,
+            label: label.to_string(),
+            index_in_set: None,
+            set_size: Some(set_size as usize),
+            bounds: Some((x0, y0, x1, y1)),
+            selected: false,
+            focusable: false,
+            live: false,
+            container: true,
+        });
     }
 
     /// An empty tree with only the window node, for a layout that publishes several lists.
@@ -180,6 +226,7 @@ impl SemanticTree {
                 selected: false,
                 focusable: false,
                 live: false,
+                container: false,
             }],
         }
     }
@@ -214,6 +261,7 @@ impl SemanticTree {
             selected: false,
             focusable: false,
             live: false,
+            container: true,
         });
 
         for (slot, row) in buf.rows().iter().enumerate() {
@@ -235,6 +283,7 @@ impl SemanticTree {
                     || interaction.selection.contains(logical),
                 focusable: true,
                 live: false,
+                container: false,
             });
         }
     }
@@ -247,6 +296,12 @@ impl SemanticTree {
             .nodes
             .iter()
             .filter(|n| n.role == Role::ListItem)
+            .map(|n| n.id)
+            .collect();
+        let containers: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| n.container)
             .map(|n| n.id)
             .collect();
 
@@ -271,7 +326,14 @@ impl SemanticTree {
                 built.set_live(Live::Polite);
             }
             match node.id {
-                WINDOW_ID => built.set_children(vec![LIST_ID, SELECTION_STATUS_ID]),
+                // Every container, not only the list. A region published without being a
+                // child of the window is a node AccessKit has been handed and no assistive
+                // technology can reach -- present in the update, absent from the tree.
+                WINDOW_ID => {
+                    let mut children = containers.clone();
+                    children.push(SELECTION_STATUS_ID);
+                    built.set_children(children);
+                }
                 LIST_ID => built.set_children(row_ids.clone()),
                 _ => {}
             }
@@ -461,27 +523,30 @@ pub fn audit(tree: &SemanticTree, expected_set_size: u64) -> Vec<AuditFinding> {
     audit_columns(tree, &[expected_set_size])
 }
 
-/// The same check over a tree that publishes **several** lists.
+/// The same check over a tree that publishes **several** containers.
 ///
-/// `expected` is one corpus length per list, left to right. A Miller-columns layout shows
-/// N directories at once and each has its own length, so a single expected size cannot
-/// express the right answer for any of them — it would either fail a correct tree or, worse,
-/// pass one where every column claimed the focused column's size. That second failure is
+/// `expected` is one length per container, in tree order. A window with a file list and an
+/// inspector beside it shows two regions at once and each has its own length, so a single
+/// expected size cannot express the right answer for either — it would either fail a correct
+/// tree or, worse, pass one where the preview claimed the list's size. That second failure is
 /// the reason this is generalised rather than relaxed: Constitution VI makes the semantic
 /// tree definition-of-done, and a check that goes green on a wrong answer is not one.
 ///
-/// A list item belongs to the most recent `List` node before it, which is the order
-/// [`SemanticTree::push_list`] builds. There are no parent links in this shape — it exists
-/// to be asserted against, and adding a parent field to carry information the order already
-/// carries would be a second source of truth.
+/// A list item belongs to the most recent container before it, which is the order
+/// [`SemanticTree::push_list`] and [`SemanticTree::push_region`] build. There are no parent
+/// links in this shape — it exists to be asserted against, and adding a parent field to carry
+/// information the order already carries would be a second source of truth.
 pub fn audit_columns(tree: &SemanticTree, expected: &[u64]) -> Vec<AuditFinding> {
     let mut findings = Vec::new();
 
-    let lists = tree.nodes.iter().filter(|n| n.role == Role::List).count();
-    if lists != expected.len() {
+    let containers = tree.nodes.iter().filter(|n| n.container).count();
+    if containers != expected.len() {
         findings.push(AuditFinding {
             node: LIST_ID,
-            problem: format!("{lists} List nodes published, expected {}", expected.len()),
+            problem: format!(
+                "{containers} container nodes published, expected {}",
+                expected.len()
+            ),
         });
     }
 
@@ -489,12 +554,12 @@ pub fn audit_columns(tree: &SemanticTree, expected: &[u64]) -> Vec<AuditFinding>
     let mut expected_set_size = expected.first().copied().unwrap_or(0);
 
     for node in &tree.nodes {
-        if node.role == Role::List {
-            // The list that follows owns every item until the next one.
+        if node.container {
+            // The container that follows owns every item until the next one.
             let index = tree
                 .nodes
                 .iter()
-                .filter(|n| n.role == Role::List)
+                .filter(|n| n.container)
                 .position(|n| n.id == node.id)
                 .unwrap_or(column);
             column = index;

@@ -159,6 +159,27 @@ pub fn resolve(selector: &dyn RenderPathSelector) -> Resolution {
     }
 }
 
+/// The conventional per-user state directory for this platform.
+///
+/// One function rather than one per thing that persists. SDD §13 gives this directory a
+/// SQLite store eventually; until then the two small files that live here (the crash counter
+/// and the window's split) at least agree about *where* here is — two functions deriving the
+/// platform directory separately is the drift that puts a user's state in two places, and
+/// only one of them gets migrated.
+#[must_use]
+pub fn state_dir() -> PathBuf {
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+    };
+    base.unwrap_or_else(std::env::temp_dir).join("quicksilver")
+}
+
 // -- crash counter -------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -192,16 +213,7 @@ impl CrashCounter {
 
     /// The conventional per-user state location for this platform.
     pub fn default_location() -> Self {
-        let base = if cfg!(target_os = "windows") {
-            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        } else if cfg!(target_os = "macos") {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
-        } else {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        };
-        Self::in_dir(base.unwrap_or_else(std::env::temp_dir).join("quicksilver"))
+        Self::in_dir(state_dir())
     }
 
     pub fn read(&self) -> Option<CrashState> {
