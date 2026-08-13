@@ -1106,7 +1106,7 @@ impl ListRenderer {
         //
         // Dimmed for hidden files, which the placeholder square was not. A hidden file's
         // name fades and its icon did not, which read as two rows rather than one.
-        if let Some(entry) = self.icon_entry(icon_for(row)) {
+        if let Some(entry) = self.icon_entry(kind_of(row)) {
             let size = entry.width as f32;
             let icon_x = (columns.icon_x() + (columns.icon - size) * 0.5).round();
             let icon_y = (top + (height - size) * 0.5).round();
@@ -1967,7 +1967,7 @@ impl ListRenderer {
             }
 
             let icon_color = fade(icon_tint(&self.tokens, row), hidden);
-            if let Some(entry) = self.icon_entry(icon_for(row)) {
+            if let Some(entry) = self.icon_entry(kind_of(row)) {
                 let size = entry.width as f32;
                 let icon_x = (cx + (cw - size) * 0.5).round();
                 let icon_y = (cy + pad + (metrics.icon_box(scale) - size) * 0.5).round();
@@ -1981,7 +1981,7 @@ impl ListRenderer {
                 ));
                 // Same emblem, same corner, same rule as the list. A symlink that looked like
                 // one in List and like a plain file in Grid would be two answers to one
-                // question, which is the defect `icon_for` already exists to prevent.
+                // question, which is the defect `kind_of` already exists to prevent.
                 if row.flags.contains(RowFlags::IS_SYMLINK) {
                     self.draw_emblem(list, Emblem::Symlink, icon_x, icon_y, size, hidden);
                 }
@@ -2259,7 +2259,13 @@ fn fade(color: Srgba, hidden: bool) -> Srgba {
 /// `KindId -> IconKind` is the mapping that survives, whoever assigns the `KindId`.
 ///
 /// [`RowSource`]: crate::row_source::RowSource
-fn icon_for(row: &RowView) -> IconKind {
+/// **Public because the multi-selection histogram counts the same kinds the icons draw.**
+/// A chart with its own `match row.kind.0` would be a second answer to one question, and it
+/// fails quietly: a folder counted as `Generic` in the chart while the list draws it as a
+/// folder looks plausible from either side. Promoting this was `inspector-metadata`'s first
+/// move for exactly that reason.
+#[must_use]
+pub fn kind_of(row: &RowView) -> IconKind {
     if row.flags.contains(RowFlags::IS_DIR) {
         return IconKind::Folder;
     }
@@ -2281,7 +2287,7 @@ fn icon_for(row: &RowView) -> IconKind {
 
 /// What colour a row's icon is drawn in.
 ///
-/// One function, called by both views, for the reason `icon_for` is one function: a folder
+/// One function, called by both views, for the reason `kind_of` is one function: a folder
 /// that is amber in List and blue in Grid is two answers to one question.
 ///
 /// Folders get `icon/folder`. They used to get `border/focus`, which was a token -- so it
@@ -3841,11 +3847,11 @@ mod tests {
             state: LoadState::Stub,
             ..RowView::default()
         };
-        assert_eq!(icon_for(&stub), IconKind::Generic);
+        assert_eq!(kind_of(&stub), IconKind::Generic);
 
         let mut dir_stub = stub.clone();
         dir_stub.flags = RowFlags::IS_DIR;
-        assert_eq!(icon_for(&dir_stub), IconKind::Folder);
+        assert_eq!(kind_of(&dir_stub), IconKind::Folder);
     }
 
     // -- The symlink emblem (UXDD 10.4) --------------------------------------------------
@@ -4025,7 +4031,7 @@ mod tests {
 
     #[test]
     fn the_grid_emblems_a_symlink_exactly_as_the_list_does() {
-        // `icon_for` is one function so the two views cannot disagree about what a row is.
+        // `kind_of` is one function so the two views cannot disagree about what a row is.
         // The emblem has the same obligation.
         let mut renderer = renderer();
         let mut list = DrawList::default();
@@ -4128,7 +4134,7 @@ mod tests {
             state: LoadState::Basic,
             ..RowView::default()
         };
-        assert_eq!(icon_for(&row), IconKind::Folder);
+        assert_eq!(kind_of(&row), IconKind::Folder);
     }
 
     #[test]
@@ -4446,7 +4452,7 @@ mod tests {
         let kinds = |buf: &RowBuf| {
             buf.rows()
                 .iter()
-                .map(icon_for)
+                .map(kind_of)
                 .collect::<std::collections::HashSet<_>>()
                 .len()
         };
@@ -4557,8 +4563,7 @@ mod tests {
             keys.dedup();
             keys.len()
         };
-        let distinct_kinds: std::collections::HashSet<_> =
-            buf.rows().iter().map(icon_for).collect();
+        let distinct_kinds: std::collections::HashSet<_> = buf.rows().iter().map(kind_of).collect();
         assert_eq!(
             distinct_uvs,
             distinct_kinds.len(),

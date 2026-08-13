@@ -28,7 +28,9 @@ pub use fenwick::{Fenwick, Heights};
 pub use material::{Material, Surface};
 pub use motion::{Animation, MotionKind, MotionPlan, MotionPreference};
 pub use recycler::{Recycler, ViewportLayout};
-pub use row::{Columns, GridMetrics, ListRenderer, ResolvedRole, format_mtime, format_size};
+pub use row::{
+    Columns, GridMetrics, ListRenderer, ResolvedRole, format_mtime, format_size, kind_of,
+};
 pub use row_source::{
     EmptySource, KindId, LoadState, RowBuf, RowFlags, RowId, RowSource, RowView, StubbornSource,
 };

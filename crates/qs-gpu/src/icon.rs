@@ -100,6 +100,29 @@ impl IconKind {
         Self::Archive,
     ];
 
+    /// What to call this kind in a sentence a human reads.
+    ///
+    /// Here rather than at the one call site that needs words, because the words and the set
+    /// have to change together: a tenth kind added to [`IconKind::ALL`] without a label is a
+    /// compile error, and a tenth kind whose label lives in a table somewhere else is a blank
+    /// bar in the multi-selection histogram that nobody notices.
+    ///
+    /// Plural, because every use of it so far counts things.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Generic => "Other",
+            Self::Folder => "Folders",
+            Self::Code => "Code",
+            Self::Config => "Config",
+            Self::Document => "Documents",
+            Self::Image => "Images",
+            Self::Text => "Text",
+            Self::Data => "Data",
+            Self::Archive => "Archives",
+        }
+    }
+
     /// Position in [`IconKind::ALL`]. Stable, and the reason a caller can hold a fixed-size
     /// array instead of a map.
     pub fn index(self) -> usize {
