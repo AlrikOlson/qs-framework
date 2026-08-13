@@ -6,7 +6,6 @@
 //! filesystem, or a search index is not visible here -- which is the test of whether the
 //! `RowSource` boundary is drawn in the right place.
 
-pub mod column_layout;
 pub mod a11y;
 pub mod density;
 pub mod fenwick;
