@@ -44,7 +44,6 @@ allow = [
     "BSL-1.0",
     "MPL-2.0",           # file-level copyleft; acceptable for unmodified crates
     "OpenSSL",
-    "Ucd",               # Unicode character database, used by unicode-* crates
 ]
 confidence-threshold = 0.9
 exceptions = []
@@ -57,7 +56,11 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-highlight = "all-duplicates"
+# `all`, not `all-duplicates`: this key has only ever accepted
+# simplest-path | lowest-version | all, so the old value made cargo-deny refuse
+# to parse this file at all. Which means the licence gate had never run --
+# found by `terminal-fork-vendoring`, whose acceptance requires it to.
+highlight = "all"
 
 # Crates that must never appear in the graph, with the reason stated so the
 # next person does not have to reconstruct it.
