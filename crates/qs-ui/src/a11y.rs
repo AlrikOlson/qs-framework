@@ -34,8 +34,34 @@ pub const SELECTION_STATUS_ID: NodeId = NodeId(2);
 /// Row node ids start here, offset by the row's **logical** index.
 const ROW_ID_BASE: u64 = 16;
 
+/// How much id space each column owns.
+///
+/// Ids have to be unique across the whole tree, and a Miller-columns layout publishes
+/// several lists at once. Striding by a constant keeps the derivation a pure function of
+/// (column, logical index) — an allocator would make a node's id depend on the order the
+/// tree happened to be built in, which is exactly the kind of thing that changes under a
+/// screen reader and not under a test.
+const COLUMN_ID_STRIDE: u64 = 1 << 40;
+
+#[must_use]
 pub fn row_node_id(logical_index: u64) -> NodeId {
     NodeId(ROW_ID_BASE + logical_index)
+}
+
+/// The row node id for a row in column `column`.
+#[must_use]
+pub fn column_row_node_id(column: u32, logical_index: u64) -> NodeId {
+    NodeId(ROW_ID_BASE + u64::from(column) * COLUMN_ID_STRIDE + logical_index)
+}
+
+/// The container node id for column `column`.
+#[must_use]
+pub fn column_list_node_id(column: u32) -> NodeId {
+    if column == 0 {
+        LIST_ID
+    } else {
+        NodeId(u64::from(column) * COLUMN_ID_STRIDE + 1)
+    }
 }
 
 /// A published semantic node, in the form the audit test inspects.
@@ -138,6 +164,79 @@ impl SemanticTree {
         }
 
         Self { nodes }
+    }
+
+    /// An empty tree with only the window node, for a layout that publishes several lists.
+    #[must_use]
+    pub fn window_only() -> Self {
+        Self {
+            nodes: vec![SemanticNode {
+                id: WINDOW_ID,
+                role: Role::Window,
+                label: "Quicksilver".to_string(),
+                index_in_set: None,
+                set_size: None,
+                bounds: None,
+                selected: false,
+                focusable: false,
+                live: false,
+            }],
+        }
+    }
+
+    /// Append one column: a `List` container and its visible rows.
+    ///
+    /// `column` scopes the node ids, so two columns showing the same row index publish two
+    /// different nodes rather than one that a screen reader would treat as having moved.
+    /// `origin_x` offsets the bounds, because a column is a sub-rect of the window and
+    /// assistive technology navigates by geometry as well as by tree order.
+    pub fn push_list(
+        &mut self,
+        column: u32,
+        label: &str,
+        buf: &RowBuf,
+        layout: &ViewportLayout,
+        interaction: Interaction<'_>,
+        origin_x: f32,
+    ) {
+        self.nodes.push(SemanticNode {
+            id: column_list_node_id(column),
+            role: Role::List,
+            label: label.to_string(),
+            index_in_set: None,
+            set_size: Some(layout.row_count as usize),
+            bounds: Some((
+                f64::from(origin_x),
+                0.0,
+                f64::from(origin_x + layout.width as f32),
+                f64::from(layout.height),
+            )),
+            selected: false,
+            focusable: false,
+            live: false,
+        });
+
+        for (slot, row) in buf.rows().iter().enumerate() {
+            let logical = layout.visible.first + slot as u64;
+            let top = f64::from(layout.row_top(slot as u32));
+            self.nodes.push(SemanticNode {
+                id: column_row_node_id(column, logical),
+                role: Role::ListItem,
+                label: describe(buf, row),
+                index_in_set: Some(logical as usize + 1),
+                set_size: Some(layout.row_count as usize),
+                bounds: Some((
+                    f64::from(origin_x),
+                    top,
+                    f64::from(origin_x + layout.width as f32),
+                    top + f64::from(layout.row_height),
+                )),
+                selected: row.flags.contains(RowFlags::IS_SELECTED)
+                    || interaction.selection.contains(logical),
+                focusable: true,
+                live: false,
+            });
+        }
     }
 
     /// Convert to an AccessKit update.
@@ -359,9 +458,62 @@ pub struct AuditFinding {
 /// Returns findings rather than a bool so a failure names the node and the rule, which is
 /// the difference between a test that fails and a test that tells you what to fix.
 pub fn audit(tree: &SemanticTree, expected_set_size: u64) -> Vec<AuditFinding> {
+    audit_columns(tree, &[expected_set_size])
+}
+
+/// The same check over a tree that publishes **several** lists.
+///
+/// `expected` is one corpus length per list, left to right. A Miller-columns layout shows
+/// N directories at once and each has its own length, so a single expected size cannot
+/// express the right answer for any of them — it would either fail a correct tree or, worse,
+/// pass one where every column claimed the focused column's size. That second failure is
+/// the reason this is generalised rather than relaxed: Constitution VI makes the semantic
+/// tree definition-of-done, and a check that goes green on a wrong answer is not one.
+///
+/// A list item belongs to the most recent `List` node before it, which is the order
+/// [`SemanticTree::push_list`] builds. There are no parent links in this shape — it exists
+/// to be asserted against, and adding a parent field to carry information the order already
+/// carries would be a second source of truth.
+pub fn audit_columns(tree: &SemanticTree, expected: &[u64]) -> Vec<AuditFinding> {
     let mut findings = Vec::new();
 
+    let lists = tree.nodes.iter().filter(|n| n.role == Role::List).count();
+    if lists != expected.len() {
+        findings.push(AuditFinding {
+            node: LIST_ID,
+            problem: format!("{lists} List nodes published, expected {}", expected.len()),
+        });
+    }
+
+    let mut column = 0usize;
+    let mut expected_set_size = expected.first().copied().unwrap_or(0);
+
     for node in &tree.nodes {
+        if node.role == Role::List {
+            // The list that follows owns every item until the next one.
+            let index = tree
+                .nodes
+                .iter()
+                .filter(|n| n.role == Role::List)
+                .position(|n| n.id == node.id)
+                .unwrap_or(column);
+            column = index;
+            expected_set_size = expected.get(column).copied().unwrap_or(0);
+            match node.set_size {
+                Some(size) if size as u64 == expected_set_size => {}
+                Some(size) => findings.push(AuditFinding {
+                    node: node.id,
+                    problem: format!(
+                        "list {column} reports set_size {size}, expected {expected_set_size}"
+                    ),
+                }),
+                None => findings.push(AuditFinding {
+                    node: node.id,
+                    problem: format!("list {column} has no set_size"),
+                }),
+            }
+        }
+
         if node.focusable && node.label.trim().is_empty() {
             findings.push(AuditFinding {
                 node: node.id,

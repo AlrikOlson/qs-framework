@@ -16,7 +16,7 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-use qs_ui::a11y::{LIST_ID, SemanticTree, WINDOW_ID, audit, row_node_id};
+use qs_ui::a11y::{LIST_ID, SemanticTree, WINDOW_ID, audit, audit_columns, row_node_id};
 use qs_ui::density::Density;
 use qs_ui::fenwick::Heights;
 use qs_ui::recycler::{Recycler, ViewportLayout};
@@ -199,4 +199,93 @@ fn an_empty_corpus_still_publishes_a_usable_tree() {
     assert!(tree.nodes.iter().any(|n| n.id == LIST_ID));
     assert!(audit(&tree, 0).is_empty());
     assert_eq!(tree.to_update(None).focus, LIST_ID);
+}
+
+#[test]
+fn several_columns_each_announce_their_own_length() {
+    // Miller columns publishes N lists at once, each over a different directory. A single
+    // expected size cannot express the right answer for any of them.
+    let (left_buf, left_layout) = frame_at(0.0, CORPUS);
+    let (right_buf, right_layout) = frame_at(0.0, 42);
+
+    let mut tree = SemanticTree::window_only();
+    tree.push_list(
+        0,
+        "Files",
+        &left_buf,
+        &left_layout,
+        Interaction::default(),
+        0.0,
+    );
+    tree.push_list(
+        1,
+        "Files",
+        &right_buf,
+        &right_layout,
+        Interaction::default(),
+        960.0,
+    );
+
+    let findings = audit_columns(&tree, &[left_layout.row_count, right_layout.row_count]);
+    assert!(findings.is_empty(), "{findings:#?}");
+
+    // Every node id is unique across columns: two columns showing row 0 must publish two
+    // nodes, or a screen reader treats them as one that moved.
+    let ids: Vec<_> = tree.nodes.iter().map(|n| n.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "column node ids collided");
+}
+
+#[test]
+fn the_generalised_audit_catches_a_column_claiming_another_columns_length() {
+    // The failure the single-size signature could not express, and would have passed:
+    // every column reporting the focused column's corpus length. Constitution VI makes the
+    // semantic tree definition-of-done, so a check that goes green here is not one.
+    let (left_buf, left_layout) = frame_at(0.0, CORPUS);
+    let (right_buf, mut right_layout) = frame_at(0.0, 42);
+    // The defect: the right column publishes the LEFT column's length.
+    right_layout.row_count = left_layout.row_count;
+
+    let mut tree = SemanticTree::window_only();
+    tree.push_list(
+        0,
+        "Files",
+        &left_buf,
+        &left_layout,
+        Interaction::default(),
+        0.0,
+    );
+    tree.push_list(
+        1,
+        "Files",
+        &right_buf,
+        &right_layout,
+        Interaction::default(),
+        960.0,
+    );
+
+    let findings = audit_columns(&tree, &[left_layout.row_count, 42]);
+    assert!(
+        !findings.is_empty(),
+        "a column claiming another column's length passed the audit"
+    );
+    assert!(
+        findings.iter().any(|f| f.problem.contains("set_size")),
+        "the finding does not name the wrong set_size: {findings:#?}"
+    );
+}
+
+#[test]
+fn a_missing_column_is_caught_rather_than_ignored() {
+    let (buf, layout) = frame_at(0.0, 10);
+    let mut tree = SemanticTree::window_only();
+    tree.push_list(0, "Files", &buf, &layout, Interaction::default(), 0.0);
+
+    let findings = audit_columns(&tree, &[layout.row_count, 42]);
+    assert!(
+        findings.iter().any(|f| f.problem.contains("List nodes")),
+        "a column that was never published went unreported: {findings:#?}"
+    );
 }
