@@ -182,6 +182,37 @@ impl GpuTimer {
         self.latest.take()
     }
 
+    /// Wait for the frame just submitted and return **its** GPU span.
+    ///
+    /// # This blocks, and only one caller may
+    ///
+    /// [`poll`](Self::poll) exists because the render thread must never wait on the GPU, and
+    /// the price it pays is that its answer is two frames stale and missing on any frame whose
+    /// buffer was still mapped. For a live overlay that is the right trade. For the measurement
+    /// harness it is the wrong one twice over: a two-frame-stale span attributed to this frame
+    /// is a number about a different frame, and a frame with no span at all becomes a
+    /// `total_ms` with no GPU half in it -- so a run would report a distribution that mixes
+    /// whole frames and half ones under a single name.
+    ///
+    /// The harness has nothing to do while the GPU works, so it can afford to wait, and
+    /// waiting is what buys an exact per-frame span. **Calling this from the application's
+    /// frame path would reintroduce the stall the whole ring exists to avoid.**
+    ///
+    /// Two rounds because the readback needs both: the first `poll` cannot register the map
+    /// until the copy has landed, and the callback that marks the buffer readable cannot run
+    /// until the map itself completes.
+    pub fn read_blocking(&mut self, device: &wgpu::Device) -> Option<f32> {
+        for _ in 0..2 {
+            // A poll that errors means the device is gone; the caller sees `None` and the
+            // frame is recorded without a GPU half, which is the honest outcome.
+            if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                return None;
+            }
+            self.poll();
+        }
+        self.take()
+    }
+
     /// The most recent value without consuming it -- for the live overlay.
     pub fn peek(&self) -> Option<f32> {
         self.latest
