@@ -64,6 +64,13 @@ pub struct Columns {
     pub kind: f32,
     pub gap: f32,
     pub padding: f32,
+    /// Whether size, modified and kind are drawn at all.
+    ///
+    /// False in a Miller column. Those three reserve about 300 logical pixels between them
+    /// — more than a column is wide once a path is a few deep — so a column that kept them
+    /// would squeeze the name to its 40 px floor and truncate every entry to about six
+    /// characters. A column is for walking structure; the metadata belongs to the list.
+    pub metadata: bool,
 }
 
 impl Columns {
@@ -86,6 +93,21 @@ impl Columns {
 
     /// Lay out columns for a surface that starts at `x` and is `width` wide.
     pub fn for_rect(x: f32, width: f32, scale: f32, tokens: &Tokens) -> Self {
+        Self::for_rect_with(x, width, scale, tokens, true)
+    }
+
+    /// Lay out a **Miller column**: the name and nothing else.
+    pub fn for_column(x: f32, width: f32, scale: f32, tokens: &Tokens) -> Self {
+        Self::for_rect_with(x, width, scale, tokens, false)
+    }
+
+    pub(crate) fn for_rect_with(
+        x: f32,
+        width: f32,
+        scale: f32,
+        tokens: &Tokens,
+        metadata: bool,
+    ) -> Self {
         let px = |logical: f32| logical * scale.max(0.1);
         let space = |step: &str| px(tokens.space(step));
 
@@ -100,11 +122,16 @@ impl Columns {
 
         // Content-sized, in logical pixels: widest plausible "999.9 GB", a
         // "2026-08-07 14:22" timestamp, and a kind label.
-        let size = px(72.0);
-        let modified = px(132.0);
-        let kind = px(96.0);
+        let (size, modified, kind) = if metadata {
+            (px(72.0), px(132.0), px(96.0))
+        } else {
+            (0.0, 0.0, 0.0)
+        };
 
-        let fixed = gutter * 2.0 + padding * 2.0 + rail + icon + size + modified + kind + gap * 4.0;
+        // Two gaps rather than four without the metadata columns: a gap sits *between*
+        // things, and three of them have gone.
+        let gaps = if metadata { gap * 4.0 } else { gap };
+        let fixed = gutter * 2.0 + padding * 2.0 + rail + icon + size + modified + kind + gaps;
         // A window narrow enough to squeeze the name column to nothing is a real state --
         // users do drag windows that small -- and the correct behaviour is a name column
         // that is merely tiny, not one with a negative width.
@@ -121,6 +148,7 @@ impl Columns {
             kind,
             gap,
             padding,
+            metadata,
         }
     }
 
@@ -795,6 +823,34 @@ impl ListRenderer {
         interaction: Interaction<'_>,
         motion: &InteractionMotion,
     ) {
+        self.render_rows(list, buf, layout, interaction, motion, true);
+    }
+
+    /// Draw one **Miller column**: the same rows, name only.
+    ///
+    /// A separate entry rather than a flag on the renderer, because which columns a row has
+    /// is a property of the surface being drawn and not of the renderer — two columns in one
+    /// frame could otherwise disagree depending on which was drawn last.
+    pub fn render_column(
+        &mut self,
+        list: &mut DrawList,
+        buf: &RowBuf,
+        layout: &ViewportLayout,
+        interaction: Interaction<'_>,
+        motion: &InteractionMotion,
+    ) {
+        self.render_rows(list, buf, layout, interaction, motion, false);
+    }
+
+    fn render_rows(
+        &mut self,
+        list: &mut DrawList,
+        buf: &RowBuf,
+        layout: &ViewportLayout,
+        interaction: Interaction<'_>,
+        motion: &InteractionMotion,
+        metadata: bool,
+    ) {
         qs_gpu::affinity::assert_ui_thread("ListRenderer::render");
 
         self.cache.begin_frame();
@@ -803,11 +859,12 @@ impl ListRenderer {
         self.icons_dropped = 0;
         self.icons = IconCache::for_px(qs_gpu::icon::device_px(qs_gpu::icon::GRID, layout.scale));
 
-        let columns = Columns::for_rect(
+        let columns = Columns::for_rect_with(
             layout.origin_x,
             layout.width as f32,
             layout.scale,
             &self.tokens,
+            metadata,
         );
 
         // The row's two roles, resolved once per frame. `ui/md` is the primary text and
@@ -1093,11 +1150,18 @@ impl ListRenderer {
             let bar = Srgba { a: 0.22, ..bar };
             let bar_h = (height * 0.28).max(2.0);
             let bar_y = top + (height - bar_h) * 0.5;
-            for (x, w) in [
-                (columns.size_x(), columns.size * 0.7),
-                (columns.modified_x(), columns.modified * 0.85),
-                (columns.kind_x(), columns.kind * 0.6),
-            ] {
+            let placeholders: &[(f32, f32)] = &if columns.metadata {
+                [
+                    (columns.size_x(), columns.size * 0.7),
+                    (columns.modified_x(), columns.modified * 0.85),
+                    (columns.kind_x(), columns.kind * 0.6),
+                ]
+            } else {
+                // Nothing to stand in for: a column draws no metadata, so a placeholder
+                // for it would be a shimmer promising a value that never arrives.
+                [(0.0, 0.0); 3]
+            };
+            for &(x, w) in placeholders.iter().filter(|(_, w)| *w > 0.0) {
                 list.instances
                     .push(Instance::rect(x, bar_y, w, bar_h, bar_h * 0.5, bar));
             }
@@ -1113,7 +1177,7 @@ impl ListRenderer {
             tabular_figures: true,
         };
 
-        if !row.flags.contains(RowFlags::IS_DIR) {
+        if columns.metadata && !row.flags.contains(RowFlags::IS_DIR) {
             let text = format_size(row.size);
             self.draw_text_right_aligned(
                 list,
@@ -1126,6 +1190,11 @@ impl ListRenderer {
                 tabular,
                 secondary,
             );
+        }
+
+        if !columns.metadata {
+            // A Miller column stops at the name.
+            return;
         }
 
         let modified = format_mtime(row.mtime);
@@ -2248,6 +2317,36 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
+
+    #[test]
+    fn a_miller_column_spends_its_width_on_the_name() {
+        // The defect this exists to prevent, seen on screen before it was caught here: at a
+        // realistic column width the size, modified and kind columns reserve more space
+        // than the column has, so the name collapses to its floor and every entry renders
+        // as about six characters plus an ellipsis.
+        let tokens = Tokens::embedded(crate::tokens::Theme::Dark).unwrap();
+        let width = 300.0;
+
+        let list = Columns::for_rect(0.0, width, 1.0, &tokens);
+        let column = Columns::for_column(0.0, width, 1.0, &tokens);
+
+        assert!(
+            list.name <= 40.0,
+            "the premise changed: a list row at {width}px no longer squeezes the name to              its floor, so this test is no longer measuring anything ({} px)",
+            list.name
+        );
+        assert!(
+            column.name > list.name * 3.0,
+            "a column gave the name {} px of {width}, barely more than the list's {}",
+            column.name,
+            list.name
+        );
+        assert_eq!(column.size, 0.0);
+        assert_eq!(column.modified, 0.0);
+        assert_eq!(column.kind, 0.0);
+        assert!(!column.metadata);
+        assert!(list.metadata);
+    }
 
     #[test]
     fn sizes_format_at_one_decimal_so_the_column_never_reflows() {
