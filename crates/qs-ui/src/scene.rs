@@ -19,7 +19,8 @@
 //! surfaces on screen as a ten-row one. The scene is built from that same visible set, widened by
 //! [`max_reach`] so a surface just off-screen still casts into it.
 
-use crate::material::Material;
+use crate::material::{Material, Surface};
+use qs_gpu::scene::{Environment, Light, SceneList, Slab};
 
 /// How far past the viewport the scene must reach, in **logical** pixels.
 ///
@@ -50,6 +51,95 @@ pub fn occupies_scene(material: &Material) -> bool {
         .layers
         .iter()
         .any(|layer| layer.near.a > 0.0 || layer.far.a > 0.0)
+}
+
+/// How far a shadow travels per unit of caster height, for the key light's direction.
+///
+/// The horizontal run over the vertical drop: a light straight overhead (`z` dominant)
+/// throws almost nothing sideways, a grazing light throws far. This is [`max_reach`]'s
+/// second input, derived from the rig rather than kept as a constant beside it.
+#[must_use]
+pub fn grazing(direction: [f32; 3]) -> f32 {
+    let run = (direction[0] * direction[0] + direction[1] * direction[1]).sqrt();
+    // A light with no vertical component would throw an infinite shadow; clamping the drop
+    // bounds the margin instead of letting one authored vector cull nothing forever.
+    run / direction[2].abs().max(0.05)
+}
+
+/// Builds one frame's [`SceneList`] from the same material/surface pairs the draw list is
+/// painted from.
+///
+/// The builder owns the two rules a call site would otherwise each keep its own copy of:
+/// culling to the viewport widened by the margin (scene-handoff rule 4), and the ceiling
+/// with its counted drop, which [`SceneList::push`] already enforces (rule 5). What it does
+/// **not** own is deciding what gets painted -- the caller adds exactly the materials it
+/// painted, which is what keeps the two descriptions of the frame in agreement (rule 1).
+#[derive(Debug)]
+pub struct SceneBuilder {
+    scene: SceneList,
+    /// `[w, h]`, physical pixels.
+    viewport: [f32; 2],
+    /// Physical pixels. See [`max_reach`].
+    margin: f32,
+}
+
+impl SceneBuilder {
+    /// Start a scene for the frame `generation`, culled to `viewport` widened by `margin`,
+    /// both in physical pixels.
+    #[must_use]
+    pub fn new(generation: u64, viewport: [f32; 2], margin: f32, environment: Environment) -> Self {
+        let mut scene = SceneList::default();
+        scene.reset(generation, environment);
+        Self {
+            scene,
+            viewport,
+            margin: margin.max(0.0),
+        }
+    }
+
+    /// Add the slab for one painted material, if it occupies the scene and reaches the
+    /// widened viewport.
+    ///
+    /// Call this beside the `paint` that pushed the material's instances, with the same
+    /// [`Surface`] -- the shared origin is what makes the slab equal the instance exactly
+    /// rather than approximately.
+    pub fn add(&mut self, material: &Material, surface: Surface) {
+        let Some(slab) = material.slab(surface) else {
+            return;
+        };
+        let [x, y, w, h] = slab.rect;
+        let reach = self.margin;
+        let inside = x < self.viewport[0] + reach
+            && x + w > -reach
+            && y < self.viewport[1] + reach
+            && y + h > -reach;
+        if inside {
+            self.scene.push(slab);
+        }
+    }
+
+    /// State the key light. Exactly one; the last call wins, which a frame builder never
+    /// exercises because it sets the light once from the rig.
+    pub fn set_key_light(&mut self, light: Light) {
+        self.scene.key_light = Some(light);
+    }
+
+    /// State the focus lamp, present only while something has keyboard focus.
+    pub fn set_focus_light(&mut self, light: Option<Light>) {
+        self.scene.focus_light = light;
+    }
+
+    /// The finished scene, ready to publish.
+    #[must_use]
+    pub fn finish(self) -> SceneList {
+        self.scene
+    }
+
+    /// The slab most recently accepted, for tests that assert on what was built.
+    #[must_use]
+    pub fn last(&self) -> Option<&Slab> {
+        self.scene.slabs.last()
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +180,95 @@ mod tests {
             layer.far.a = 0.0;
         }
         assert!(!occupies_scene(&invisible));
+    }
+
+    #[test]
+    fn every_shipped_materials_slab_equals_one_of_its_instances_exactly() {
+        // Scene-handoff rule 1, as the contract words it: paint every shipped material,
+        // build both descriptions, and the slab's rect and radius equal the corresponding
+        // instance's -- with `==`, not a tolerance. Both descriptions come from the same
+        // `Material`/`Surface` pair through the same `layer_shape`, so a failure here is a
+        // divergence in that shared origin, which is exactly what the rule exists to catch.
+        use crate::material::{Drive, Surface};
+
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            let names: Vec<String> = tokens.material_names().map(str::to_string).collect();
+            assert!(!names.is_empty());
+            for name in names {
+                let material = tokens.material(&name).unwrap();
+                let surface = Surface::new(37.0, 91.0, 240.0, 28.0, 12.0, 2.0);
+
+                let Some(slab) = material.slab(surface) else {
+                    panic!("shipped material `{name}` produced no slab");
+                };
+                let mut instances = Vec::new();
+                material.compile(surface, 1.0, Drive::REST, true, &mut instances);
+                assert!(
+                    instances
+                        .iter()
+                        .any(|i| i.rect == slab.rect && i.radius == slab.radius),
+                    "material `{name}` ({theme:?}): slab rect {:?} radius {} matches no \
+                     compiled instance",
+                    slab.rect,
+                    slab.radius,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_slab_carries_its_materials_elevation_in_physical_pixels() {
+        // The scale multiply happens exactly once, at the slab -- the same place every
+        // other logical length meets physical pixels. A material that authored no step lies
+        // on the canvas.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let material = tokens.material(name::ROW_SELECTED).unwrap();
+        let slab = material
+            .slab(crate::material::Surface::new(0.0, 0.0, 100.0, 30.0, 6.0, 2.0))
+            .unwrap();
+        assert_eq!(slab.elevation, material.elevation * 2.0);
+    }
+
+    #[test]
+    fn the_builder_culls_at_the_widened_viewport_not_the_viewport() {
+        // Scene-handoff rule 4. A surface just past the edge still casts into the viewport,
+        // so it must be in the scene; one past the margin cannot reach, so it must not be.
+        // Culling at the bare edge is the shadow-pops-in-as-its-caster-scrolls defect.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let material = tokens.material(name::ROW_BODY).unwrap();
+        let margin = 40.0;
+        let mut builder = SceneBuilder::new(1, [800.0, 600.0], margin, Environment::default());
+
+        let at = |x: f32| crate::material::Surface::new(x, 100.0, 100.0, 28.0, 6.0, 1.0);
+        builder.add(material, at(820.0)); // inside the margin: casts into view
+        assert!(builder.last().is_some(), "a caster inside the margin was culled");
+
+        let before = builder.finish().slabs.len();
+        let mut builder = SceneBuilder::new(1, [800.0, 600.0], margin, Environment::default());
+        builder.add(material, at(841.0)); // past the margin: cannot reach
+        assert_eq!(
+            builder.finish().slabs.len() + before,
+            1,
+            "a surface past the widened viewport was included"
+        );
+    }
+
+    #[test]
+    fn the_margin_derives_from_the_rig_not_from_a_constant() {
+        // Rule 4's second sentence: max_reach comes from the active effects' tokens. The
+        // two inputs are the tallest step on the elevation scale and the key light's
+        // grazing ratio, both authored in design/tokens.json.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let direction = tokens.lighting().rig.key.direction;
+        let reach = max_reach(tokens.elevation_max(), grazing(direction));
+        assert!(
+            reach > 0.0,
+            "the shipped scale and rig produce no margin at all, so every shadow will pop \
+             at the viewport edge"
+        );
+
+        // Overhead light: no run, so no reach regardless of elevation.
+        assert_eq!(grazing([0.0, 0.0, 1.0]), 0.0);
     }
 }

@@ -241,6 +241,12 @@ pub struct TokenFile {
     /// Corner radii by surface class, in logical pixels.
     #[serde(default)]
     pub radius: BTreeMap<String, f32>,
+    /// The elevation scale, in logical pixels: how far a surface stands off the canvas, as a
+    /// closed set of named steps. Defaulted so a token file predating the lit mode still
+    /// loads; a material naming a step then fails resolution, which is the honest outcome —
+    /// the file authored a height against a scale it does not carry.
+    #[serde(default)]
+    pub elevation: BTreeMap<String, f32>,
     #[serde(default)]
     pub focus: FocusTokens,
     /// Named looks, each a stack of effect layers over the colour and space scales.
@@ -311,6 +317,8 @@ pub enum TokenError {
     MaterialUnknownStep { material: String, step: String },
     #[error("material `{material}` names radius class `{class}`, which is not declared")]
     MaterialUnknownRadius { material: String, class: String },
+    #[error("material `{material}` names elevation step `{step}`, which is not on the scale")]
+    MaterialUnknownElevation { material: String, step: String },
     #[error(
         "material `{material}` declares {centres} field centres, but the field uniform holds \
          {limit}; the extras would be authored, ungated and never drawn"
@@ -383,6 +391,7 @@ pub struct Tokens {
     type_roles: BTreeMap<String, TypeRole>,
     space: BTreeMap<String, f32>,
     radius: BTreeMap<String, f32>,
+    elevation: BTreeMap<String, f32>,
     focus: FocusTokens,
     materials: BTreeMap<String, Material>,
     lighting: LightingTokens,
@@ -417,8 +426,13 @@ impl Tokens {
             colors.insert(name.clone(), color);
             roles.insert(name.clone(), def.role);
         }
-        let materials =
-            crate::material::resolve_all(&file.materials, &colors, &file.space, &file.radius)?;
+        let materials = crate::material::resolve_all(
+            &file.materials,
+            &colors,
+            &file.space,
+            &file.radius,
+            &file.elevation,
+        )?;
         Ok(Self {
             theme,
             colors,
@@ -426,9 +440,10 @@ impl Tokens {
             type_roles: file.type_roles.clone(),
             space: file.space.clone(),
             radius: file.radius.clone(),
+            elevation: file.elevation.clone(),
             focus: file.focus,
             materials,
-            lighting: file.lighting,
+            lighting: file.lighting.clone(),
             substance: file.substance,
             effects_enabled: true,
         })
@@ -457,7 +472,28 @@ impl Tokens {
     /// The authored allowances, for the lighting pass and for the instruments.
     #[must_use]
     pub fn lighting(&self) -> LightingTokens {
-        self.lighting
+        self.lighting.clone()
+    }
+
+    /// The rig's environment, resolved for this theme.
+    ///
+    /// The two stops are token *names* in the file, so the room a lit surface reflects
+    /// changes with the theme rather than being one room both themes share. Resolution goes
+    /// through [`Tokens::color`], which is the same lookup every other consumer uses.
+    #[must_use]
+    pub fn environment(&self) -> qs_gpu::scene::Environment {
+        qs_gpu::scene::Environment {
+            horizon: self.color(&self.lighting.rig.environment.horizon),
+            zenith: self.color(&self.lighting.rig.environment.zenith),
+        }
+    }
+
+    /// The tallest step on the elevation scale, in logical pixels. Zero when the file has no
+    /// scale, which is also the honest margin: nothing can stand up, so nothing can cast
+    /// past the viewport edge.
+    #[must_use]
+    pub fn elevation_max(&self) -> f32 {
+        self.elevation.values().copied().fold(0.0_f32, f32::max)
     }
 
     /// Replace every colour with the OS-supplied forced-colours palette.
@@ -565,9 +601,18 @@ impl Tokens {
         // replaced. `effects_enabled` is false below, so what actually reaches the screen is
         // each stack's Exact layers at their flat stops -- which is the same answer the
         // hand-written `if effects_enabled` in chrome.rs used to give, now given once.
+        // The elevation scale is geometry, like space and radius, and survives for the same
+        // reason: forced colours replace the palette, not the shape of the world.
+        let elevation = embedded
+            .as_ref()
+            .map(|f| f.elevation.clone())
+            .unwrap_or_default();
         let materials = embedded
             .as_ref()
-            .and_then(|f| crate::material::resolve_all(&f.materials, &colors, &space, &radius).ok())
+            .and_then(|f| {
+                crate::material::resolve_all(&f.materials, &colors, &space, &radius, &elevation)
+                    .ok()
+            })
             .unwrap_or_default();
 
         Self {
@@ -580,6 +625,7 @@ impl Tokens {
                 .unwrap_or_default(),
             space,
             radius,
+            elevation,
             focus: embedded.map(|f| f.focus).unwrap_or_default(),
             materials,
             // Deliberately not carried over from the embedded file. Forced colours supply a
@@ -998,10 +1044,90 @@ impl Default for LitAllowance {
 /// The rig lands here under `tasks.md` T010. Every exposure control it gains must be a **mix
 /// toward a bound** and never a multiplier — research R8, a mistake this codebase has made four
 /// times in four places.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LightingTokens {
     pub allowance: LitAllowance,
+    /// Where the light is. See [`RigTokens`]. Not `Copy` any more, and deliberately: the
+    /// environment's two stops are token *names*, resolved per theme at use, so the room
+    /// changes with the theme instead of being one room both themes share.
+    pub rig: RigTokens,
+}
+
+/// The rig: where the light is, as authored (tasks.md T010). An art-direction question, not
+/// a contrast one — the allowance beside it is what is gated, and a value from one is never
+/// a valid answer for the other.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RigTokens {
+    pub key: KeyLightTokens,
+    pub environment: EnvironmentTokens,
+}
+
+impl Default for RigTokens {
+    /// The authored rig, not "no rig": a token file predating the rig still lights the way
+    /// the shipped file does, and the mode is off by default anyway (FR-002), so the default
+    /// is never seen until someone turns the light on.
+    fn default() -> Self {
+        Self {
+            key: KeyLightTokens::default(),
+            environment: EnvironmentTokens::default(),
+        }
+    }
+}
+
+/// The key light. One, directional, fixed — a window whose shadows point in several
+/// directions reads as broken in a way nobody can name, which is why this is a token and not
+/// a per-material choice.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct KeyLightTokens {
+    /// Toward the light. Normalized at use, and doubling as the reduced-motion resting
+    /// position (FR-029): under Reduce Motion the light sits exactly here.
+    pub direction: [f32; 3],
+    /// The key light's fraction of an exposure budget that sums to one; the environment gets
+    /// the remainder. A **mix toward a bound, never a multiplier** (research R8) — there is
+    /// no spelling of this field that pushes total exposure past the bound.
+    pub share: f32,
+    /// Angular size in degrees. What makes a shadow soften with distance; a light with no
+    /// size casts the hard offset shadow this feature exists to replace.
+    pub size_deg: f32,
+}
+
+impl Default for KeyLightTokens {
+    fn default() -> Self {
+        Self {
+            direction: [-0.42, -0.62, 0.66],
+            share: 0.72,
+            size_deg: 5.0,
+        }
+    }
+}
+
+impl KeyLightTokens {
+    /// The share, held to its budget. Clamped at read rather than trusted at parse, so a
+    /// hand-edited file cannot spend more than the whole budget.
+    #[must_use]
+    pub fn share(self) -> f32 {
+        self.share.clamp(0.0, 1.0)
+    }
+}
+
+/// The environment's two stops, as token names. Resolved per theme at use.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct EnvironmentTokens {
+    pub horizon: String,
+    pub zenith: String,
+}
+
+impl Default for EnvironmentTokens {
+    fn default() -> Self {
+        Self {
+            horizon: "surface/base".to_string(),
+            zenith: "surface/overlay-lift".to_string(),
+        }
+    }
 }
 
 /// Which bounds the gate checks each material against.

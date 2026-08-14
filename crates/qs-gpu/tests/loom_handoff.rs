@@ -39,6 +39,7 @@
 
 use qs_gpu::color::Srgba;
 use qs_gpu::frame::draw_list_channel;
+use qs_gpu::scene::{Environment, SceneList, Slab};
 
 /// Frames published by the producer. Kept small deliberately: loom explores interleavings
 /// combinatorially, and a third publish takes this model from seconds to minutes without
@@ -58,6 +59,17 @@ fn the_handoff_never_aliases_a_slot() {
                 // detectable as an inconsistency rather than only as a wrong number.
                 slot.stats.rows_laid_out = generation as u32;
                 slot.stats.instances = generation as u32 * 10;
+                // The scene rides in the same slot (scene-handoff rule 6), so the same
+                // publish must make it visible with the same guarantee. Alternate lit and
+                // unlit frames so the model also covers a recycled slot going back to None.
+                *producer.scene_slot() = (generation % 2 == 1).then(|| {
+                    let mut scene = SceneList::default();
+                    scene.reset(generation, Environment::default());
+                    for _ in 0..generation {
+                        scene.push(Slab::default());
+                    }
+                    scene
+                });
                 producer.publish();
             }
         });
@@ -83,6 +95,24 @@ fn the_handoff_never_aliases_a_slot() {
                 );
                 assert_eq!(list.stats.instances, list.generation as u32 * 10);
                 assert_eq!(list.viewport, [1920, 1080]);
+
+                let generation = list.generation;
+                match consumer.scene() {
+                    // A lit frame's scene must be the one written before the same publish:
+                    // same generation, and contents derived from it fully visible.
+                    Some(scene) => {
+                        assert_eq!(generation % 2, 1, "an unlit frame handed out a scene");
+                        assert_eq!(scene.generation, generation);
+                        assert_eq!(
+                            scene.slabs.len(),
+                            generation as usize,
+                            "a partially visible scene was acquired"
+                        );
+                    }
+                    // An unlit frame reads as no scene -- including when a previous lit
+                    // frame used this slot, which is the recycled-slot hazard.
+                    None => assert_eq!(generation % 2, 0, "a lit frame lost its scene"),
+                }
             }
         }
 

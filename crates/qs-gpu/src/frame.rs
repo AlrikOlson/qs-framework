@@ -39,6 +39,7 @@ use std::cell::UnsafeCell;
 use bytemuck::{Pod, Zeroable};
 
 use crate::color::Srgba;
+use crate::scene::SceneList;
 
 // -- primitives --------------------------------------------------------------------
 
@@ -1009,8 +1010,21 @@ const FRESH: u8 = 0b100;
 /// The `AcqRel` ordering on both swaps is what makes the *contents* of a slot visible: the
 /// producer's writes happen-before its swap, which synchronizes-with the consumer's swap,
 /// which happens-before its reads.
+/// One slot's payload: the draw list, and beside it the scene the lit mode publishes.
+///
+/// The scene rides **inside the same slot** rather than through a second channel, and that
+/// is the whole of scene-handoff rule 3's enforcement strategy: one atomic swap hands both
+/// across, so a frame can never acquire this frame's geometry with last frame's shadows —
+/// the tearing a second channel would have to be *kept* from doing is impossible here by
+/// construction. `None` is the mode being off; `Some` with an empty slab list is a builder
+/// that ran and found nothing, which is a bug worth finding (rule 2: absent is not empty).
+struct FrameSlot {
+    list: DrawList,
+    scene: Option<SceneList>,
+}
+
 pub struct DrawListChannel {
-    slots: [UnsafeCell<DrawList>; 3],
+    slots: [UnsafeCell<FrameSlot>; 3],
     state: AtomicU8,
 }
 
@@ -1027,12 +1041,14 @@ impl std::fmt::Debug for DrawListChannel {
 
 /// Build a connected producer/consumer pair.
 pub fn draw_list_channel() -> (Producer, Consumer) {
+    let empty = || {
+        UnsafeCell::new(FrameSlot {
+            list: DrawList::default(),
+            scene: None,
+        })
+    };
     let channel = Arc::new(DrawListChannel {
-        slots: [
-            UnsafeCell::new(DrawList::default()),
-            UnsafeCell::new(DrawList::default()),
-            UnsafeCell::new(DrawList::default()),
-        ],
+        slots: [empty(), empty(), empty()],
         // Producer starts on slot 0, consumer on slot 1, slot 2 is ready-but-stale.
         state: AtomicU8::new(2),
     });
@@ -1058,7 +1074,20 @@ impl Producer {
         let index = self.write as usize;
         // SAFETY: `self.write` is owned exclusively by this `Producer` until `publish`
         // swaps it away, and `Producer` is neither `Clone` nor `Sync`.
-        unsafe { self.channel.slot_mut(index) }
+        unsafe { &mut self.channel.slot_mut(index).list }
+    }
+
+    /// The scene half of the same slot, published by the same `publish`.
+    ///
+    /// Set it every frame: `Some` when the lit mode is on, `None` when it is off. Slots are
+    /// recycled, so a producer that only writes it when the mode is on would leave a stale
+    /// scene in the slot from three frames ago — which is exactly the pairing
+    /// [`Consumer::scene`]'s generation check exists to refuse, and better never published
+    /// than published and refused.
+    pub fn scene_slot(&mut self) -> &mut Option<SceneList> {
+        let index = self.write as usize;
+        // SAFETY: as for `slot`.
+        unsafe { &mut self.channel.slot_mut(index).scene }
     }
 
     /// Publish the current slot and take ownership of another.
@@ -1097,13 +1126,28 @@ impl Consumer {
         let index = self.read as usize;
         // SAFETY: the swap transferred exclusive ownership of `old`'s index to this
         // consumer; the producer can no longer reach it.
-        Some(unsafe { self.channel.slot_ref(index) })
+        Some(unsafe { &self.channel.slot_ref(index).list })
     }
 
     /// The most recently acquired list, whether or not it is new.
     pub fn current(&self) -> &DrawList {
         // SAFETY: `self.read` is consumer-owned.
-        unsafe { self.channel.slot_ref(self.read as usize) }
+        unsafe { &self.channel.slot_ref(self.read as usize).list }
+    }
+
+    /// The scene belonging to [`Consumer::current`], or `None` if this frame is not lit.
+    ///
+    /// **Refuses a mismatched pair** (scene-handoff rule 3): a scene whose generation is not
+    /// the draw list's is answered with `None`, exactly as if the mode were off, because the
+    /// only way to produce one is a producer that reused a slot without rewriting the scene
+    /// half — and lighting this frame's geometry with a stale frame's shadows reads as
+    /// latency, which is nearly impossible to attribute. Refusal costs one unlit frame and
+    /// is diagnosable; rendering the mismatch is neither.
+    pub fn scene(&self) -> Option<&SceneList> {
+        // SAFETY: `self.read` is consumer-owned.
+        let slot = unsafe { self.channel.slot_ref(self.read as usize) };
+        let scene = slot.scene.as_ref()?;
+        (scene.generation == slot.list.generation).then_some(scene)
     }
 }
 
@@ -1111,7 +1155,7 @@ impl DrawListChannel {
     /// # Safety
     /// The caller must own `index` per the type-level argument.
     #[allow(clippy::mut_from_ref)]
-    unsafe fn slot_mut(&self, index: usize) -> &mut DrawList {
+    unsafe fn slot_mut(&self, index: usize) -> &mut FrameSlot {
         let cell = self.slot_cell(index);
         #[cfg(loom)]
         {
@@ -1125,7 +1169,7 @@ impl DrawListChannel {
 
     /// # Safety
     /// The caller must own `index` per the type-level argument.
-    unsafe fn slot_ref(&self, index: usize) -> &DrawList {
+    unsafe fn slot_ref(&self, index: usize) -> &FrameSlot {
         let cell = self.slot_cell(index);
         #[cfg(loom)]
         {
@@ -1137,7 +1181,7 @@ impl DrawListChannel {
         }
     }
 
-    fn slot_cell(&self, index: usize) -> &UnsafeCell<DrawList> {
+    fn slot_cell(&self, index: usize) -> &UnsafeCell<FrameSlot> {
         // The index always comes from a 2-bit field, so it is 0..=3; state is only ever
         // seeded with 0..=2. Clamping rather than indexing keeps a corrupted state byte
         // from becoming an out-of-bounds access.
@@ -1302,6 +1346,72 @@ mod tests {
             c.current().generation,
             1,
             "the held frame must not be mutated"
+        );
+    }
+
+    #[test]
+    fn a_scene_travels_in_the_same_slot_as_its_draw_list() {
+        // Scene-handoff rules 2 and 6: the scene is published by the same swap as the list,
+        // and absent is a state the consumer can see -- not an empty stand-in.
+        let (mut p, mut c) = draw_list_channel();
+        p.slot().reset([100, 100], Srgba::TRANSPARENT, 7);
+        let mut scene = crate::scene::SceneList::default();
+        scene.reset(7, crate::scene::Environment::default());
+        scene.push(crate::scene::Slab {
+            rect: [1.0, 2.0, 3.0, 4.0],
+            ..crate::scene::Slab::default()
+        });
+        *p.scene_slot() = Some(scene);
+        p.publish();
+
+        assert_eq!(c.acquire().map(|d| d.generation), Some(7));
+        assert!(c.scene().is_some(), "the scene published with generation 7");
+        let held = c.scene().unwrap();
+        assert_eq!(held.generation, 7);
+        assert_eq!(held.slabs.len(), 1);
+    }
+
+    #[test]
+    fn an_unlit_frame_carries_no_scene_even_after_a_lit_one_used_the_slot() {
+        // Slots are recycled. A frame with the mode off must read as "no scene", not as
+        // whichever scene a previous frame left in the slot -- which is why the producer
+        // writes the scene half every frame and the docs on `scene_slot` say so.
+        let (mut p, mut c) = draw_list_channel();
+        for generation in 1..=4 {
+            p.slot().reset([1, 1], Srgba::TRANSPARENT, generation);
+            let mut scene = crate::scene::SceneList::default();
+            scene.reset(generation, crate::scene::Environment::default());
+            *p.scene_slot() = Some(scene);
+            p.publish();
+        }
+        p.slot().reset([1, 1], Srgba::TRANSPARENT, 5);
+        *p.scene_slot() = None;
+        p.publish();
+
+        assert_eq!(c.acquire().map(|d| d.generation), Some(5));
+        assert!(
+            c.scene().is_none(),
+            "an unlit frame surfaced a stale scene from a recycled slot"
+        );
+    }
+
+    #[test]
+    fn a_scene_with_the_wrong_generation_is_refused_rather_than_rendered() {
+        // Scene-handoff rule 3. The only way to build this pair is a producer defect, and
+        // the failure it prevents is this frame's geometry lit with last frame's shadows --
+        // a shadow lagging its object by one frame during a scroll, which reads as latency
+        // and is nearly impossible to attribute.
+        let (mut p, mut c) = draw_list_channel();
+        p.slot().reset([100, 100], Srgba::TRANSPARENT, 9);
+        let mut scene = crate::scene::SceneList::default();
+        scene.reset(8, crate::scene::Environment::default());
+        *p.scene_slot() = Some(scene);
+        p.publish();
+
+        assert_eq!(c.acquire().map(|d| d.generation), Some(9));
+        assert!(
+            c.scene().is_none(),
+            "a scene from generation 8 was handed out with generation 9's draw list"
         );
     }
 

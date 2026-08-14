@@ -600,6 +600,14 @@ pub struct MaterialDef {
     pub text: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// A step from the elevation scale, or absent for a surface that lies on the canvas.
+    ///
+    /// A property of the **material**, never of a layer: every layer of one material sits at
+    /// the same height, or the material would describe an object with two of them
+    /// (specs/002-ray-traced-mode/data-model.md). A step name rather than a number, exactly
+    /// as `radius` is a class and `reach` is a space step — Principle VII.
+    #[serde(default)]
+    pub elevation: Option<String>,
 }
 
 /// A layer with its colours resolved for one theme and its lengths in **logical** pixels.
@@ -813,6 +821,10 @@ pub struct Material {
     pub over: Vec<String>,
     pub text: Vec<String>,
     pub description: String,
+    /// Height of this material's top face above the canvas, **logical** pixels. Zero for a
+    /// material that authored no step. Resolved from the elevation scale, so an unknown step
+    /// was already an error by the time this exists.
+    pub elevation: f32,
 }
 
 impl Material {
@@ -1028,6 +1040,80 @@ impl Material {
             .max(0.0)
     }
 
+    /// This material as the lighting pass sees it: one slab, the shape of its body layer.
+    ///
+    /// The geometry comes from [`layer_shape`] on the same [`Layer`] that
+    /// [`Material::compile`] turns into the body instance — scene-handoff rule 1's exact
+    /// agreement is this shared origin, not a comparison somebody remembers to run. The body
+    /// is the first full-coverage surface layer: not a halo (drawn outside the shape), not an
+    /// edge band, not a displaced contact shadow, because a shadow cast by any of those would
+    /// come from a shape that is not the surface.
+    ///
+    /// `None` for a material that is fully transparent — an invisible surface that casts a
+    /// shadow is a shadow from nothing (see [`crate::scene::occupies_scene`]) — or one with
+    /// no full-coverage layer, which today does not exist and would be a stack of hairlines.
+    ///
+    /// The albedo is the body's `flat` stop: the colour the CPU floor and forced-colours mode
+    /// already collapse this surface to, so the three degraded descriptions of one thing
+    /// agree instead of being three guesses. Emission stays zero here — authoring it is US2's
+    /// task (T050), and a slab that emitted before the tokens could say so would be a light
+    /// nobody can turn off.
+    #[must_use]
+    pub fn slab(&self, surface: Surface) -> Option<qs_gpu::scene::Slab> {
+        if !crate::scene::occupies_scene(self) {
+            return None;
+        }
+        let body = self.layers.iter().find(|layer| {
+            matches!(
+                layer.kind,
+                PrimKind::Rect
+                    | PrimKind::Gradient
+                    | PrimKind::Sweep
+                    | PrimKind::Field
+                    | PrimKind::Pbr
+            ) && layer.edge.is_none()
+                && layer.inset == 0.0
+                && layer.offset == 0.0
+        })?;
+        let (x, y, w, h, radius) = layer_shape(*body, surface)?;
+        // `Instance::field` hardcodes its radius to zero -- the field is the window's ground
+        // and a rounded ground has nothing behind it to show. The slab mirrors the *drawn*
+        // truth, not the requested one, or rule 1's exactness fails at the first rounded
+        // surface someone paints a field on.
+        let radius = if body.kind == PrimKind::Field {
+            0.0
+        } else {
+            radius
+        };
+        let linear = |c: Srgba| {
+            [
+                qs_gpu::color::srgb_to_linear(c.r),
+                qs_gpu::color::srgb_to_linear(c.g),
+                qs_gpu::color::srgb_to_linear(c.b),
+            ]
+        };
+        let (roughness, metalness) = self
+            .layers
+            .iter()
+            .find(|layer| layer.kind == PrimKind::Pbr)
+            .map_or((1.0, 0.0), |layer| (layer.roughness, layer.metallic));
+        let elevation = self.elevation * surface.scale;
+        Some(qs_gpu::scene::Slab {
+            rect: [x, y, w, h],
+            radius,
+            elevation,
+            // Standing on the canvas: the slab extends from its top face down to the ground.
+            // A floating surface is a choice nothing has made yet, and it would be authored,
+            // not defaulted.
+            thickness: elevation,
+            albedo: linear(body.flat),
+            roughness,
+            metalness,
+            emission: [0.0; 3],
+            emission_strength: 0.0,
+        })
+    }
+
     /// Every colour text can end up sitting on, when this material is painted over `base`.
     ///
     /// The cartesian product of each layer's in-shape stops, composited in paint order. Two
@@ -1177,6 +1263,7 @@ pub(crate) fn resolve_all(
     colors: &BTreeMap<String, Srgba>,
     space: &BTreeMap<String, f32>,
     radius: &BTreeMap<String, f32>,
+    elevation: &BTreeMap<String, f32>,
 ) -> Result<BTreeMap<String, Material>, TokenError> {
     let color = |name: &str, material: &str| -> Result<Srgba, TokenError> {
         colors
@@ -1469,6 +1556,21 @@ pub(crate) fn resolve_all(
             };
             layers.push(resolved);
         }
+        // An unknown elevation step is an error exactly as an unknown colour token is: a
+        // material that silently lay on the canvas would cast no shadow, and a missing
+        // shadow looks like a lighting bug rather than a typo in this file.
+        let elevation = match &def.elevation {
+            Some(step) => {
+                elevation
+                    .get(step)
+                    .copied()
+                    .ok_or_else(|| TokenError::MaterialUnknownElevation {
+                        material: material.clone(),
+                        step: step.clone(),
+                    })?
+            }
+            None => 0.0,
+        };
         out.insert(
             material.clone(),
             Material {
@@ -1476,6 +1578,7 @@ pub(crate) fn resolve_all(
                 over: def.over.clone(),
                 text: def.text.clone(),
                 description: def.description.clone(),
+                elevation,
             },
         );
     }

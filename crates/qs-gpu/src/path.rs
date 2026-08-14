@@ -133,6 +133,22 @@ pub trait RenderPathSelector {
     fn pinned(&self) -> Option<RenderPath>;
 }
 
+/// The tier `QS_FORCE_TIER` names, if the variable is set and parseable.
+///
+/// A test seam (tasks.md T008): the parity suites and the boot proofs need to put the
+/// application on *any* tier without a dialog or a flag threading through a harness. It is
+/// consulted by the application's selector **after** `--force-render-path`, so a command
+/// line is never silently overridden by a variable a shell exported an hour ago. An
+/// unparseable value is `None` rather than an error, for the reason `RenderPath::parse`
+/// already gives: a typo in an env var must not stop the application starting.
+#[must_use]
+pub fn forced_from_env() -> Option<RenderPath> {
+    std::env::var("QS_FORCE_TIER")
+        .ok()
+        .as_deref()
+        .and_then(RenderPath::parse)
+}
+
 /// Apply the contract's resolution order.
 pub fn resolve(selector: &dyn RenderPathSelector) -> Resolution {
     if let Some(path) = selector.forced() {
@@ -365,6 +381,33 @@ mod tests {
             pinned: Some(RenderPath::Cpu),
         });
         assert_eq!(r.path, RenderPath::Primary);
+        assert_eq!(r.reason, PathReason::Forced);
+    }
+
+    #[test]
+    fn qs_force_tier_selects_any_tier_and_forcing_cpu_still_resolves() {
+        // T008. The variable is only touched by this one test, so the process-global env is
+        // not raced. `set_var` is unsafe in edition 2024 because of exactly that hazard.
+        unsafe { std::env::set_var("QS_FORCE_TIER", "cpu") };
+        assert_eq!(forced_from_env(), Some(RenderPath::Cpu));
+        unsafe { std::env::set_var("QS_FORCE_TIER", "REDUCED") };
+        assert_eq!(forced_from_env(), Some(RenderPath::Reduced));
+        unsafe { std::env::set_var("QS_FORCE_TIER", "quantum") };
+        assert_eq!(forced_from_env(), None, "a typo must not stop startup");
+        unsafe { std::env::remove_var("QS_FORCE_TIER") };
+        assert_eq!(forced_from_env(), None);
+
+        // Forcing the CPU tier resolves to a running configuration rather than an error --
+        // the tier exists and the resolution order honours it. That it *renders* is the
+        // CPU rasterizer's suites and `--shot`'s job (and the cpu-tier-boot-proof chunk's,
+        // for the whole application); a claim of it here would be a claim this unit test
+        // cannot observe.
+        let r = resolve(&Fixed {
+            probe: RenderPath::Primary,
+            forced: Some(RenderPath::Cpu),
+            pinned: None,
+        });
+        assert_eq!(r.path, RenderPath::Cpu);
         assert_eq!(r.reason, PathReason::Forced);
     }
 
