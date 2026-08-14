@@ -115,14 +115,14 @@ fn measure(ctx: &GpuContext, list: &DrawList, force: bool) -> f64 {
     renderer.force_offscreen(force);
 
     for _ in 0..WARMUP {
-        let cmd = renderer.render(ctx, &view, list, None);
+        let cmd = renderer.render(ctx, &view, list, None, None);
         ctx.queue.submit([cmd]);
     }
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
     let start = std::time::Instant::now();
     for _ in 0..FRAMES {
-        let cmd = renderer.render(ctx, &view, list, None);
+        let cmd = renderer.render(ctx, &view, list, None, None);
         ctx.queue.submit([cmd]);
     }
     ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();

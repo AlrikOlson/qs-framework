@@ -635,6 +635,35 @@ mod tests {
     }
 
     #[test]
+    fn hit_testing_is_identical_with_the_mode_on_and_off() {
+        // FR-008 / T031. The lit mode's scene is published beside the frame and is not an
+        // input to `entry_at` or `row_at` — this sweep asserts the answers are identical
+        // anyway, with a real scene built from the same viewport, so a future change that
+        // threads the scene into hit testing has to keep every answer or go red here.
+        // (The task names row.rs; the hit test lives here, beside its inverse.)
+        let layout = layout_for(1000, 1080, 28, 13.0).at(240.0, 96.0);
+        let off: Vec<Option<u64>> = (0..1080).map(|y| layout.row_at(y as f32)).collect();
+
+        let tokens = crate::tokens::Tokens::embedded(crate::tokens::Theme::Dark).unwrap();
+        let mut builder = crate::scene::SceneBuilder::new(
+            1,
+            [1000.0, 1080.0],
+            40.0,
+            qs_gpu::scene::Environment::default(),
+        );
+        let canvas = tokens.material(crate::material::name::SURFACE_CANVAS).unwrap();
+        builder.add(
+            canvas,
+            crate::material::Surface::new(0.0, 0.0, 1000.0, 1080.0, 0.0, 1.0),
+        );
+        let scene = builder.finish();
+        assert!(!scene.slabs.is_empty());
+
+        let on: Vec<Option<u64>> = (0..1080).map(|y| layout.row_at(y as f32)).collect();
+        assert_eq!(off, on, "hit testing changed when the lit mode's scene existed");
+    }
+
+    #[test]
     fn a_pointer_in_the_chrome_is_over_no_row_at_all() {
         // Without this, the command bar and the status shelf both act as row 0 and the
         // last visible row respectively -- a click on "up" would also select a file.

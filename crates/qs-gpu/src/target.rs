@@ -179,6 +179,114 @@ impl OffscreenTarget {
     }
 }
 
+/// The lighting pass's own target: what one surface does to another, per pixel (T018).
+///
+/// # Three channels, and why
+///
+/// Bounced light is chromatic — an amber selection spills amber, not grey — so a
+/// single-channel target cannot carry it (research R9's note, revising R11's single-channel
+/// estimate). The format is `Rgba8Unorm`: attenuation and addition are both bounded inside
+/// `0..=1` by the allowance tokens (`addition_max` ships at 0.35 linear), so 8 bits per
+/// channel suffice, and the fourth channel is padding — stated here so a reader does not go
+/// looking for what alpha means. It means nothing.
+///
+/// # Cost, stated before it is spent
+///
+/// `width x height x 4`: **8,294,400 bytes at 1920x1080 and 33,177,600 at 3840x2160** — the
+/// same figures as the colour target, because the format has the same stride. Counted
+/// against the same GPU allocation ceiling as everything else, and pinned by
+/// `the_lighting_targets_cost_is_the_one_that_was_stated` so a wider format for headroom is
+/// argued for rather than merged. Allocated **lazily**, on the first frame that carries a
+/// renderable scene, so an installation that never turns the mode on carries none of it.
+///
+/// # What does not exist yet
+///
+/// No pipeline reads or writes this target — the lighting shaders are US1's tasks. It is
+/// allocated here, ahead of them, because its memory cost and resize behaviour are exactly
+/// the decisions T018 wants made in the open rather than under a visual feature, and because
+/// `usage` is part of that decision: RENDER_ATTACHMENT for the pass that will fill it,
+/// TEXTURE_BINDING for the modulation that will read it.
+pub struct LightingTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: [u32; 2],
+}
+
+impl std::fmt::Debug for LightingTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LightingTarget")
+            .field("size", &self.size)
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
+
+impl LightingTarget {
+    /// The one format this target takes. A constant rather than a parameter, because unlike
+    /// the colour target it does not have to match a surface — it has to match the lighting
+    /// maths, which is the same on every machine.
+    pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+    /// Allocate a target of exactly `size`, clamped to one texel per axis like its sibling.
+    pub fn new(device: &wgpu::Device, size: [u32; 2]) -> Self {
+        let size = [size[0].max(1), size[1].max(1)];
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("qs-lighting"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            texture,
+            view,
+            size,
+        }
+    }
+
+    /// The view the lighting pass will render into.
+    #[must_use]
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    #[must_use]
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    #[must_use]
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// Whether this target can serve a frame at `size`. Exact, like the colour target's.
+    #[must_use]
+    pub fn fits(&self, size: [u32; 2]) -> bool {
+        self.size == [size[0].max(1), size[1].max(1)]
+    }
+
+    /// GPU memory this target holds, in bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        Self::bytes_at(self.size)
+    }
+
+    /// What a target at `size` would cost, without allocating one.
+    #[must_use]
+    pub fn bytes_at(size: [u32; 2]) -> u64 {
+        u64::from(size[0].max(1)) * u64::from(size[1].max(1)) * BYTES_PER_TEXEL
+    }
+}
+
 /// Whether a tier can hold an offscreen target at all.
 ///
 /// Not a capability probe: a second colour attachment is available on every device that can
@@ -208,6 +316,17 @@ mod tests {
         // reasonable idea and a 66 MB one at 4K is a reasonable thing to have to argue for.
         assert_eq!(OffscreenTarget::bytes_at([1920, 1080]), 8_294_400);
         assert_eq!(OffscreenTarget::bytes_at([3840, 2160]), 33_177_600);
+    }
+
+    #[test]
+    fn the_lighting_targets_cost_is_the_one_that_was_stated() {
+        // T018: the cost is stated and pinned, like the colour target's, so a format change
+        // that doubles it has to be argued for. Three meaningful channels in four bytes --
+        // Rgba8Unorm -- because attenuation and addition are both bounded in 0..=1 by the
+        // allowance tokens and bounced light is chromatic.
+        assert_eq!(LightingTarget::bytes_at([1920, 1080]), 8_294_400);
+        assert_eq!(LightingTarget::bytes_at([3840, 2160]), 33_177_600);
+        assert_eq!(LightingTarget::FORMAT, wgpu::TextureFormat::Rgba8Unorm);
     }
 
     #[test]

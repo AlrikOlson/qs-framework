@@ -220,7 +220,7 @@ fn render(ctx: &GpuContext, list: &DrawList) -> Vec<u8> {
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut renderer = Renderer::new(ctx, 512);
-    let commands = renderer.render(ctx, &view, list, None);
+    let commands = renderer.render(ctx, &view, list, None, None);
 
     // `copy_texture_to_buffer` requires the row stride to be a multiple of 256, so the
     // read-back buffer is padded and unpadded again below. Getting this wrong shifts every

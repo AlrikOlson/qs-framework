@@ -14,8 +14,9 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::PendingUpload;
 use crate::device::GpuContext;
-use crate::frame::{DrawList, FIELD_CENTRES, Instance, PrimKind};
-use crate::target::OffscreenTarget;
+use crate::frame::{Batch, DrawList, FIELD_CENTRES, Instance, PrimKind};
+use crate::scene::SceneList;
+use crate::target::{LightingTarget, OffscreenTarget};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
@@ -89,6 +90,13 @@ pub struct Renderer {
     /// recreated only on resize" is a claim about a thing that is otherwise invisible, and a
     /// per-frame reallocation of 33 MB looks exactly like a correct render.
     offscreen_allocations: u32,
+    /// The lighting pass's target (T018). Lazy for the same reason as `offscreen`, one
+    /// mode further out: allocated on the first frame that carries a renderable scene, so
+    /// the mode being off costs no memory as well as no work. See
+    /// [`crate::target::LightingTarget`] for the format, the three channels and the cost.
+    lighting: Option<LightingTarget>,
+    /// Counted for the same reason as `offscreen_allocations`.
+    lighting_allocations: u32,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -379,6 +387,8 @@ impl Renderer {
             offscreen: None,
             force_offscreen: false,
             offscreen_allocations: 0,
+            lighting: None,
+            lighting_allocations: 0,
         }
     }
 
@@ -489,15 +499,35 @@ impl Renderer {
     /// puts it back. `the_two_pass_path_is_pixel_identical_to_the_one_pass_path` asserts the
     /// two produce the same image when nothing has actually sampled the backdrop, which is
     /// what keeps the addition from being a silent regression.
+    ///
+    /// # The surface/content split (T019)
+    ///
+    /// The batch sequence is drawn in two halves around [`surface_content_split`]: the
+    /// leading run of untextured batches — the **surfaces** — and everything from the first
+    /// atlas-sampled batch on — the **content**. The lighting pass, when it lands (US1),
+    /// slots exactly between them, which is what makes "text is drawn after lighting and
+    /// never lit" (lit-contrast rule 1) a property of this function's shape rather than of
+    /// anyone's care. The split is a *cut*, never a re-sort: batches keep their order on both
+    /// sides, so composition is untouched and an overlay ground drawn above earlier text
+    /// stays above it — unlit, which rule 1 permits; reordered, which it does not, is the
+    /// version [`crate::batcher::tests::the_split_is_a_cut_at_the_first_textured_batch`]
+    /// goes red on.
+    ///
+    /// `scene` is the frame's lit-mode geometry, from [`crate::frame::Consumer::scene`].
+    /// Today it drives exactly one thing: a renderable scene allocates the lighting target
+    /// (T018), so the mode's memory cost appears when the mode does. No pass reads the
+    /// target yet.
     pub fn render(
         &mut self,
         ctx: &GpuContext,
         target: &wgpu::TextureView,
         list: &DrawList,
+        scene: Option<&SceneList>,
         timing: Option<&mut crate::timing::GpuTimer>,
     ) -> wgpu::CommandBuffer {
         self.ensure_capacity(ctx, list.instances.len() as u64);
         let offscreen = self.ensure_offscreen(ctx, list);
+        self.ensure_lighting(ctx, list, scene);
 
         ctx.queue.write_buffer(
             &self.globals_buffer,
@@ -568,25 +598,21 @@ impl Renderer {
             pass.set_bind_group(1, &self.atlas_bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
-            for batch in &list.batches {
-                if let Some([x, y, w, h]) = batch.scissor {
-                    // A scissor rect outside the surface is a validation error, and a
-                    // resize race can produce one. Clamping is cheaper than the frame it
-                    // would otherwise cost.
-                    let (vw, vh) = (list.viewport[0], list.viewport[1]);
-                    let x = x.min(vw);
-                    let y = y.min(vh);
-                    let w = w.min(vw.saturating_sub(x));
-                    let h = h.min(vh.saturating_sub(y));
-                    if w == 0 || h == 0 {
-                        continue;
-                    }
-                    pass.set_scissor_rect(x, y, w, h);
-                } else {
-                    pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
-                }
-                pass.draw(0..4, batch.range.clone());
-            }
+            let split = surface_content_split(&list.batches);
+            let (surface_half, content_half) = list.batches.split_at(split);
+
+            // The surface half: every batch before the first atlas-sampled one.
+            draw_batches(&mut pass, list, surface_half);
+
+            // The lighting pass slots HERE (US1): it modulates the surfaces just drawn and
+            // is finished before any glyph exists to be lit. Today there is nothing to run
+            // -- the scene above has allocated the target and no more -- and keeping the
+            // seam inside one wgpu pass is what keeps the mode-off frame the exact frame it
+            // always was: no second pass begins until something renders into it.
+
+            // The content half: text, icons, and whatever is composed above them, in the
+            // order the list stated.
+            draw_batches(&mut pass, list, content_half);
         }
 
         // The resolve. Nothing at all on the single-pass path, which is the shape acceptance
@@ -625,6 +651,37 @@ impl Renderer {
         encoder.finish()
     }
 
+    /// The lighting target, if one has been allocated.
+    #[must_use]
+    pub fn lighting_target(&self) -> Option<&LightingTarget> {
+        self.lighting.as_ref()
+    }
+
+    /// How many lighting targets this renderer has allocated, ever. See
+    /// [`Renderer::offscreen_allocations`] for why this is counted.
+    #[must_use]
+    pub fn lighting_allocations(&self) -> u32 {
+        self.lighting_allocations
+    }
+
+    /// Allocate or resize the lighting target if this frame carries a renderable scene.
+    ///
+    /// The same lazy discipline as [`Renderer::ensure_offscreen`], keyed on the scene
+    /// rather than the draw list: the lit mode's memory cost appears when the mode does and
+    /// never before. An existing target is kept across unlit frames for the same
+    /// reallocation-per-scroll reason the colour target is.
+    fn ensure_lighting(&mut self, ctx: &GpuContext, list: &DrawList, scene: Option<&SceneList>) {
+        if !scene.is_some_and(SceneList::is_renderable) {
+            return;
+        }
+        let size = [list.viewport[0].max(1), list.viewport[1].max(1)];
+        let fits = self.lighting.as_ref().is_some_and(|t| t.fits(size));
+        if !fits {
+            self.lighting_allocations = self.lighting_allocations.saturating_add(1);
+            self.lighting = Some(LightingTarget::new(&ctx.device, size));
+        }
+    }
+
     /// Allocate or resize the offscreen target if this frame needs one.
     ///
     /// Returns whether the two-pass path should run. Returning a bool rather than a
@@ -657,6 +714,47 @@ impl Renderer {
     }
 }
 
+/// Where the batch sequence divides into surfaces and content (T019).
+///
+/// The index of the first atlas-sampled batch: everything before it is a surface the
+/// lighting pass may modulate, everything from it on is content — drawn after lighting,
+/// never lit (lit-contrast rule 1). A **cut, not a partition by flag**: an untextured batch
+/// *after* the first textured one stays in the content half, because moving it would
+/// reorder composition — an overlay's ground drawn above a lower layer's text has to stay
+/// above it. The price is that such a ground goes unlit, which rule 1 permits; the
+/// alternative prices are a reordered frame or lit glyphs, and both are defects.
+fn surface_content_split(batches: &[Batch]) -> usize {
+    batches
+        .iter()
+        .position(|batch| batch.textured)
+        .unwrap_or(batches.len())
+}
+
+/// One half of the batch loop. Factored so the two halves around the lighting seam cannot
+/// drift apart — the scissor clamping below is exactly the kind of detail a second copy
+/// forgets.
+fn draw_batches(pass: &mut wgpu::RenderPass<'_>, list: &DrawList, batches: &[Batch]) {
+    for batch in batches {
+        if let Some([x, y, w, h]) = batch.scissor {
+            // A scissor rect outside the surface is a validation error, and a
+            // resize race can produce one. Clamping is cheaper than the frame it
+            // would otherwise cost.
+            let (vw, vh) = (list.viewport[0], list.viewport[1]);
+            let x = x.min(vw);
+            let y = y.min(vh);
+            let w = w.min(vw.saturating_sub(x));
+            let h = h.min(vh.saturating_sub(y));
+            if w == 0 || h == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(x, y, w, h);
+        } else {
+            pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
+        }
+        pass.draw(0..4, batch.range.clone());
+    }
+}
+
 /// Mirrors the `InstanceIn` struct in `shaders/instance.wgsl`. The two must agree; a
 /// mismatch is a silently wrong render, not a validation error, because the byte counts
 /// still line up.
@@ -668,3 +766,59 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array!
     4 => Float32,    // param
     5 => Uint32,     // kind
 ];
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    fn batch(textured: bool) -> Batch {
+        Batch {
+            range: 0..1,
+            scissor: None,
+            textured,
+        }
+    }
+
+    #[test]
+    fn no_atlas_sampled_batch_is_drawn_before_the_lighting_seam() {
+        // T020, and the property lit-contrast rule 1 depends on: every textured batch sits
+        // at or after the split, so the lighting pass that slots into the seam is finished
+        // before the first glyph is drawn. Trivially true of `position(first textured)` --
+        // which is the point: the test exists for the future reordering that replaces it.
+        let sequences: &[&[Batch]] = &[
+            &[],
+            &[batch(false)],
+            &[batch(true)],
+            &[batch(false), batch(true)],
+            &[batch(false), batch(true), batch(false), batch(true)],
+            &[batch(true), batch(false)],
+        ];
+        for batches in sequences {
+            let split = surface_content_split(batches);
+            assert!(
+                batches.iter().take(split).all(|b| !b.textured),
+                "an atlas-sampled batch sits in the surface half, so it would be lit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_is_a_cut_at_the_first_textured_batch() {
+        // The version that goes red on the tempting rewrite: splitting at the LAST
+        // untextured batch. That version draws the sandwiched textured batch before the
+        // lighting seam -- a lit glyph -- and re-orders nothing else, so only this exact
+        // assertion catches it.
+        let batches = [batch(false), batch(true), batch(false), batch(true)];
+        assert_eq!(surface_content_split(&batches), 1);
+
+        // An overlay ground after text stays in the content half: unlit, but in order.
+        let overlay = [batch(false), batch(true), batch(false)];
+        assert_eq!(surface_content_split(&overlay), 1);
+
+        // No content at all: everything is surface, the seam is at the end.
+        let plain = [batch(false), batch(false)];
+        assert_eq!(surface_content_split(&plain), 2);
+    }
+}

@@ -129,7 +129,7 @@ fn draw_into(
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let commands = renderer.render(ctx, &view, list, None);
+    let commands = renderer.render(ctx, &view, list, None, None);
 
     let unpadded = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;

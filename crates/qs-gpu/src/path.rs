@@ -338,6 +338,101 @@ impl CrashCounter {
     }
 }
 
+// -- the lit mode's own attempt counter (T023, FR-020) --------------------------------
+
+/// Persisted attempt counter for the lit mode's risky initialisation.
+///
+/// Turning the lit mode on allocates targets and, when US1 lands, compiles a lighting
+/// pipeline — a second risky initialisation with the same failure mode as startup: a driver
+/// that faults there kills the process before any code after it runs. The discipline is
+/// therefore [`CrashCounter`]'s, deliberately copied rather than shared: **persist before
+/// attempting**, clear on the first lit frame that renders, and once the threshold is
+/// reached pin the mode *off* — permanently and reported, never silently. A separate file
+/// rather than a second key in `render-path.state`, because the two counters demote
+/// different things: one moves the tier, the other refuses a mode, and a torn write must
+/// not be able to damage both at once.
+#[derive(Clone, Debug)]
+pub struct LitCounter {
+    file: PathBuf,
+}
+
+impl LitCounter {
+    /// Store the counter in `dir`. Same degradation as [`CrashCounter::in_dir`]: an
+    /// uncreatable directory means "always zero", which is a first-ever run.
+    pub fn in_dir(dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref();
+        let _ = fs::create_dir_all(dir);
+        Self {
+            file: dir.join("lit-mode.state"),
+        }
+    }
+
+    /// The conventional per-user state location for this platform.
+    #[must_use]
+    pub fn default_location() -> Self {
+        Self::in_dir(state_dir())
+    }
+
+    fn attempts(&self) -> u32 {
+        // A half-written or hostile file reads as zero attempts -- it can cost one extra
+        // crash, never a machine wedged out of a mode by a torn write.
+        fs::read_to_string(&self.file)
+            .ok()
+            .as_deref()
+            .and_then(|text| {
+                text.lines()
+                    .filter_map(|line| line.split_once('='))
+                    .find(|(key, _)| key.trim() == "attempts")
+                    .and_then(|(_, value)| value.trim().parse::<u32>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Whether previous faults have pinned the mode off.
+    ///
+    /// The caller reports the pin rather than silently ignoring the toggle — Constitution
+    /// III: reduced capability is never silent.
+    #[must_use]
+    pub fn pinned_off(&self) -> bool {
+        self.attempts() >= DEMOTION_THRESHOLD
+    }
+
+    /// Record that the lit initialisation is about to be attempted. Returns `false` when
+    /// the pin says not to try.
+    ///
+    /// **Persists before returning**, like [`CrashCounter::begin_attempt`], and the caller
+    /// must not touch the graphics API for the mode until it has. That ordering is the
+    /// whole contract: the marker on disk is what tells the *next* run that this one died
+    /// here.
+    #[must_use]
+    pub fn begin_attempt(&self) -> bool {
+        let attempts = self.attempts();
+        if attempts >= DEMOTION_THRESHOLD {
+            return false;
+        }
+        let _ = self.write(attempts + 1);
+        true
+    }
+
+    /// Called once a frame has rendered with the mode on. See [`CrashCounter::mark_success`]
+    /// for why it is a rendered frame and not a created device.
+    pub fn mark_success(&self) {
+        let _ = self.write(0);
+    }
+
+    /// Forget the pin, for the user gesture that says the driver was fixed.
+    pub fn reset(&self) {
+        let _ = fs::remove_file(&self.file);
+    }
+
+    fn write(&self, attempts: u32) -> std::io::Result<()> {
+        let mut file = fs::File::create(&self.file)?;
+        writeln!(file, "attempts={attempts}")?;
+        file.flush()?;
+        file.sync_all()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -409,6 +504,49 @@ mod tests {
         });
         assert_eq!(r.path, RenderPath::Cpu);
         assert_eq!(r.reason, PathReason::Forced);
+    }
+
+    #[test]
+    fn the_lit_marker_is_on_disk_before_the_caller_can_touch_a_graphics_api() {
+        // T023 / FR-020. The ordering IS the contract: `begin_attempt` returns only after
+        // the marker is persisted, so a driver fault during the lit initialisation leaves
+        // evidence the next run reads. Asserted by reading the file in the window between
+        // `begin_attempt` returning and any "initialisation" happening.
+        let dir = temp_dir("lit-marker-first");
+        let counter = LitCounter::in_dir(&dir);
+        assert!(counter.begin_attempt());
+        let on_disk = fs::read_to_string(dir.join("lit-mode.state")).unwrap();
+        assert!(
+            on_disk.contains("attempts=1"),
+            "the marker was not persisted before begin_attempt returned: {on_disk:?}"
+        );
+    }
+
+    #[test]
+    fn two_lit_faults_pin_the_mode_off_and_a_lit_frame_clears_the_count() {
+        let dir = temp_dir("lit-pin");
+        let counter = LitCounter::in_dir(&dir);
+        assert!(!counter.pinned_off());
+        assert!(counter.begin_attempt()); // died
+        assert!(counter.begin_attempt()); // died again
+        assert!(counter.pinned_off(), "two faults must pin the mode off");
+        assert!(!counter.begin_attempt(), "a pinned mode must not be retried");
+
+        counter.reset();
+        assert!(counter.begin_attempt());
+        counter.mark_success();
+        assert!(!counter.pinned_off());
+        assert_eq!(counter.attempts(), 0, "a lit frame must clear the count");
+    }
+
+    #[test]
+    fn a_torn_lit_file_reads_as_no_information() {
+        let dir = temp_dir("lit-torn");
+        let counter = LitCounter::in_dir(&dir);
+        fs::write(dir.join("lit-mode.state"), "attem").unwrap();
+        assert!(!counter.pinned_off());
+        fs::write(dir.join("lit-mode.state"), "attempts=notanumber").unwrap();
+        assert!(!counter.pinned_off());
     }
 
     #[test]

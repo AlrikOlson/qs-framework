@@ -1877,6 +1877,97 @@ fn run_kind(kind: PrimKind) {
     }
 }
 
+// -- scene-effect floors (T022) -------------------------------------------------------
+
+use crate::lighting::{SceneEffect, SceneFloor};
+use crate::path::RenderPath;
+
+/// One tier's rendering of one scene effect's contribution, isolated: what the lighting
+/// pass would add to or remove from an otherwise-untouched `SURFACE` x `SURFACE` image.
+///
+/// A function value rather than a method so the mutation test can hand the harness a
+/// deliberately wrong renderer and watch it go red — the same design that keeps
+/// [`assert_floor`] honest for primitives.
+type EffectContribution = fn(SceneEffect, RenderPath) -> Surface;
+
+/// The zero contribution: the pass touched nothing.
+fn zero_contribution() -> Surface {
+    Surface {
+        pixels: vec![[0.0; 4]; (SURFACE * SURFACE) as usize],
+        width: SURFACE,
+        height: SURFACE,
+    }
+}
+
+/// The lighting pass as it exists today: no shaders, no contribution, on any tier.
+///
+/// Not a stub pretending to be a pass — this **is** the pass's current declared behaviour,
+/// which is what lets contract rule 5 ("every rung exercised on every build") hold from
+/// the first build instead of the last. US1's transcriptions (T039) replace this with the
+/// real per-effect maths, and T041's fixtures feed real scenes through it; this function
+/// is the seam they land in.
+fn lit_contribution(_effect: SceneEffect, _tier: RenderPath) -> Surface {
+    zero_contribution()
+}
+
+/// Whether `draw`'s output on `tier` is **exactly** the floor `effect` declares.
+///
+/// Scene-effect contract rule 2: zero tolerance, because both sides of the comparison run
+/// the same rasterizer and there is nothing for a tolerance to forgive — it would only
+/// ever hide a real difference. The scene-level mirror of [`cpu_output_is_the_floor`].
+fn scene_effect_holds_its_floor(
+    effect: SceneEffect,
+    tier: RenderPath,
+    draw: EffectContribution,
+) -> bool {
+    let drawn = draw(effect, tier);
+    let expected = match effect.floor(tier) {
+        // The tier draws the effect in full: parity rather than flooring is the question
+        // there, and it is asked by the per-effect fixtures (T032, T041), not here.
+        None => return true,
+        Some(SceneFloor::Nothing) => zero_contribution(),
+        // A bounded floor is the same effect at stated parameters, so its expected image
+        // comes through the same contribution. No shipped effect declares one yet: shadow
+        // and occlusion are drawn in full on their lowest tier, and everything else floors
+        // to Nothing.
+        Some(SceneFloor::Bounded { .. }) => draw(effect, tier),
+    };
+    drawn.pixels == expected.pixels
+}
+
+#[test]
+fn every_declared_scene_floor_is_exercised_and_held_exactly() {
+    // Contract rules 1, 2 and 5 in one sweep: every effect, every tier, every rung run on
+    // every build. Today each declared floor is Nothing and the pass contributes nothing,
+    // so the suite is green by the honest route — the declarations and the implementation
+    // agree because both say "not yet".
+    for effect in SceneEffect::ALL {
+        for tier in [RenderPath::Cpu, RenderPath::Reduced, RenderPath::Primary] {
+            assert!(
+                scene_effect_holds_its_floor(effect, tier, lit_contribution),
+                "{effect:?} on {tier:?} does not draw the floor it declares"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_scene_floor_harness_can_go_red() {
+    // The mutation proof T022 requires: a pass that draws SOMETHING where the effect's
+    // floor says Nothing must fail the harness. A fidelity class that cannot go red is a
+    // promise nobody is keeping.
+    fn wrong(_effect: SceneEffect, _tier: RenderPath) -> Surface {
+        let mut surface = zero_contribution();
+        surface.pixels[0] = [1.0, 0.0, 0.0, 1.0];
+        surface
+    }
+    assert!(
+        !scene_effect_holds_its_floor(SceneEffect::Bounce, RenderPath::Reduced, wrong),
+        "a contribution where the floor declares Nothing was accepted — the harness \
+         cannot detect the failure it exists for"
+    );
+}
+
 // -- the tests -----------------------------------------------------------------------
 
 #[test]

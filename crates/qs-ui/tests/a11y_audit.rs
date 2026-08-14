@@ -336,3 +336,35 @@ fn a_region_that_is_not_a_list_is_still_audited_and_still_owns_its_own_length() 
         "the preview claimed the list's length and nothing said so: {findings:#?}"
     );
 }
+
+#[test]
+fn the_semantic_tree_is_identical_with_the_mode_on_and_off() {
+    // FR-009 / T030. The lit mode publishes a scene BESIDE the frame; the semantic tree is
+    // a function of the row buffer, the layout and the interaction, and the scene is not
+    // among its inputs. This test builds a real scene from the same frame's dimensions and
+    // asserts the tree is bit-identical anyway — so a future change that threads the scene
+    // into `SemanticTree::build` has to keep roles, names, values, bounds, set size and
+    // index in set unchanged or go red here. Compared as a whole rather than field by
+    // field: a field compared is a field someone chose, and the ones nobody chose are
+    // where drift hides.
+    use qs_ui::material::Surface;
+    use qs_ui::scene::SceneBuilder;
+    use qs_ui::tokens::{Theme, Tokens};
+
+    let (buf, layout) = frame_at(3.5 * 28.0, 100);
+    let off = SemanticTree::build(&buf, &layout, Interaction::default());
+
+    let tokens = Tokens::embedded(Theme::Dark).unwrap();
+    let mut builder = SceneBuilder::new(1, [1920.0, 1080.0], 40.0, Default::default());
+    let canvas = tokens.material(qs_ui::material::name::SURFACE_CANVAS).unwrap();
+    builder.add(canvas, Surface::new(0.0, 0.0, 1920.0, 1080.0, 0.0, 1.0));
+    let scene = builder.finish();
+    assert!(!scene.slabs.is_empty(), "the mode-on half built no scene");
+
+    let on = SemanticTree::build(&buf, &layout, Interaction::default());
+    assert_eq!(
+        format!("{off:?}"),
+        format!("{on:?}"),
+        "the semantic tree changed when the lit mode's scene existed"
+    );
+}
