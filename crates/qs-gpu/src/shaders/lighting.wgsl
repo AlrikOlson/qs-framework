@@ -60,6 +60,16 @@ const AO_STRENGTH: f32 = 0.35;
 // Stated rather than tuned per material: one room, one falloff, so two emitters at the
 // same distance contribute the same and a surface cannot buy itself extra reach.
 const BOUNCE_REACH: f32 = 90.0;
+// How far the focus lamp's influence reaches before it has fallen to a quarter, in physical
+// pixels. A stated constant rather than a token, on BOUNCE_REACH's precedent and for the same
+// reason: one room, one falloff, so the lamp cannot buy itself extra reach in one theme.
+//
+// 220 px is roughly four rows at the default density on a 2x display. The bound is what
+// matters more than the number: past it the key light owns the shading again, unchanged, so
+// a lamp cannot relight the far corner of the window from one row — which would be a second
+// light source disagreeing with the first about where light comes from, the exact thing one
+// fixed key direction exists to prevent.
+const FOCUS_REACH: f32 = 220.0;
 
 struct LitScene {
     viewport: vec2f,
@@ -68,6 +78,25 @@ struct LitScene {
     // xyz: toward the light, normalized. w: hardness k = 1 / tan(size / 2) — the inverse of
     // the light's angular size, which is the whole of contact hardening (research R4).
     light: vec4f,
+    // The focus lamp (US3), as a STRIP rather than a bulb: x, y, w, h — the focused row's own
+    // rect in physical pixels. Not a position, which is why it cannot share the field above.
+    //
+    // A point light over a 790 px row lights its middle third and leaves the ends dark, which
+    // reads as a blob rather than as the row being lit. `bounce` learned this one light ago and
+    // its comment says it: the nearest point on the emitter is what the receiver sees, so a long
+    // row lights like a strip. Same rule, same arithmetic, second caller.
+    focus: vec4f,
+    // x: the lamp's share of the SHADOW DIRECTION directly beneath it — how much of the
+    //    shading the lamp's own ray owns against the key light's. **Zero means no lamp**, and
+    //    at zero every line below is arithmetically what this shader did before US3, which is
+    //    what makes "a frame with no focus is unchanged" a property of the arithmetic rather
+    //    than of a branch somebody has to remember to write.
+    // y: the lamp's AMBIENT depth — how far the room dims at the edge of its reach. A separate
+    //    number from x because the two do different work, and one of them does almost nothing
+    //    on its own. See `focus_ambient`.
+    // z: how high the strip hangs above the canvas, physical pixels.
+    // w: hardness k, as `light.w`.
+    focus_mix: vec4f,
     // x, y, w, h — physical pixels, exactly the instance's rect (scene-handoff rule 1).
     rect: array<vec4f, LIT_SLABS>,
     // x: corner radius. y: elevation (top face). z: thickness (downward). w: attenuation
@@ -118,6 +147,28 @@ fn scene_distance(q: vec3f) -> f32 {
     return least;
 }
 
+// The scene with one slab left out. `skip` is the receiver, and a surface does not shadow
+// itself.
+//
+// This is not tidiness, it is the only way a ray to a place can leave a large flat surface at
+// all. A segment from a point half a pixel above the canvas to a lamp thirty pixels up spends
+// most of its length nearly parallel to the canvas, so the nearest surface for most of the
+// march IS the canvas, and `k * h / t` reads the receiver's own face as a near-miss occluder.
+// The whole ground then shadows itself, worse the SOFTER the light -- a large light has a small
+// `k`, so the focus lamp is the first thing to trip it and the key light's 5-degree source never
+// did. `bounce` already draws this line by skipping the receiver in its emitter loop; this is the
+// same line one level in, where the march can act on it.
+fn scene_distance_excluding(q: vec3f, skip: u32) -> f32 {
+    var least = 1e9;
+    for (var i = 0u; i < min(scene.count, LIT_SLABS); i++) {
+        if i == skip {
+            continue;
+        }
+        least = min(least, slab_distance(q, i));
+    }
+    return least;
+}
+
 // Contact-hardening shadow: track `min(k * h / t)` along one ray toward the light
 // (research R4). The closer the ray passes to an occluder, and the earlier, the darker —
 // penumbra falls out of the distance field for free.
@@ -149,17 +200,88 @@ fn soft_shadow(origin: vec3f, toward: vec3f, k: f32) -> f32 {
 // coverage is uniform and the cost is exactly SHADOW_STEPS regardless of geometry. `t` stays
 // strictly between the two ends -- the receiver's own face would occlude at 0 and the emitter's
 // own face at `d`, and both would return black everywhere.
-fn bounce_shadow(origin: vec3f, toward: vec3f, d: f32, k: f32) -> f32 {
+//
+// Two callers: `bounce` (the emitter's nearest point) and `focus_shadow` (the lamp). Both are
+// rays to a place, which is what a positional light and an emitting surface have in common and
+// what neither shares with the key light.
+fn bounce_shadow(origin: vec3f, toward: vec3f, d: f32, k: f32, skip: u32) -> f32 {
     var res = 1.0;
     for (var i = 1u; i <= SHADOW_STEPS; i++) {
         let t = d * f32(i) / f32(SHADOW_STEPS + 1u);
-        let h = scene_distance(origin + toward * t);
+        let h = scene_distance_excluding(origin + toward * t, skip);
         res = min(res, clamp(k * h / t, 0.0, 1.0));
         if res < 0.005 {
             break;
         }
     }
     return clamp(res, 0.0, 1.0);
+}
+
+// The focus lamp's shading term at `origin` (T063): visibility along the finite segment from
+// the receiver to the lamp.
+//
+// A positional light is a ray to a PLACE, so `soft_shadow` is the wrong instrument for the same
+// reason it was wrong for bounce: its step is the scene distance, and a ray leaving a surface it
+// is skimming never gets a stride longer than the clamp. `bounce_shadow` is the right one and
+// already exists.
+fn focus_point(origin: vec3f) -> vec3f {
+    // The nearest point on the strip, clamped to the focused row's rect. Directly under the
+    // row this is the pixel's own column; past either end it is the nearer end.
+    let q = clamp(origin.xy, scene.focus.xy, scene.focus.xy + scene.focus.zw);
+    return vec3f(q, scene.focus_mix.z);
+}
+
+fn focus_shadow(origin: vec3f, receiver: u32) -> f32 {
+    let to_light = focus_point(origin) - origin;
+    let d = length(to_light);
+    // A lamp AT the pixel has no segment to march, and dividing by that length would put a NaN
+    // into the attenuation the whole frame is multiplied by. Fully lit is the honest answer: a
+    // light at zero distance is occluded by nothing.
+    if d < 0.001 {
+        return 1.0;
+    }
+    return bounce_shadow(origin, to_light / d, d, scene.focus_mix.w, receiver);
+}
+
+// How much of this pixel's shading the lamp owns: its authored share, falling off with distance
+// in the same bounded inverse-square `bounce` uses -- one falloff shape in this file rather than
+// two. Zero share yields zero weight at every distance, which is the identity case.
+fn focus_weight(origin: vec3f) -> f32 {
+    let share = scene.focus_mix.x;
+    if share <= 0.0 {
+        return 0.0;
+    }
+    let d = length(focus_point(origin) - origin);
+    let falloff = 1.0 / (1.0 + (d / FOCUS_REACH) * (d / FOCUS_REACH));
+    return clamp(share * falloff, 0.0, 1.0);
+}
+
+// How bright the room is at `origin`: full under the lamp, falling to `1 - ambient` past its
+// reach. Multiplicative, and never below zero.
+//
+// # Why the mix alone was not enough, measured
+//
+// `focus_weight` redistributes the shading between two lights. Where both lights are
+// unobstructed both terms are 1.0, the mix is 1.0, and the lamp changes NOTHING — which is
+// most of a file list, because a list of rows at one elevation has almost no shadow geometry
+// for a second light to disagree with the first about. Measured on the shipped list at
+// 1200x700: peak difference 7/255 with focus moved eight rows, mean 3/255. The feature was
+// arithmetically present and perceptually absent.
+//
+// This term is what makes focus *lit* rather than merely differently-shadowed: the room is
+// brightest where the lamp is and dims with distance, so a keyboard user finds focus by where
+// the light is instead of by locating a rectangle. It is bounded by the SAME allowance clamp
+// the key light's shadow is, so the contrast gate's closed-form worst case still holds and no
+// gate literal moves — a text ground that may not be darkened past 0.87 in the light theme is
+// not darkened past 0.87 by this either.
+fn focus_ambient(origin: vec3f) -> f32 {
+    let ambient = scene.focus_mix.y;
+    if ambient <= 0.0 {
+        return 1.0;
+    }
+    let d = length(focus_point(origin) - origin);
+    let falloff = 1.0 / (1.0 + (d / FOCUS_REACH) * (d / FOCUS_REACH));
+    return clamp(1.0 - ambient * (1.0 - falloff), 0.0, 1.0);
 }
 
 // Bounded-sample occlusion straight up from the receiver (T038): how much of the sky the
@@ -204,7 +326,7 @@ fn bounce(origin: vec3f, receiver: u32) -> vec3f {
         }
         let n_dot_l = clamp(to_light.z / max(d, 0.001), 0.0, 1.0);
         let falloff = 1.0 / (1.0 + (d / BOUNCE_REACH) * (d / BOUNCE_REACH));
-        let shade = bounce_shadow(origin, to_light / max(d, 0.001), d, scene.light.w);
+        let shade = bounce_shadow(origin, to_light / max(d, 0.001), d, scene.light.w, receiver);
         added += e.rgb * e.w * falloff * n_dot_l * shade;
     }
     return added;
@@ -244,6 +366,20 @@ fn fs_lit(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     // register as an occluder at t = 0.
     let origin = vec3f(p, top + 0.5);
     var atten = soft_shadow(origin, scene.light.xyz, scene.light.w);
+
+    // The focus lamp, mixed in rather than multiplied (research R8: exposure is a mix toward a
+    // bound, never a multiplier). Both terms are in 0..=1 and `w` is in 0..=1, so the result is
+    // too: the lamp can LIFT a shadow the key light cast -- which is how focus becomes findable
+    // without the row itself being brightened -- and can never deepen one, and can never take a
+    // surface past its unlit colour. `min()` would have been the obvious combiner and gets the
+    // sign of the whole feature backwards: adding a light would darken the frame.
+    let w = focus_weight(origin);
+    if w > 0.0 {
+        atten = mix(atten, focus_shadow(origin, receiver), w);
+    }
+    // And the room's brightness around the lamp, which is the half a person actually sees.
+    atten *= focus_ambient(origin);
+
     atten *= 1.0 - AO_STRENGTH * occlusion(origin);
 
     // The allowance clamp. This line is the contrast gate's closed-form claim being true.

@@ -27,7 +27,7 @@ use qs_gpu::color::Srgba;
 use qs_gpu::device::{GpuContext, new_instance};
 use qs_gpu::frame::{DrawList, Instance};
 use qs_gpu::path::RenderPath;
-use qs_gpu::scene::{Environment, Light, LightKind, SceneList, Slab};
+use qs_gpu::scene::{Environment, Light, SceneList, Slab};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 192;
@@ -82,7 +82,6 @@ fn scene(slabs: Vec<Slab>) -> SceneList {
         scene.push(slab);
     }
     scene.key_light = Some(Light {
-        kind: LightKind::Directional,
         vector: qs_gpu::frame::LIGHT_DIR,
         colour: [1.0, 1.0, 1.0],
         intensity: 0.72,

@@ -685,6 +685,30 @@ pub(crate) mod shader {
     /// `BOUNCE_REACH` — shader constant. How far bounced light reaches before it has fallen
     /// to a quarter, in physical pixels.
     pub const BOUNCE_REACH: f32 = 90.0;
+    /// `FOCUS_REACH` — shader constant. How far the focus lamp's influence reaches before it
+    /// has fallen to a quarter, in physical pixels.
+    pub const FOCUS_REACH: f32 = 220.0;
+
+    /// The focus lamp as the shader reads it: the uniform's `focus`/`focus_mix` pair.
+    ///
+    /// A type rather than three loose arguments so a caller cannot supply a position and
+    /// forget the share, which would be a lamp that is somewhere and does nothing — and
+    /// would silently make every focus-light assertion vacuous.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct FocusLamp {
+        /// The focused row's rect, `[x, y, w, h]`, physical pixels. A **strip**, not a point:
+        /// a bulb over a long row lights its middle third, the same finding `bounce` records
+        /// one light earlier.
+        pub rect: [f32; 4],
+        /// How high the strip hangs above the canvas, physical pixels.
+        pub height: f32,
+        /// `1 / tan(size / 2)`, from [`crate::lighting::hardness`].
+        pub hardness: f32,
+        /// The lamp's share of the shading directly beneath it. Zero is the identity.
+        pub share: f32,
+        /// How far the room dims at the edge of the lamp's reach. The half a person sees.
+        pub ambient: f32,
+    }
 
     /// `fn slab_distance` — the 2D rounded box extruded from `elevation - thickness` up to
     /// `elevation`.
@@ -706,6 +730,22 @@ pub(crate) mod shader {
         slabs
             .iter()
             .map(|slab| slab_distance(q, slab))
+            .fold(1e9, f32::min)
+    }
+
+    /// `fn scene_distance_excluding` — the scene with the receiver left out.
+    ///
+    /// A surface does not shadow itself. Without this a ray to a *place* cannot leave a
+    /// large flat surface at all: most of the segment runs nearly parallel to the receiver,
+    /// so the receiver's own face is the nearest surface for most of the march and
+    /// `k * h / t` reads it as a near-miss occluder. It bites harder the SOFTER the light,
+    /// which is why the focus lamp found it and the key light's 5-degree source never did.
+    pub fn scene_distance_excluding(q: [f32; 3], slabs: &[Slab], skip: usize) -> f32 {
+        slabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip)
+            .map(|(_, slab)| slab_distance(q, slab))
             .fold(1e9, f32::min)
     }
 
@@ -734,7 +774,14 @@ pub(crate) mod shader {
     /// Fixed steps across the segment rather than [`soft_shadow`]'s distance-driven march:
     /// a bounce ray skims its own receiver, so the scene distance never grows and the
     /// adaptive march spends its whole budget inside ~17 px of a 90 px reach.
-    pub fn bounce_shadow(origin: [f32; 3], toward: [f32; 3], d: f32, k: f32, slabs: &[Slab]) -> f32 {
+    pub fn bounce_shadow(
+        origin: [f32; 3],
+        toward: [f32; 3],
+        d: f32,
+        k: f32,
+        slabs: &[Slab],
+        skip: usize,
+    ) -> f32 {
         let mut res = 1.0_f32;
         for i in 1..=SHADOW_STEPS {
             let t = d * i as f32 / (SHADOW_STEPS + 1) as f32;
@@ -743,13 +790,76 @@ pub(crate) mod shader {
                 origin[1] + toward[1] * t,
                 origin[2] + toward[2] * t,
             ];
-            let h = scene_distance(q, slabs);
+            let h = scene_distance_excluding(q, slabs, skip);
             res = res.min((k * h / t).clamp(0.0, 1.0));
             if res < 0.005 {
                 break;
             }
         }
         res.clamp(0.0, 1.0)
+    }
+
+    /// `fn focus_point` — the nearest point on the lamp's strip, clamped to the focused row's
+    /// rect. Directly under the row this is the pixel's own column; past either end it is the
+    /// nearer end.
+    pub fn focus_point(origin: [f32; 3], lamp: FocusLamp) -> [f32; 3] {
+        let [x, y, w, h] = lamp.rect;
+        [
+            origin[0].clamp(x, x + w),
+            origin[1].clamp(y, y + h),
+            lamp.height,
+        ]
+    }
+
+    /// `fn focus_shadow` — visibility along the finite segment from the receiver to the lamp.
+    pub fn focus_shadow(origin: [f32; 3], receiver: usize, lamp: FocusLamp, slabs: &[Slab]) -> f32 {
+        let point = focus_point(origin, lamp);
+        let to_light = [
+            point[0] - origin[0],
+            point[1] - origin[1],
+            point[2] - origin[2],
+        ];
+        let d = (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2])
+            .sqrt();
+        if d < 0.001 {
+            return 1.0;
+        }
+        let toward = [to_light[0] / d, to_light[1] / d, to_light[2] / d];
+        bounce_shadow(origin, toward, d, lamp.hardness, slabs, receiver)
+    }
+
+    /// `fn focus_weight` — how much of this pixel's shading the lamp owns.
+    pub fn focus_weight(origin: [f32; 3], lamp: FocusLamp) -> f32 {
+        if lamp.share <= 0.0 {
+            return 0.0;
+        }
+        let point = focus_point(origin, lamp);
+        let d = ((point[0] - origin[0]).powi(2)
+            + (point[1] - origin[1]).powi(2)
+            + (point[2] - origin[2]).powi(2))
+        .sqrt();
+        let falloff = 1.0 / (1.0 + (d / FOCUS_REACH) * (d / FOCUS_REACH));
+        (lamp.share * falloff).clamp(0.0, 1.0)
+    }
+
+    /// `fn focus_ambient` — how bright the room is at `origin`: full under the lamp, falling
+    /// to `1 - ambient` past its reach.
+    ///
+    /// The half of the lamp a person actually sees. [`focus_weight`] only changes a pixel
+    /// where the two lights disagree, and on a list of rows at one elevation they agree
+    /// almost everywhere — measured at a peak of 7/255 across a shipped 1200x700 window with
+    /// focus moved eight rows.
+    pub fn focus_ambient(origin: [f32; 3], lamp: FocusLamp) -> f32 {
+        if lamp.ambient <= 0.0 {
+            return 1.0;
+        }
+        let point = focus_point(origin, lamp);
+        let d = ((point[0] - origin[0]).powi(2)
+            + (point[1] - origin[1]).powi(2)
+            + (point[2] - origin[2]).powi(2))
+        .sqrt();
+        let falloff = 1.0 / (1.0 + (d / FOCUS_REACH) * (d / FOCUS_REACH));
+        (1.0 - lamp.ambient * (1.0 - falloff)).clamp(0.0, 1.0)
     }
 
     /// `fn occlusion` — bounded samples straight up, weights halving.
@@ -799,7 +909,7 @@ pub(crate) mod shader {
                 to_light[1] / d.max(0.001),
                 to_light[2] / d.max(0.001),
             ];
-            let shade = bounce_shadow(origin, toward, d, k, slabs);
+            let shade = bounce_shadow(origin, toward, d, k, slabs, receiver);
             let gain = slab.emission_strength * falloff * n_dot_l * shade;
             for (channel, emitted) in added.iter_mut().zip(slab.emission) {
                 *channel += emitted * gain;
@@ -829,14 +939,32 @@ pub(crate) mod shader {
 
     /// `fs_lit`, minus the blend: the attenuation the pass writes for pixel `p`.
     ///
-    /// Includes the receiver scan (topmost slab under the pixel, rect containment) and the
-    /// allowance clamp — the line that makes the contrast gate's closed form a bound.
-    pub fn lit_attenuation(p: [f32; 2], slabs: &[Slab], toward: [f32; 3], k: f32) -> f32 {
-        let Some((_, top, floor, _)) = receiver_at(p, slabs) else {
+    /// Includes the receiver scan (topmost slab under the pixel, rect containment), the focus
+    /// lamp's mix, and the allowance clamp — the line that makes the contrast gate's closed
+    /// form a bound.
+    ///
+    /// `lamp` is `None` when nothing has keyboard focus. A lamp with a zero share produces the
+    /// same numbers, and that equality is asserted rather than assumed — see
+    /// `a_lamp_with_no_share_is_the_frame_that_shipped_before_it`.
+    pub fn lit_attenuation(
+        p: [f32; 2],
+        slabs: &[Slab],
+        toward: [f32; 3],
+        k: f32,
+        lamp: Option<FocusLamp>,
+    ) -> f32 {
+        let Some((receiver, top, floor, _)) = receiver_at(p, slabs) else {
             return 1.0;
         };
         let origin = [p[0], p[1], top + 0.5];
         let mut atten = soft_shadow(origin, toward, k, slabs);
+        if let Some(lamp) = lamp {
+            let w = focus_weight(origin, lamp);
+            if w > 0.0 {
+                atten = atten + (focus_shadow(origin, receiver, lamp, slabs) - atten) * w;
+            }
+            atten *= focus_ambient(origin, lamp);
+        }
         atten *= 1.0 - AO_STRENGTH * occlusion(origin, slabs);
         atten.clamp(floor.clamp(0.0, 1.0), 1.0)
     }
@@ -2148,7 +2276,7 @@ fn lit_contribution(effect: SceneEffect, tier: RenderPath) -> Surface {
                 // departure from 1.0, so an untouched pixel is zero and the floor's
                 // expected image is the zero surface without a special case.
                 SceneEffect::Shadow | SceneEffect::Occlusion => {
-                    let atten = shader::lit_attenuation(p, &slabs, toward, k);
+                    let atten = shader::lit_attenuation(p, &slabs, toward, k, None);
                     [1.0 - atten, 0.0, 0.0, 0.0]
                 }
                 // The additive one, per channel.
@@ -2384,14 +2512,14 @@ fn the_allowance_floor_bounds_the_attenuation_per_slab() {
 
     // Deep in the caster's shadow: a 24 px caster reaches ~20 px past its edge along
     // the shadow direction, so (170, 175) sits in the umbra.
-    let atten = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k);
+    let atten = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k, None);
     assert!(
         atten >= 0.87,
         "the shader may not exceed the allowance: floor 0.87, attenuation {atten}"
     );
 
     slabs[0].attenuation_floor = 0.0;
-    let free = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k);
+    let free = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k, None);
     assert!(
         free <= atten,
         "with the floor released the same pixel should be at least as dark"
@@ -2412,11 +2540,17 @@ fn the_lighting_shader_and_its_transcription_state_the_same_bounds() {
         "fn sd_rounded_box",
         "fn bounce",
         "fn bounce_shadow",
+        "fn focus_shadow",
+        "fn focus_weight",
+        "fn focus_ambient",
+        "fn focus_point",
+        "fn scene_distance_excluding",
         "const LIT_SLABS: u32 = 192u",
         "const SHADOW_STEPS: u32 = 12u",
         "const AO_SAMPLES: u32 = 4u",
         "const AO_STRENGTH: f32 = 0.35",
         "const BOUNCE_REACH: f32 = 90.0",
+        "const FOCUS_REACH: f32 = 220.0",
     ] {
         assert!(
             source.contains(needle),
@@ -2432,6 +2566,8 @@ fn the_lighting_shader_and_its_transcription_state_the_same_bounds() {
     assert_eq!(shader::SHADOW_STEPS, 12);
     assert_eq!(shader::AO_SAMPLES, 4);
     assert!((shader::AO_STRENGTH - 0.35).abs() < f32::EPSILON);
+    assert!((shader::BOUNCE_REACH - 90.0).abs() < f32::EPSILON);
+    assert!((shader::FOCUS_REACH - 220.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -4114,4 +4250,351 @@ fn the_reference_reproduces_the_stroke_alignment_the_cpu_tier_was_fixed_to_match
         (Some(10), Some(29)),
         "the shader's ring must sit inside the rect's bounds, touching both edges"
     );
+}
+
+// -- the focus lamp (US3, T063) ---------------------------------------------------------
+
+/// A point the block's key-light shadow actually falls on.
+///
+/// Asserted rather than eyeballed by `the_shared_lamp_scene_really_does_cast_a_key_shadow`,
+/// because every test below that reads it means something only if that shadow is real.
+#[cfg(test)]
+const KEY_SHADOWED: [f32; 2] = [252.0, 232.0];
+
+/// The scene the lamp tests share: a canvas, one block raised high enough to be caught
+/// throwing a key-light shadow, and the key rig.
+///
+/// Built once so the tests differ only in the lamp, which is what makes their comparisons
+/// comparisons rather than several unrelated numbers.
+#[cfg(test)]
+fn lamp_scene() -> (Vec<crate::scene::Slab>, [f32; 3], f32) {
+    use crate::scene::Slab;
+    let slabs = vec![
+        Slab {
+            rect: [0.0, 0.0, 512.0, 512.0],
+            elevation: 0.0,
+            thickness: 1.0,
+            attenuation_floor: 0.0,
+            ..Slab::default()
+        },
+        Slab {
+            rect: [200.0, 180.0, 80.0, 40.0],
+            radius: 6.0,
+            elevation: 20.0,
+            thickness: 20.0,
+            attenuation_floor: 0.0,
+            ..Slab::default()
+        },
+    ];
+    (slabs, [-0.32, -0.55, 0.77], crate::lighting::hardness(5.0))
+}
+
+/// A lamp of the shipped softness at `position`.
+///
+/// `ambient` defaults to zero so the shadow-mix tests below isolate `share` -- the two halves
+/// of the lamp do different work and a test that moved both at once could not say which one
+/// its number came from. `lamp_with_ambient` is the other half.
+#[cfg(test)]
+fn lamp_at(position: [f32; 3], share: f32) -> shader::FocusLamp {
+    // A short strip centred on `position`, so these tests read as they did when the lamp was a
+    // point and their numbers stay comparable to the ones recorded beside them.
+    shader::FocusLamp {
+        rect: [position[0] - 20.0, position[1] - 14.0, 40.0, 28.0],
+        height: position[2],
+        hardness: crate::lighting::hardness(22.0),
+        share,
+        ambient: 0.0,
+    }
+}
+
+/// A lamp whose ambient half is on, for the tests that are about the room rather than the
+/// shadow direction.
+#[cfg(test)]
+fn lamp_with_ambient(position: [f32; 3], ambient: f32) -> shader::FocusLamp {
+    shader::FocusLamp {
+        ambient,
+        ..lamp_at(position, 0.0)
+    }
+}
+
+#[test]
+fn the_shared_lamp_scene_really_does_cast_a_key_shadow() {
+    // The anti-vacuity guard for everything below. Three of the four lamp tests are about
+    // what happens to a pixel the key light has shadowed; if `KEY_SHADOWED` sat in the open
+    // they would all pass while asserting nothing, and would keep passing with the lamp
+    // deleted. Same discipline as `a_floored_effect_drops_something_that_was_actually_there`:
+    // establish the subject exists before measuring what is done to it.
+    let (slabs, toward, k) = lamp_scene();
+    let shadowed = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, None);
+    assert!(
+        shadowed < 0.9,
+        "KEY_SHADOWED is not in the block's shadow ({shadowed}), so every lamp test that \
+         reads it is measuring an unshadowed pixel"
+    );
+}
+
+#[test]
+fn a_lamp_with_no_share_is_the_frame_that_shipped_before_it() {
+    // The claim the whole mix rests on: with nothing focused the pass is arithmetically what
+    // it was before US3, so turning the lit mode on without touching the keyboard cannot
+    // change a pixel that was already checked. `to_bits`, not a tolerance -- "close enough"
+    // here would let the identity drift by an ulp a release until something noticed.
+    let (slabs, toward, k) = lamp_scene();
+    let dark = lamp_at([300.0, 260.0, 40.0], 0.0);
+
+    for i in 0..(64u32 * 64) {
+        let p = [(i % 64) as f32 * 8.0, (i / 64) as f32 * 8.0];
+        let absent = shader::lit_attenuation(p, &slabs, toward, k, None);
+        let unlit = shader::lit_attenuation(p, &slabs, toward, k, Some(dark));
+        assert_eq!(
+            absent.to_bits(),
+            unlit.to_bits(),
+            "a lamp with no share changed pixel {p:?}: {absent} became {unlit}"
+        );
+    }
+}
+
+#[test]
+fn the_lamp_lights_the_shadow_it_stands_in() {
+    // US3's acceptance scenario 1, at one pixel: put the lamp where the key light is blocked
+    // and the pixel gets brighter, because the lamp can see it even though the key light
+    // cannot. That is the whole reason a second light is worth a second shadow ray.
+    //
+    // Note what is NOT claimed: that the lamp brightens everywhere. It casts its own shadows,
+    // so a pixel the KEY light reaches and the lamp does not gets darker -- which is the
+    // story's "the shadows across the whole window lean away from it", a feature rather than a
+    // leak. The invariant that actually holds is the next test's.
+    let (slabs, toward, k) = lamp_scene();
+    let lamp = lamp_at([300.0, 260.0, 40.0], 0.45);
+
+    let dark = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, None);
+    let lit = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, Some(lamp));
+    assert!(
+        lit > dark + 1e-3,
+        "the lamp stood in the key light's shadow and lit nothing: {dark} became {lit}"
+    );
+}
+
+#[test]
+fn the_mix_stays_inside_the_unit_range_and_inside_the_allowance() {
+    // The safety property, and it is NOT "the lamp only brightens" -- that was the first
+    // guess and this scene refutes it in a few dozen pixels. What a convex mix of two terms
+    // in 0..=1 guarantees is that the result is in 0..=1 too: the lamp can never take a
+    // surface past its unlit colour, and can never produce a pixel darker than the darker of
+    // the two lights alone.
+    //
+    // That is exactly what the contrast gate needs. The gate's worst case is the allowance
+    // floor, and a term bounded by two terms that are each already bounded cannot reach past
+    // it -- which is why no gate literal moves for this feature. The floor clamp is asserted
+    // directly as well, since it is the line that makes the closed form a bound rather than
+    // a hope.
+    //
+    // Both counters are checked, and the second is the interesting one: a lamp that deepened
+    // nothing anywhere would be a brightness wash rather than a light.
+    let (slabs, toward, k) = lamp_scene();
+    let lamp = lamp_at([300.0, 260.0, 40.0], 0.45);
+    let floored: Vec<crate::scene::Slab> = slabs
+        .iter()
+        .map(|s| crate::scene::Slab {
+            attenuation_floor: 0.55,
+            ..*s
+        })
+        .collect();
+
+    let (mut lifted, mut deepened) = (0u32, 0u32);
+    for i in 0..(96u32 * 96) {
+        let p = [(i % 96) as f32 * 5.0, (i / 96) as f32 * 5.0];
+        let key_only = shader::lit_attenuation(p, &slabs, toward, k, None);
+        let mixed = shader::lit_attenuation(p, &slabs, toward, k, Some(lamp));
+
+        assert!(
+            (0.0..=1.0).contains(&mixed),
+            "the mix left the unit range at {p:?}: {mixed}"
+        );
+        if mixed > key_only + 1e-4 {
+            lifted += 1;
+        }
+        if mixed < key_only - 1e-4 {
+            deepened += 1;
+        }
+        assert!(
+            shader::lit_attenuation(p, &floored, toward, k, Some(lamp)) >= 0.55,
+            "the lamp reached past the allowance floor at {p:?}"
+        );
+    }
+
+    assert!(
+        lifted > 0,
+        "the lamp lifted nothing anywhere, so this test asserts a bound over a no-op"
+    );
+    assert!(
+        deepened > 0,
+        "the lamp deepened nothing anywhere. That is not a pass -- a second light that casts \
+         no shadow of its own is a brightness wash, and this whole feature's premise is that \
+         it is a light. If this fires, the lamp stopped being occluded."
+    );
+}
+
+#[test]
+fn the_lamps_influence_ends_and_the_key_light_owns_the_far_side() {
+    // FOCUS_REACH's purpose. Without the falloff one focused row would relight the far corner
+    // of the window, and the shadows there would stop agreeing with the key light -- two
+    // sources disagreeing about where light comes from, which is what one fixed key direction
+    // exists to prevent. Measured at the SAME pixel against two lamp positions, so the only
+    // variable is distance; moving the pixel instead would compare two bits of geometry.
+    let (slabs, toward, k) = lamp_scene();
+    let key_only = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, None);
+    let delta = |lamp: shader::FocusLamp| {
+        (shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, Some(lamp)) - key_only).abs()
+    };
+
+    let near = delta(lamp_at([300.0, 260.0, 40.0], 0.45));
+    let far = delta(lamp_at(
+        [300.0 + shader::FOCUS_REACH * 8.0, 260.0, 40.0],
+        0.45,
+    ));
+
+    assert!(
+        near > far,
+        "the lamp reaches as far as it does near: near {near}, far {far}"
+    );
+    assert!(
+        far < 0.01,
+        "a lamp {} px away still moved the pixel by {far}",
+        shader::FOCUS_REACH * 8.0
+    );
+}
+
+#[test]
+fn the_lamp_is_occluded_by_what_stands_between_it_and_the_surface() {
+    // A light that reaches through geometry is not a light, it is a wash with a plausible
+    // shape -- the finding d3bb539 recorded for bounce, asserted for the second caller of the
+    // segment march. The control is the identical scene with the wall removed, because one
+    // small number proves nothing about a sample that may simply have been out of reach.
+    use crate::scene::Slab;
+    let (mut slabs, toward, k) = lamp_scene();
+    let lamp = lamp_at([300.0, 260.0, 40.0], 0.9);
+
+    let open = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, Some(lamp));
+
+    // Tall, thin, and directly between the lamp and KEY_SHADOWED.
+    slabs.push(Slab {
+        rect: [270.0, 240.0, 6.0, 30.0],
+        elevation: 90.0,
+        thickness: 90.0,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    });
+    let blocked = shader::lit_attenuation(KEY_SHADOWED, &slabs, toward, k, Some(lamp));
+
+    assert!(
+        blocked < open,
+        "the wall did not occlude the lamp: open {open}, blocked {blocked}"
+    );
+}
+
+#[test]
+fn the_room_is_brightest_under_the_lamp_and_dims_with_distance() {
+    // The half of US3 a person actually sees, and the reason it exists at all.
+    //
+    // `focus_weight` alone was measured on the shipped list at 1200x700: peak 7/255, mean
+    // 3/255 with focus moved eight rows. It is arithmetically correct and perceptually
+    // absent, because it only changes a pixel where the two lights DISAGREE, and a list of
+    // rows at one elevation gives them almost nothing to disagree about. This term is what
+    // makes the story's "focus is where the light in the room is coming from" true.
+    //
+    // Asserted as a monotone ramp rather than at two points: a single near/far pair passes on
+    // a step function, a ring, or a falloff with the sign flipped somewhere in the middle.
+    //
+    // On a FLAT scene, deliberately, and that is the claim rather than a convenience. The
+    // shared `lamp_scene` has a raised block in it whose key-light shadow rises and falls
+    // along any sample line, so a ramp measured there is measuring two things at once. A flat
+    // list is also exactly the case this term exists for: it is where `focus_weight` has
+    // nothing to do.
+    use crate::scene::Slab;
+    let slabs = vec![Slab {
+        rect: [0.0, 0.0, 512.0, 640.0],
+        elevation: 0.0,
+        thickness: 1.0,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    }];
+    let (toward, k) = ([-0.32, -0.55, 0.77], crate::lighting::hardness(5.0));
+    let lamp = lamp_with_ambient([256.0, 40.0, 40.0], 0.18);
+
+    let at = |y: f32| shader::lit_attenuation([256.0, y], &slabs, toward, k, Some(lamp));
+    let mut previous = at(40.0);
+    for step in 1..=12 {
+        let here = at(40.0 + step as f32 * 45.0);
+        assert!(
+            here <= previous + 1e-6,
+            "the room got BRIGHTER further from the lamp at y {}: {previous} then {here}",
+            40.0 + step as f32 * 45.0
+        );
+        previous = here;
+    }
+    assert!(
+        at(40.0) - previous > 0.05,
+        "the whole ramp from the lamp to the far edge is {}, which nobody will see",
+        at(40.0) - previous
+    );
+}
+
+#[test]
+fn the_ambient_half_cannot_brighten_past_the_unlit_colour_or_darken_past_the_allowance() {
+    // Both bounds, because the term is a multiply and a multiply gets both wrong at once if
+    // its sign is off. Above: 1.0 is the unlit colour and no lamp may exceed it. Below: the
+    // allowance floor is what the contrast gate computes its worst case at, so a term that
+    // reached past it would make the gate's closed form stop being a bound — and the gate
+    // would still be green, because it reads token values rather than frames.
+    let (slabs, toward, k) = lamp_scene();
+    let floored: Vec<crate::scene::Slab> = slabs
+        .iter()
+        .map(|s| crate::scene::Slab {
+            attenuation_floor: 0.87,
+            ..*s
+        })
+        .collect();
+    // Deliberately far past anything authored: the bound has to hold for a hand-edited token
+    // file too, and `FocusLightTokens::ambient` clamps for exactly this reason.
+    let lamp = lamp_with_ambient([256.0, 40.0, 40.0], 1.0);
+
+    for i in 0..(64u32 * 64) {
+        let p = [(i % 64) as f32 * 8.0, (i / 64) as f32 * 8.0];
+        let free = shader::lit_attenuation(p, &slabs, toward, k, Some(lamp));
+        assert!(
+            free <= 1.0,
+            "the lamp took {p:?} past its unlit colour: {free}"
+        );
+        let held = shader::lit_attenuation(p, &floored, toward, k, Some(lamp));
+        assert!(
+            held >= 0.87,
+            "the lamp reached past the light theme's text-ground floor at {p:?}: {held}"
+        );
+    }
+}
+
+#[test]
+fn a_lamp_with_neither_strength_is_the_frame_that_shipped_before_it() {
+    // The identity, restated over BOTH halves now that there are two. The earlier version of
+    // this test set only `share` to zero and would have passed while a stray ambient dimmed
+    // every frame in the product -- which is precisely the failure mode of adding a second
+    // strength to a thing that used to have one.
+    let (slabs, toward, k) = lamp_scene();
+    let dark = shader::FocusLamp {
+        share: 0.0,
+        ambient: 0.0,
+        ..lamp_at([300.0, 260.0, 40.0], 0.0)
+    };
+
+    for i in 0..(64u32 * 64) {
+        let p = [(i % 64) as f32 * 8.0, (i / 64) as f32 * 8.0];
+        let absent = shader::lit_attenuation(p, &slabs, toward, k, None);
+        let unlit = shader::lit_attenuation(p, &slabs, toward, k, Some(dark));
+        assert_eq!(
+            absent.to_bits(),
+            unlit.to_bits(),
+            "a lamp with no strength at all changed pixel {p:?}: {absent} became {unlit}"
+        );
+    }
 }

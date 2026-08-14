@@ -44,5 +44,5 @@ pub use gl_tier::{TierConfig, config_for};
 pub use icon::{Emblem, IconKey, IconKind, IconShape};
 pub use lighting::{SceneEffect, SceneFloor};
 pub use path::{CrashCounter, PathReason, RenderPath, RenderPathSelector, Resolution};
-pub use scene::{Environment, Light, LightKind, MAX_SLABS, SceneList, Slab};
+pub use scene::{Environment, FocusLamp, Light, MAX_SLABS, SceneList, Slab};
 pub use target::{OffscreenTarget, tier_can_hold_target};

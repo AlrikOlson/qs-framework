@@ -20,7 +20,8 @@
 //! [`max_reach`] so a surface just off-screen still casts into it.
 
 use crate::material::{Material, Surface};
-use qs_gpu::scene::{Environment, Light, SceneList, Slab};
+use crate::tokens::FocusLightTokens;
+use qs_gpu::scene::{Environment, FocusLamp, Light, SceneList, Slab};
 
 /// How far past the viewport the scene must reach, in **logical** pixels.
 ///
@@ -64,6 +65,45 @@ pub fn grazing(direction: [f32; 3]) -> f32 {
     // A light with no vertical component would throw an infinite shadow; clamping the drop
     // bounds the margin instead of letting one authored vector cull nothing forever.
     run / direction[2].abs().max(0.05)
+}
+
+/// The focus lamp, hanging over the surface that has keyboard focus (T062).
+///
+/// `rect` is the focused region's rect and `elevation` its top face, both in physical pixels
+/// and both taken from the surface that was actually painted — the same shared-origin rule
+/// [`SceneBuilder::add`] follows, for the same reason. A lamp positioned from a rectangle
+/// rebuilt here would drift from the focus ring, and a light that is not quite over the thing
+/// it is finding is worse than no light at all.
+///
+/// `gain` is [`crate::motion::InteractionMotion::focus_light_gain`]: the lamp coming up or
+/// going out. It scales **both** strengths, so a lamp at zero gain is arithmetically absent
+/// rather than present-but-dark — which is what makes the mode's two identity cases (no focus,
+/// and focus that has not arrived yet) the same arithmetic instead of two branches.
+///
+/// # Why the lamp is the row's whole rect and not a point on it
+///
+/// A bulb over a 790 px row lights its middle third: the ends of the focused row stay dark and
+/// the result reads as a blob sitting on the list rather than as the row being lit. Measured on
+/// the shipped list before this was a rect. It also avoids having to choose a point, and every
+/// choice available encodes a reading direction that is wrong in a right-to-left locale.
+#[must_use]
+pub fn focus_light(
+    rect: [f32; 4],
+    elevation: f32,
+    tokens: FocusLightTokens,
+    scale: f32,
+    gain: f32,
+) -> FocusLamp {
+    let gain = gain.clamp(0.0, 1.0);
+    FocusLamp {
+        rect,
+        // The authored height is a logical length, so it meets physical pixels here — the same
+        // single multiply every other authored length gets, at the slab.
+        height: elevation + tokens.height * scale.max(0.0),
+        size: tokens.size_deg,
+        share: tokens.share() * gain,
+        ambient: tokens.ambient() * gain,
+    }
 }
 
 /// Builds one frame's [`SceneList`] from the same material/surface pairs the draw list is
@@ -132,8 +172,8 @@ impl SceneBuilder {
     }
 
     /// State the focus lamp, present only while something has keyboard focus.
-    pub fn set_focus_light(&mut self, light: Option<Light>) {
-        self.scene.focus_light = light;
+    pub fn set_focus_light(&mut self, lamp: Option<FocusLamp>) {
+        self.scene.focus_light = lamp;
     }
 
     /// The finished scene, ready to publish.
@@ -277,5 +317,88 @@ mod tests {
 
         // Overhead light: no run, so no reach regardless of elevation.
         assert_eq!(grazing([0.0, 0.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn moving_focus_moves_the_lamp_in_the_published_scene() {
+        // T059, and the assertion is about the *published* scene rather than about the
+        // helper's return value on purpose. `set_focus_light` takes an `Option`, so the
+        // failure this catches is not "the arithmetic is wrong" — it is a builder that
+        // computes a lamp correctly and publishes the previous frame's, or none, which no
+        // test of `focus_light` alone can see.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let focus = tokens.lighting().rig.focus;
+
+        let published = |row_top: f32| -> FocusLamp {
+            let mut builder = SceneBuilder::new(1, [800.0, 600.0], 40.0, Environment::default());
+            builder.set_focus_light(Some(focus_light(
+                [12.0, row_top, 300.0, 28.0],
+                6.0,
+                focus,
+                2.0,
+                1.0,
+            )));
+            builder.finish().focus_light.expect("the lamp was not published")
+        };
+
+        let first = published(100.0);
+        let second = published(240.0);
+
+        // The lamp's strip IS the focused region's rect, not a rectangle derived from it. That
+        // equality is what keeps the light over the ring: the two come from the same surface,
+        // so they cannot drift, and a light that is not quite over the thing it is finding
+        // sends the eye to the wrong place.
+        assert_eq!(
+            first.rect,
+            [12.0, 100.0, 300.0, 28.0],
+            "the lamp's strip is not the focused region's rect"
+        );
+        assert!(
+            (second.rect[1] - first.rect[1] - 140.0).abs() < 1e-4,
+            "focus moved 140 px and the lamp moved {}",
+            second.rect[1] - first.rect[1]
+        );
+        assert_eq!(
+            (second.rect[0], second.rect[2]),
+            (first.rect[0], first.rect[2]),
+            "the lamp moved sideways or changed width for a purely vertical move"
+        );
+
+        // The height is authored in logical pixels and multiplied by the scale exactly once.
+        // A lamp that skipped the multiply hangs inside the surface it is meant to be over on
+        // every high-DPI display, and the picture looks like the mode is simply off.
+        assert!(
+            (first.height - (6.0 + focus.height * 2.0)).abs() < 1e-4,
+            "the lamp hangs at {} above the canvas, not at the authored height",
+            first.height
+        );
+    }
+
+    #[test]
+    fn a_lamp_at_zero_gain_is_arithmetically_absent() {
+        // The shader mixes the lamp's shading term in by its intensity, so intensity zero is
+        // the identity — which is what makes "coming up" and "going out" continuous with
+        // "no focus at all" rather than a step at each end. Asserted here because the
+        // property lives in this multiply, not in the shader.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let focus = tokens.lighting().rig.focus;
+        let at = |gain: f32| focus_light([0.0, 0.0, 100.0, 28.0], 4.0, focus, 1.0, gain);
+
+        // BOTH halves scale with the gain. Scaling only the share would make a lamp at zero
+        // gain still dim the room -- so "focus has not arrived yet" and "nothing has focus"
+        // would draw differently, which is a step change in every shadow at the moment focus
+        // lands, i.e. the snap the ramp exists to remove.
+        assert_eq!(at(0.0).share, 0.0);
+        assert_eq!(at(0.0).ambient, 0.0);
+        assert!(at(0.5).share > 0.0 && at(0.5).share < at(1.0).share);
+        assert!(at(0.5).ambient > 0.0 && at(0.5).ambient < at(1.0).ambient);
+        assert!(
+            (at(1.0).share - focus.share()).abs() < 1e-6
+                && (at(1.0).ambient - focus.ambient()).abs() < 1e-6,
+            "a fully-lit lamp does not burn at its authored strengths"
+        );
+        // A hand-edited token file cannot spend more than the budget, and a gain outside its
+        // range cannot either — both clamp, so the mix stays a mix.
+        assert!(at(4.0).share <= 1.0 && at(-1.0).share == 0.0 && at(-1.0).ambient == 0.0);
     }
 }

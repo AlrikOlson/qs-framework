@@ -1085,6 +1085,10 @@ pub struct LightingTokens {
 #[serde(default)]
 pub struct RigTokens {
     pub key: KeyLightTokens,
+    /// The focus lamp. Its *position* is deliberately absent: it is wherever focus is, which
+    /// is a layout fact and not something a designer authors. What is authored here is how
+    /// the lamp behaves once it is there.
+    pub focus: FocusLightTokens,
     pub environment: EnvironmentTokens,
 }
 
@@ -1095,6 +1099,7 @@ impl Default for RigTokens {
     fn default() -> Self {
         Self {
             key: KeyLightTokens::default(),
+            focus: FocusLightTokens::default(),
             environment: EnvironmentTokens::default(),
         }
     }
@@ -1138,6 +1143,103 @@ impl KeyLightTokens {
     #[must_use]
     pub fn share(self) -> f32 {
         self.share.clamp(0.0, 1.0)
+    }
+}
+
+/// The focus lamp: a positional light that sits over whatever has keyboard focus.
+///
+/// # Why there is no direction, and no colour
+///
+/// A positional light has no single direction — that is why [`qs_gpu::scene::FocusLamp`] is a
+/// separate type from `Light`, and a field for one here would be a value nothing reads.
+/// Colour is absent for the reason the key light's is `[1, 1, 1]`: this lamp contributes
+/// **attenuation only**, and attenuation is a colourless multiply. A tint authored here
+/// would be dead metadata that looks like it does something.
+///
+/// # Why it cannot brighten anything past its unlit colour
+///
+/// The lamp's shadow term and the key light's are both in `0..=1`, and the pass mixes them
+/// convexly, so the result is in `0..=1` too. A lamp can therefore *lift* a shadow the key
+/// light cast — which is what makes focus visible — and can never push a surface past the
+/// colour it has with no lighting at all. That is why this is art direction with no gate
+/// obligation: the contrast gate's worst case is the allowance floor, and nothing here
+/// moves it. See `contracts/lit-contrast.md` and research R8.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FocusLightTokens {
+    /// The lamp's fraction of the shading budget **directly beneath it**, falling off with
+    /// distance. A **mix toward a bound, never a multiplier** (research R8): at `0.0` the
+    /// pass is arithmetically what it is today, and at `1.0` the lamp owns the shading of
+    /// the pixel under it outright. There is no spelling of this field that darkens a frame.
+    pub share: f32,
+    /// How far the room dims at the edge of the lamp's reach, `0..=1`. The half of the lamp
+    /// a person actually sees.
+    ///
+    /// [`FocusLightTokens::share`] redistributes the shading between two lights, and on a
+    /// list of rows at one elevation the two lights agree everywhere, so it changes almost
+    /// nothing: measured at a peak of 7/255 and a mean of 3/255 across a shipped 1200x700
+    /// window with focus moved eight rows. That is a feature that is arithmetically present
+    /// and perceptually absent. This is what makes focus *lit*: brightest under the lamp,
+    /// dimming with distance, so focus is found by where the light is.
+    ///
+    /// Bounded by the same allowance clamp the key light's shadow is, so the light theme's
+    /// 0.87 text-ground floor holds it to a shallower gradient than the dark theme's 0.55 —
+    /// the theme asymmetry research R13 measured, handled by the clamp that already exists
+    /// rather than by a second rule.
+    pub ambient: f32,
+    /// Angular size in degrees, exactly as [`KeyLightTokens::size_deg`]. Large on purpose:
+    /// a focus lamp hanging a few pixels above a row is physically a broad source, and a
+    /// small one would cast a hard second shadow that reads as a rendering fault rather
+    /// than as light.
+    pub size_deg: f32,
+    /// How far above the focused surface's top face the lamp hangs, in **logical** pixels
+    /// (scaled where it is built, like every other authored length).
+    ///
+    /// This is the closest thing the lamp has to a resting position, and FR-029 is satisfied
+    /// by a different mechanism: under Reduce Motion the lamp does not travel between rows,
+    /// it is simply *at* the focused row — an authored place, not wherever an interrupted
+    /// animation stopped. See [`crate::motion::MotionPattern::FocusLight`].
+    pub height: f32,
+}
+
+impl Default for FocusLightTokens {
+    fn default() -> Self {
+        Self {
+            // Enough that the room around focus visibly changes, well short of the lamp
+            // taking over the shading from the key light and flattening the scene.
+            share: 0.45,
+            // Deep enough to read as light rather than as a rendering artefact, shallow
+            // enough that the rows past the lamp's reach are still comfortably readable —
+            // they sit at 0.82 of their colour in the dark theme, well above the 0.55 the
+            // allowance would permit. A vignette that followed the keyboard at full
+            // allowance would be the mode making the product worse, which SC-012 exists to
+            // catch and which no amount of "it looks impressive" should be allowed to buy.
+            ambient: 0.18,
+            // Roughly four times the key light's, which is what keeps the lamp's shadow a
+            // soft lift rather than a second hard edge competing with the key's.
+            size_deg: 22.0,
+            // Just above a compact row's own height, so the lamp clears the surface it sits
+            // over instead of being embedded in it.
+            height: 14.0,
+        }
+    }
+}
+
+impl FocusLightTokens {
+    /// The share, held to its budget. Clamped at read rather than trusted at parse, for the
+    /// same reason [`KeyLightTokens::share`] is: a hand-edited file cannot spend more than
+    /// the whole budget, and a negative one cannot invert the mix.
+    #[must_use]
+    pub fn share(self) -> f32 {
+        self.share.clamp(0.0, 1.0)
+    }
+
+    /// The ambient depth, held to its range. Clamped for [`FocusLightTokens::share`]'s
+    /// reason, and with one more of its own: a negative value would *brighten* a surface past
+    /// its unlit colour, which is the one direction the allowance clamp does not catch.
+    #[must_use]
+    pub fn ambient(self) -> f32 {
+        self.ambient.clamp(0.0, 1.0)
     }
 }
 

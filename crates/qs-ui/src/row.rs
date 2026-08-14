@@ -1056,6 +1056,14 @@ impl ListRenderer {
             }
         }
 
+        // The focus lamp (US3), stated before the selection layer takes the builder. It is
+        // not a layer: nothing is drawn for it, and the row that has focus is painted exactly
+        // as it would be with the mode off -- FR-031, asserted by
+        // `the_focus_ring_is_identical_with_the_lit_mode_on_and_off`.
+        if let Some(builder) = scene.as_deref_mut() {
+            self.set_focus_lamp(builder, layout, &region, motion);
+        }
+
         // Layer 2: the selection regions, hoisted -- see this function's doc comment.
         self.draw_selection(
             list,
@@ -1497,6 +1505,58 @@ impl ListRenderer {
             Pass::Body,
             scene,
         );
+    }
+
+    /// State the focus lamp on the scene, or leave it absent when nothing has focus (T062).
+    ///
+    /// # The lamp reads the same region the focus ring is painted on
+    ///
+    /// [`StateRegion`] owns where a row's state is drawn, and the lamp takes its position from
+    /// exactly that rectangle rather than rebuilding one. A lamp positioned from a second
+    /// description of the same row would drift from the ring by whatever the two disagreed
+    /// about, and a light that is not quite over the thing it is finding is worse than no
+    /// light: the user's eye goes to the brightest place and the ring is somewhere else.
+    ///
+    /// # The height is measured from the canvas, not from the focused row
+    ///
+    /// A row's elevation is a property of *that row*; how the room is lit is a property of the
+    /// room. Hanging the lamp a fixed distance over whatever the focused row happens to be
+    /// made of would make the whole window's shadows shift when a row gained a step, which
+    /// reads as the lighting flickering as the keyboard moves between differently-elevated
+    /// rows.
+    ///
+    /// # Mid-travel, and off-screen
+    ///
+    /// The lamp's slot may be fractional (it is travelling) and may be outside the viewport
+    /// entirely (focus scrolled away). Both are fine and neither is culled: a light outside
+    /// the frame still lights what is inside it, which is the difference between a light and a
+    /// slab. The arithmetic stays relative to the first visible row for
+    /// [`ViewportLayout::row_top`]'s reason -- row 999,999's absolute offset does not survive
+    /// an `f32`.
+    fn set_focus_lamp(
+        &self,
+        scene: &mut crate::scene::SceneBuilder,
+        layout: &ViewportLayout,
+        region: &StateRegion,
+        motion: &InteractionMotion,
+    ) {
+        let Some(draw) = motion.focus_light_draw() else {
+            scene.set_focus_light(None);
+            return;
+        };
+        let scale = layout.scale.max(0.1);
+        let slot = draw.row as f64 - layout.visible.first as f64;
+        let top = (slot * f64::from(layout.row_height) - layout.first_row_offset) as f32
+            + draw.offset_rows * layout.row_height as f32
+            + layout.origin_y;
+        let surface = region.surface(top, scale, 0.0);
+        scene.set_focus_light(Some(crate::scene::focus_light(
+            [surface.x, surface.y, surface.w, surface.h],
+            0.0,
+            self.tokens.lighting().rig.focus,
+            scale,
+            motion.focus_light_gain(),
+        )));
     }
 
     /// One pass of one selected row, at a surface-relative `top`.
@@ -5364,4 +5424,71 @@ mod tests {
             "the ring is not on cell 6"
         );
     }
+    #[test]
+    fn the_focus_ring_is_identical_with_the_lit_mode_on_and_off() {
+        // T060 / FR-031. The lit mode replaces the ring with nothing; it adds a light BESIDE
+        // it. That obligation is easy to state and easy to lose, because the obvious way to
+        // make focus read as light is to soften the ring once the light is doing the work --
+        // which quietly removes the only focus indicator that survives the CPU tier, forced
+        // colours, and every path where the mode is suppressed.
+        //
+        // Asserted over the ring's instances byte for byte rather than "a ring exists": a
+        // ring drawn at a different width, colour or radius is still a ring, and it is
+        // exactly the change this test exists to refuse.
+        let mut renderer = renderer();
+        let layout = layout_for(12, 2.0);
+        let buf = uniform_kind_rows(layout.visible.count as usize, 0);
+        let interaction = Interaction {
+            focused: Some(4),
+            ..Interaction::default()
+        };
+        let mut motion = settled();
+        motion.set_focused(Some(4));
+
+        let mut unlit = DrawList::default();
+        unlit.reset([1200, layout.height], qs_gpu::Srgba::TRANSPARENT, 1);
+        renderer.render(&mut unlit, &buf, &layout, interaction, &motion);
+
+        let mut lit = DrawList::default();
+        lit.reset([1200, layout.height], qs_gpu::Srgba::TRANSPARENT, 2);
+        let mut builder = crate::scene::SceneBuilder::new(
+            2,
+            [1200.0, layout.height as f32],
+            64.0,
+            qs_gpu::scene::Environment::default(),
+        );
+        renderer.render_lit(&mut lit, &buf, &layout, interaction, &motion, &mut builder);
+
+        let rings = |list: &DrawList| -> Vec<Instance> {
+            list.instances
+                .iter()
+                .filter(|i| i.kind == qs_gpu::PrimKind::Stroke as u32)
+                .copied()
+                .collect()
+        };
+        let (off, on) = (rings(&unlit), rings(&lit));
+        assert!(
+            !off.is_empty(),
+            "the unlit arm drew no ring at all, so this test compares nothing to nothing"
+        );
+        assert_eq!(
+            off.len(),
+            on.len(),
+            "the lit mode changed how many strokes the focus indicator is made of"
+        );
+        for (a, b) in off.iter().zip(&on) {
+            assert_eq!(
+                bytemuck::bytes_of(a),
+                bytemuck::bytes_of(b),
+                "the lit mode changed the focus ring: {a:?} became {b:?}"
+            );
+        }
+
+        // And the light exists, so the arm above is not passing because the mode did nothing.
+        assert!(
+            builder.finish().focus_light.is_some(),
+            "the lit arm published no focus lamp, so `render_lit` is not exercising US3"
+        );
+    }
+
 }

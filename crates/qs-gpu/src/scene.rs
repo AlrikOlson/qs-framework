@@ -103,34 +103,58 @@ impl Slab {
     }
 }
 
-/// Which shape of light this is.
+/// The key light. Infinitely far away, so only its direction matters.
 ///
-/// Two, and the distinction is not stylistic: a directional light has no position and therefore no
-/// falloff, and a positional one has no single direction. Collapsing them into one type with unused
-/// fields is how a light ends up half-configured.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LightKind {
-    /// The key light. Infinitely far away, so only its direction matters.
-    Directional,
-    /// The focus lamp. Somewhere in the scene, so distance matters.
-    Positional,
-}
-
-/// One source of illumination.
+/// # Why the focus lamp is not this type with a flag
+///
+/// It started as one: a `LightKind` enum with `Directional` and `Positional`, and a `vector`
+/// field that meant a direction for one and a position for the other. That is the shape this
+/// module's own comment warned against — "collapsing them into one type with unused fields is
+/// how a light ends up half-configured" — and US3 proved the warning right the moment the lamp
+/// needed [`FocusLamp::ambient`], a number that has no meaning at all for a light with no
+/// position. Two types, so neither can be built wrong.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Light {
-    pub kind: LightKind,
-    /// Direction *toward* the light for [`LightKind::Directional`]; world position in physical
-    /// pixels for [`LightKind::Positional`].
+    /// Direction *toward* the light, normalized at use.
     pub vector: [f32; 3],
     /// Straight linear RGB, from a token.
     pub colour: [f32; 3],
     pub intensity: f32,
-    /// **The field that matters.** How large the light is — angular size for a directional light,
-    /// radius for a positional one. It governs how fast a shadow softens with distance, which is
-    /// the whole of the feature's central claim. A light with no size casts a hard offset shadow
-    /// and the claim collapses.
+    /// **The field that matters.** The light's angular size: it governs how fast a shadow
+    /// softens with distance, which is the whole of the feature's central claim. A light with
+    /// no size casts a hard offset shadow and the claim collapses.
     pub size: f32,
+}
+
+/// The focus lamp: a positional light over whatever has keyboard focus (US3).
+///
+/// No direction, because a positional light has none. No colour, because it contributes
+/// **attenuation only** and attenuation is a colourless multiply — the focused row is a text
+/// ground whose `addition_max` is zero, so lighting it by adding to it is forbidden by
+/// lit-contrast rule 1a, and what the lamp changes is the room around it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FocusLamp {
+    /// The focused row's own rect, `[x, y, w, h]`, physical pixels. A **strip**, not a point.
+    ///
+    /// A bulb over a 790 px row lights its middle third and leaves the ends dark, which reads
+    /// as a blob rather than as the row being lit — measured on the shipped list before this
+    /// was a rect. `bounce` learned the same thing one light earlier and its comment states it:
+    /// the nearest point on the emitter is what the receiver sees.
+    pub rect: [f32; 4],
+    /// How high the strip hangs above the canvas, physical pixels.
+    pub height: f32,
+    /// Angular size in degrees, as [`Light::size`].
+    pub size: f32,
+    /// How much of the shading directly beneath it the lamp's own shadow ray owns, against the
+    /// key light's. Zero is the identity: the pass is then arithmetically what it was before
+    /// US3.
+    pub share: f32,
+    /// How far the room dims at the edge of the lamp's reach.
+    ///
+    /// **The half a person actually sees.** `share` only changes a pixel where the two lights
+    /// disagree, and on a list of rows at one elevation they agree almost everywhere —
+    /// measured at a peak of 7/255 across a shipped window. This is what makes focus *lit*.
+    pub ambient: f32,
 }
 
 /// The surroundings a lit surface reflects. Two stops of an infinite sky.
@@ -173,7 +197,7 @@ pub struct SceneList {
     /// about where light comes from.
     pub key_light: Option<Light>,
     /// Present only when something has keyboard focus.
-    pub focus_light: Option<Light>,
+    pub focus_light: Option<FocusLamp>,
     pub environment: Environment,
     /// Matches the [`crate::frame::DrawList`] this scene belongs to.
     pub generation: u64,
@@ -260,7 +284,6 @@ mod tests {
         );
 
         scene.key_light = Some(Light {
-            kind: LightKind::Directional,
             vector: [-0.42, -0.62, 0.66],
             colour: [1.0, 1.0, 1.0],
             intensity: 1.0,

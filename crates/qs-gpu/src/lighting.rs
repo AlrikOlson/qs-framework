@@ -58,6 +58,15 @@ pub struct LitSceneUniform {
     _pad: u32,
     /// xyz: toward the light, normalized. w: hardness `k` — see [`hardness`].
     light: [f32; 4],
+    /// The focus lamp's **strip**: the focused row's rect, `[x, y, w, h]`. A separate field
+    /// from `light` because a positional light has no direction and a directional one has no
+    /// position — the distinction [`crate::scene::FocusLamp`] is a separate type for, carried
+    /// into the uniform so a half-configured light cannot be assembled here either.
+    focus: [f32; 4],
+    /// The lamp's four scalars: share, ambient depth, height above the canvas, hardness.
+    /// **Share zero means no lamp**, and zero is what a zeroed uniform already holds, so an
+    /// absent lamp needs no branch on either side of the handoff.
+    focus_mix: [f32; 4],
     rect: [[f32; 4]; LIT_SLABS],
     /// radius, elevation, thickness, attenuation floor.
     shape: [[f32; 4]; LIT_SLABS],
@@ -119,6 +128,24 @@ impl LitSceneUniform {
             direction[2] / len,
             hardness(size),
         ];
+
+        // The focus lamp. Absent leaves the zeroed uniform in place, whose share is zero —
+        // and a zero share is the shader's identity, not a special case it has to branch on.
+        if let Some(lamp) = scene.focus_light.as_ref() {
+            uniform.focus = lamp.rect;
+            // Clamped here as well as at the token, because the two clamps guard different
+            // things: the token's stops a hand-edited file, this one stops any future caller
+            // that builds a `FocusLamp` without going through `qs_ui::scene::focus_light`. A
+            // share above one makes the mix an extrapolation and a negative ambient
+            // *brightens* — both push attenuation past 1.0, which is the one direction the
+            // allowance clamp does not catch.
+            uniform.focus_mix = [
+                lamp.share.clamp(0.0, 1.0),
+                lamp.ambient.clamp(0.0, 1.0),
+                lamp.height,
+                hardness(lamp.size),
+            ];
+        }
 
         let take = scene.slabs.len().min(LIT_SLABS);
         for (slab, (rect, shape)) in scene
@@ -302,7 +329,7 @@ mod tests {
             (0..64u32 * 64)
                 .map(|i| {
                     let p = [(i % 64) as f32 * 4.0, (i / 64) as f32 * 4.0];
-                    shader::lit_attenuation(p, &slabs, toward, k).to_bits()
+                    shader::lit_attenuation(p, &slabs, toward, k, None).to_bits()
                 })
                 .collect()
         };
@@ -317,7 +344,7 @@ mod tests {
     fn the_uniform_packs_the_scene_the_shader_expects() {
         // The pack takes the nearest-first slabs, normalizes the light, carries the floor,
         // and reports what did not fit — the counted-drop discipline at the second ceiling.
-        use crate::scene::{Light, LightKind, SceneList, Slab};
+        use crate::scene::{Light, SceneList, Slab};
 
         let mut scene = SceneList::default();
         scene.reset(3, crate::scene::Environment::default());
@@ -329,7 +356,6 @@ mod tests {
             });
         }
         scene.key_light = Some(Light {
-            kind: LightKind::Directional,
             vector: [0.0, 0.0, 2.0],
             colour: [1.0, 1.0, 1.0],
             intensity: 0.7,

@@ -179,14 +179,21 @@ pub enum MotionPattern {
     SelectionChange,
     /// Row heights change because the density changed.
     DensityChange,
+    /// The lit mode's focus lamp travels to a different row.
+    ///
+    /// Not a row of UXDD 10.3 — it is spec 002 US3's, and it is here rather than beside the
+    /// scene because "what reduced motion does to this" is a motion question and this module
+    /// is the only place that answers it. See [`InteractionMotion::focus_light_draw`].
+    FocusLight,
 }
 
 impl MotionPattern {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::HoverFeedback,
         Self::PressFeedback,
         Self::SelectionChange,
         Self::DensityChange,
+        Self::FocusLight,
     ];
 
     /// The floor and the span for a distance-scaled duration, or `None` for a pattern with
@@ -209,6 +216,12 @@ impl MotionPattern {
             // move as "the region stepped" and starts reading it as "the region travelled".
             // Below it the region should arrive; at or above it, it should be seen going.
             Self::SelectionChange => Some((0.045, 16.0)),
+            // The lamp scales over the same sixteen rows as the selection region, and takes
+            // longer at every distance. It is meant to be seen arriving *after* the ring
+            // that is already there — a light swinging over to where focus went, rather
+            // than a second thing moving in lockstep with the first, which reads as one
+            // thicker object.
+            Self::FocusLight => Some((0.070, 16.0)),
             Self::HoverFeedback | Self::PressFeedback | Self::DensityChange => None,
         }
     }
@@ -227,6 +240,9 @@ impl MotionPattern {
             // `the_density_pattern_and_the_density_transition_agree` is what makes that
             // more than a hope.
             Self::DensityChange => DensityTransition::DURATION,
+            // Half again the selection region's ceiling. The gap is the effect: the ring
+            // lands, then the room catches up.
+            Self::FocusLight => 0.180,
         }
     }
 
@@ -237,7 +253,8 @@ impl MotionPattern {
             Self::HoverFeedback
             | Self::PressFeedback
             | Self::SelectionChange
-            | Self::DensityChange => Curve::EaseOut,
+            | Self::DensityChange
+            | Self::FocusLight => Curve::EaseOut,
         }
     }
 
@@ -247,8 +264,11 @@ impl MotionPattern {
             // Hover and press are a colour wash. Nothing moves, so reduced motion may keep
             // them -- capped at the cross-fade budget, which they are already under.
             Self::HoverFeedback | Self::PressFeedback => MotionKind::Fade,
-            // Both move geometry, and both become instant.
-            Self::SelectionChange | Self::DensityChange => MotionKind::Layout,
+            // All three move something across the window, and all three become instant. The
+            // lamp is `Layout` rather than `Fade` even though nothing in the *layout* moves:
+            // what travels is a light, and a light sweeping across the whole window is more
+            // of the large-area movement FR-029 exists for than a row height changing is.
+            Self::SelectionChange | Self::DensityChange | Self::FocusLight => MotionKind::Layout,
         }
     }
 
@@ -503,6 +523,22 @@ pub struct SelectionDraw {
     pub alpha: f32,
 }
 
+/// Where the lit mode's focus lamp should hang this frame.
+///
+/// Deliberately **not** a [`SelectionDraw`] with a different name. The selection region has an
+/// alpha because it is drawn and can fade; a lamp cannot fade, it can only be somewhere or
+/// nowhere, and the somewhere is the whole content. Giving it an unread alpha would be the
+/// half-configured light [`qs_gpu::scene::FocusLamp`] is a separate type from `Light` to prevent.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FocusLightDraw {
+    /// The row whose slot the lamp is anchored to.
+    pub row: u64,
+    /// Vertical displacement from that row's top, in **rows**. Zero once settled, and zero at
+    /// every instant under Reduce Motion; positive means the lamp is still above `row`, on
+    /// its way down.
+    pub offset_rows: f32,
+}
+
 /// The animated presentation of [`Interaction`], plus the density transition.
 ///
 /// This is deliberately the **only** thing that answers "is anything animating". The frame
@@ -514,6 +550,10 @@ pub struct InteractionMotion {
     hover: Phase<Option<u64>>,
     pressed: Phase<Option<u64>>,
     selected: Phase<Option<u64>>,
+    /// Keyboard focus, tracked separately from `selected` because they are separate: the
+    /// keyboard moves focus through rows without selecting them, and a lamp riding the
+    /// selection would sit still while the thing it is supposed to be finding moves.
+    focused: Phase<Option<u64>>,
     density: Option<DensityTransition>,
     /// Where the material cycle is, in turns. See [`InteractionMotion::phase`].
     cycle: f32,
@@ -526,6 +566,7 @@ impl InteractionMotion {
             hover: Phase::settled(None),
             pressed: Phase::settled(None),
             selected: Phase::settled(None),
+            focused: Phase::settled(None),
             density: None,
             cycle: 0.0,
         }
@@ -544,6 +585,7 @@ impl InteractionMotion {
         self.set_hovered(interaction.hovered);
         self.set_pressed(interaction.pressed);
         self.set_selected(interaction.selection.morph_target());
+        self.set_focused(interaction.focused);
     }
 
     pub fn set_hovered(&mut self, row: Option<u64>) {
@@ -581,6 +623,22 @@ impl InteractionMotion {
         };
         let plan = MotionPattern::SelectionChange.plan_over(self.preference, distance);
         self.selected.set(row, plan);
+    }
+
+    /// Aim the focus lamp at `row`, or extinguish it when nothing has focus.
+    ///
+    /// The distance is measured from where the lamp is *heading*, exactly as
+    /// [`InteractionMotion::set_selected`] does and for the same reason: holding an arrow key
+    /// must not make each successive move inherit the last one's length.
+    pub fn set_focused(&mut self, row: Option<u64>) {
+        let distance = match (self.focused.to(), row) {
+            (Some(from), Some(to)) => from.abs_diff(to) as f32,
+            // Arriving or leaving is not a journey — the lamp comes up or goes out where it
+            // is — so it takes the floor, which is the shortest thing the pattern can do.
+            _ => 0.0,
+        };
+        let plan = MotionPattern::FocusLight.plan_over(self.preference, distance);
+        self.focused.set(row, plan);
     }
 
     /// Start a density morph, returning the transition to drive the layout with.
@@ -633,6 +691,7 @@ impl InteractionMotion {
         let hover = self.hover.advance(dt);
         let pressed = self.pressed.advance(dt);
         let selected = self.selected.advance(dt);
+        let focused = self.focused.advance(dt);
         let density = match &mut self.density {
             Some(transition) => {
                 if transition.advance(dt) {
@@ -644,13 +703,14 @@ impl InteractionMotion {
             }
             None => false,
         };
-        hover || pressed || selected || density
+        hover || pressed || selected || focused || density
     }
 
     pub fn is_animating(&self) -> bool {
         self.hover.is_animating()
             || self.pressed.is_animating()
             || self.selected.is_animating()
+            || self.focused.is_animating()
             || self.density.is_some()
     }
 
@@ -764,6 +824,71 @@ impl InteractionMotion {
             // Unreachable while animating: `Phase::set` refuses a no-op target, so `from`
             // and `to` differ for as long as a ticket is live.
             (None, None) => None,
+        }
+    }
+
+    /// Where the focus lamp is this frame, or `None` when nothing has focus.
+    ///
+    /// # FR-029, and why there is no branch on the preference here
+    ///
+    /// Under Reduce Motion `MotionPattern::FocusLight` plans to `Instant`, `Phase::set` never
+    /// opens a ticket, `is_animating` is false, and the first arm below returns the lamp at
+    /// the focused row with a zero offset. So the reduced picture is the lamp **at** focus —
+    /// a place the layout chose — and not wherever a suppressed animation would have left it.
+    /// A preference check in this function would be a second answer to a question
+    /// [`MotionPattern::kind`] already answers, and the two could disagree.
+    ///
+    /// Unlike the selection region there is no long-distance special case. The region fades
+    /// across a jump longer than the viewport because a rectangle streaking past the rows is
+    /// what a person's eye follows to nothing; a lamp travelling the same distance changes
+    /// only where the shadows point, which is not something to protect anyone from.
+    #[must_use]
+    pub fn focus_light_draw(&self) -> Option<FocusLightDraw> {
+        if !self.focused.is_animating() {
+            return self
+                .focused
+                .to()
+                .map(|row| FocusLightDraw { row, offset_rows: 0.0 });
+        }
+
+        let progress = self.focused.progress();
+        match (self.focused.from(), self.focused.to()) {
+            (Some(from), Some(to)) => Some(FocusLightDraw {
+                row: to,
+                offset_rows: (1.0 - progress) * ((from as i64) - (to as i64)) as f32,
+            }),
+            // Coming up: the lamp is already at its destination, and what ramps is its
+            // strength, which the scene builder scales by `progress`. Going out: it stays
+            // where it was while the strength ramps down. Both are handled by
+            // `focus_light_gain` rather than by moving something.
+            (None, Some(to)) => Some(FocusLightDraw {
+                row: to,
+                offset_rows: 0.0,
+            }),
+            (Some(from), None) => Some(FocusLightDraw {
+                row: from,
+                offset_rows: 0.0,
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// How strongly the focus lamp burns this frame, `0.0..=1.0`.
+    ///
+    /// One on a settled lamp. Ramping while it comes up or goes out, so focus arriving is a
+    /// light coming on rather than a light appearing at full strength — which is the same
+    /// snap the mode exists to replace, one level in. A lamp merely *travelling* burns at
+    /// full strength throughout: it is the same light, in a new place.
+    #[must_use]
+    pub fn focus_light_gain(&self) -> f32 {
+        if !self.focused.is_animating() {
+            return f32::from(u8::from(self.focused.to().is_some()));
+        }
+        match (self.focused.from(), self.focused.to()) {
+            (Some(_), Some(_)) => 1.0,
+            (None, Some(_)) => self.focused.progress(),
+            (Some(_), None) => 1.0 - self.focused.progress(),
+            (None, None) => 0.0,
         }
     }
 }
@@ -1018,9 +1143,18 @@ mod tests {
             (MotionPattern::SelectionChange, 0.120, MotionKind::Layout),
             (MotionPattern::DensityChange, 0.120, MotionKind::Layout),
         ];
-        assert_eq!(expected.len(), MotionPattern::ALL.len());
+        // Patterns that are NOT rows of UXDD 10.3, each with the document that owns it.
+        // Listed rather than subtracted, so the count assertion below keeps doing its job:
+        // every pattern is accounted for by exactly one design source, and adding a fifth
+        // without saying which one it came from fails here instead of quietly joining a
+        // table it is not in.
+        let elsewhere = [
+            // spec 002 US3, the lit mode's focus lamp.
+            (MotionPattern::FocusLight, 0.180, MotionKind::Layout),
+        ];
+        assert_eq!(expected.len() + elsewhere.len(), MotionPattern::ALL.len());
 
-        for (pattern, duration, kind) in expected {
+        for (pattern, duration, kind) in expected.into_iter().chain(elsewhere) {
             assert!(
                 (pattern.duration() - duration).abs() < 1e-6,
                 "{pattern:?} is {}s, UXDD 10.3 says {duration}s",
@@ -1720,6 +1854,147 @@ mod tests {
             reduced.drive().phase,
             PINNED_PHASE,
             "the pin is applied by `phase` and skipped by `drive`, so a call site can reach              around it"
+        );
+    }
+
+    #[test]
+    fn the_focus_lamp_arrives_without_travelling_under_reduced_motion() {
+        // T061 / FR-029, and the two halves are separate claims.
+        //
+        // FIRST: under Reduce Motion the lamp never has a non-zero offset at ANY instant. It
+        // is not enough that it ends up in the right place -- a light sweeping across the
+        // window and then stopping there is exactly the large-area movement the preference
+        // exists to remove, and a test that only checked the final frame would pass on it.
+        let mut reduced = InteractionMotion::new(MotionPreference::Reduced);
+        reduced.set_focused(Some(3));
+        reduced.set_focused(Some(40));
+        assert_eq!(
+            reduced.focus_light_draw(),
+            Some(FocusLightDraw {
+                row: 40,
+                offset_rows: 0.0,
+            }),
+            "the lamp did not arrive at the focused row instantly"
+        );
+        assert!(
+            !reduced.is_animating(),
+            "a reduced-motion lamp opened an animation ticket, which SC-003 pays for"
+        );
+        for _ in 0..12 {
+            reduced.advance(0.016);
+            let draw = reduced.focus_light_draw().unwrap();
+            assert_eq!(
+                draw.offset_rows, 0.0,
+                "the lamp travelled under Reduce Motion, at row {} offset {}",
+                draw.row, draw.offset_rows
+            );
+            assert_eq!(draw.row, 40);
+        }
+
+        // SECOND: the comparison arm. A test whose reduced case is right because NOTHING
+        // moves in either case is not evidence about reduced motion -- it is evidence the
+        // feature is missing. This is the half that would have caught a lamp wired to the
+        // wrong phase.
+        let mut full = InteractionMotion::new(MotionPreference::Full);
+        full.set_focused(Some(3));
+        full.set_focused(Some(40));
+        let travelling = full.focus_light_draw().unwrap();
+        assert_eq!(travelling.row, 40);
+        assert!(
+            travelling.offset_rows.abs() > 0.0,
+            "with full motion the lamp arrived instantly too, so the reduced arm above \
+             asserts nothing"
+        );
+        assert!(full.is_animating());
+    }
+
+    #[test]
+    fn the_lamp_rests_where_the_layout_put_it_and_not_where_motion_stopped() {
+        // FR-029's second clause, which is the one that is easy to satisfy wrongly: the
+        // resting position must be one somebody chose. Turn the preference on mid-flight and
+        // the lamp must snap to the focused row -- not freeze at the fraction of the journey
+        // it happened to have covered, which is a position nobody authored and which differs
+        // by machine depending on when the setting was read.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        motion.set_focused(Some(0));
+        motion.set_focused(Some(20));
+        motion.advance(0.030);
+        let mid = motion.focus_light_draw().unwrap();
+        assert!(
+            mid.offset_rows.abs() > 0.0,
+            "the lamp was already settled, so there is no interrupted journey to test"
+        );
+
+        let mut reduced = InteractionMotion::new(MotionPreference::Reduced);
+        reduced.set_focused(Some(20));
+        assert_eq!(
+            reduced.focus_light_draw().unwrap().offset_rows,
+            0.0,
+            "the reduced lamp rests somewhere other than the focused row"
+        );
+    }
+
+    #[test]
+    fn the_lamp_goes_out_and_comes_up_rather_than_appearing() {
+        // The gain is a separate question from the position, and collapsing them is how a
+        // lamp ends up teleporting: focus arriving from nothing has no distance to travel,
+        // so if strength did not ramp there would be nothing to see but a step change in
+        // every shadow in the window.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        assert_eq!(motion.focus_light_gain(), 0.0, "a lamp burns with no focus");
+
+        motion.set_focused(Some(5));
+        assert!(
+            motion.focus_light_gain() < 1.0,
+            "the lamp came up at full strength instead of ramping"
+        );
+        for _ in 0..24 {
+            motion.advance(0.016);
+        }
+        assert_eq!(motion.focus_light_gain(), 1.0);
+        assert!(!motion.is_animating(), "the lamp never settled");
+
+        // Travelling is the same light in a new place, so it does not dim on the way.
+        motion.set_focused(Some(9));
+        motion.advance(0.016);
+        assert_eq!(
+            motion.focus_light_gain(),
+            1.0,
+            "the lamp dimmed while merely moving"
+        );
+
+        motion.set_focused(None);
+        motion.advance(0.016);
+        let going = motion.focus_light_gain();
+        assert!(
+            going > 0.0 && going < 1.0,
+            "the lamp did not ramp down on the way out, it was switched off: {going}"
+        );
+    }
+
+    #[test]
+    fn the_lamp_and_the_selection_are_separate_lights_to_aim() {
+        // The keyboard moves focus through rows without selecting them. A lamp riding
+        // `selected` would sit still while the thing it exists to find walks away, and the
+        // symptom is a mode that looks broken only for keyboard users -- who are the people
+        // US3 is for.
+        let mut motion = InteractionMotion::new(MotionPreference::Full);
+        motion.set_selected(Some(2));
+        motion.set_focused(Some(2));
+        for _ in 0..24 {
+            motion.advance(0.016);
+        }
+
+        motion.set_focused(Some(11));
+        assert_eq!(
+            motion.focus_light_draw().map(|d| d.row),
+            Some(11),
+            "the lamp did not follow focus"
+        );
+        assert_eq!(
+            motion.selection_draw(40).map(|d| d.row),
+            Some(2),
+            "moving focus moved the selection region, which is a different thing"
         );
     }
 }
