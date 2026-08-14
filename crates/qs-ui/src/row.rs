@@ -869,7 +869,27 @@ impl ListRenderer {
         interaction: Interaction<'_>,
         motion: &InteractionMotion,
     ) {
-        self.render_rows(list, buf, layout, interaction, motion, true);
+        self.render_rows(list, buf, layout, interaction, motion, true, None);
+    }
+
+    /// [`ListRenderer::render`], also describing every painted surface to `scene`.
+    ///
+    /// The lit mode's walk (specs/002 T015's second half): the slab is admitted at the same
+    /// call site that paints the material, with the same [`Surface`], so which material a
+    /// row gets is decided exactly once — a re-derivation in the caller is the
+    /// two-descriptions drift scene-handoff rule 1 exists to catch. A separate entry point
+    /// rather than an `Option` on `render`, for the reason `compile_with` is one: every
+    /// existing caller keeps the signature it has.
+    pub fn render_lit(
+        &mut self,
+        list: &mut DrawList,
+        buf: &RowBuf,
+        layout: &ViewportLayout,
+        interaction: Interaction<'_>,
+        motion: &InteractionMotion,
+        scene: &mut crate::scene::SceneBuilder,
+    ) {
+        self.render_rows(list, buf, layout, interaction, motion, true, Some(scene));
     }
 
     /// Draw one **Miller column**: the same rows, name only.
@@ -885,9 +905,10 @@ impl ListRenderer {
         interaction: Interaction<'_>,
         motion: &InteractionMotion,
     ) {
-        self.render_rows(list, buf, layout, interaction, motion, false);
+        self.render_rows(list, buf, layout, interaction, motion, false, None);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_rows(
         &mut self,
         list: &mut DrawList,
@@ -896,6 +917,7 @@ impl ListRenderer {
         interaction: Interaction<'_>,
         motion: &InteractionMotion,
         metadata: bool,
+        mut scene: Option<&mut crate::scene::SceneBuilder>,
     ) {
         qs_gpu::affinity::assert_ui_thread("ListRenderer::render");
 
@@ -978,21 +1000,30 @@ impl ListRenderer {
                 .map_or(Substance::UNKNOWN, |row| {
                     Substance::of(row, substance_tokens)
                 });
+            let body_surface = Surface {
+                x: layout.origin_x,
+                y: top,
+                w: layout.width as f32,
+                h: layout.row_height as f32,
+                radius: 0.0,
+                scale,
+            };
             self.tokens.paint_substance(
                 material,
-                Surface {
-                    x: layout.origin_x,
-                    y: top,
-                    w: layout.width as f32,
-                    h: layout.row_height as f32,
-                    radius: 0.0,
-                    scale,
-                },
+                body_surface,
                 1.0,
                 Drive::REST,
                 Some(substance),
                 &mut list.instances,
             );
+            // The same material, the same surface, described to the lighting pass. Here,
+            // beside the paint, so a row's slab can never come from a different material
+            // than its pixels did.
+            if let Some(builder) = scene.as_deref_mut() {
+                if let Some(slab) = self.tokens.scene_slab(material, body_surface) {
+                    builder.admit(slab);
+                }
+            }
             // Hover and press are the same material, layered rather than blended: a press
             // deepens whatever is already beneath it, which is what makes it read as the
             // same object being pushed instead of as a second colour arriving.
@@ -1021,7 +1052,17 @@ impl ListRenderer {
             &region,
             interaction.selection,
             motion,
+            scene.as_deref_mut(),
         );
+
+        // The surface/content seam, recorded where it actually is (specs/002 T019). Layers
+        // 1 and 2 — the canvas painted before this call, the row bodies, the washes and the
+        // selection — are surfaces the lighting pass may modulate; everything from here on
+        // samples the atlas or sits on top of text. Without this boundary the whole region
+        // is one textured batch, `surface_content_split` lands at zero, and the lighting
+        // pass paints under everything and changes nothing — which is exactly how the first
+        // lit window shipped a no-op and a `--shot-gpu` diff caught it.
+        list.end_batch(None, false);
 
         // Layer 3: content, over both.
         for (slot, row) in buf.rows().iter().enumerate() {
@@ -1299,6 +1340,7 @@ impl ListRenderer {
     /// Which layers bleed is the *material's* answer rather than this function's --
     /// [`material::Pass`] -- so a look that later grows a second reaching layer does not
     /// need this loop rewritten.
+    #[allow(clippy::too_many_arguments)]
     fn draw_selection(
         &mut self,
         list: &mut DrawList,
@@ -1307,6 +1349,7 @@ impl ListRenderer {
         region: &StateRegion,
         selection: &Selection,
         motion: &InteractionMotion,
+        mut scene: Option<&mut crate::scene::SceneBuilder>,
     ) {
         // How hard the selection is being moved and where the material cycle has got to.
         // The intensity is zero whenever nothing is animating, so a settled list is a still
@@ -1335,6 +1378,7 @@ impl ListRenderer {
                     Drive::REST,
                     0.0,
                     Pass::Bleed,
+                    None,
                 );
             }
             for index in selection.iter_in(first..end) {
@@ -1348,6 +1392,7 @@ impl ListRenderer {
                     Drive::REST,
                     0.0,
                     Pass::Body,
+                    scene.as_deref_mut(),
                 );
             }
             return;
@@ -1379,6 +1424,7 @@ impl ListRenderer {
             drive,
             squish,
             Pass::Bleed,
+            None,
         );
         self.push_selection(
             list,
@@ -1390,6 +1436,7 @@ impl ListRenderer {
             drive,
             squish,
             Pass::Body,
+            scene,
         );
     }
 
@@ -1414,6 +1461,7 @@ impl ListRenderer {
         drive: Drive,
         squish: f32,
         pass: Pass,
+        scene: Option<&mut crate::scene::SceneBuilder>,
     ) {
         let Some(material) = self.tokens.material(material::name::ROW_SELECTED) else {
             return;
@@ -1439,14 +1487,30 @@ impl ListRenderer {
         }
 
         let top = top + layout.origin_y;
+        let surface = region.surface(top, scale, squish);
         material.compile_pass(
             pass,
-            region.surface(top, scale, squish),
+            surface,
             alpha,
             drive,
             self.tokens.effects_enabled(),
             &mut list.instances,
         );
+        // The raised slab, admitted beside the paint (US1). Body pass only, so the two
+        // passes of one region cannot cast twice, and only while the region is actually
+        // visible -- a slab for a fully faded selection would shadow from nothing. The
+        // travelling region admits at its interpolated surface, so mid-morph the shadow
+        // moves WITH the region rather than teleporting between rows.
+        if alpha > 0.0 {
+            if let Some(builder) = scene {
+                if let Some(slab) = self
+                    .tokens
+                    .scene_slab(material::name::ROW_SELECTED, surface)
+                {
+                    builder.admit(slab);
+                }
+            }
+        }
 
         if pass == Pass::Bleed {
             return;

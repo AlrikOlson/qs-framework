@@ -97,6 +97,17 @@ pub struct Renderer {
     lighting: Option<LightingTarget>,
     /// Counted for the same reason as `offscreen_allocations`.
     lighting_allocations: u32,
+    /// The lighting pass itself: one fullscreen triangle drawn in the seam between the
+    /// surface and content halves, blending `dst * attenuation + addition` with
+    /// fixed-function state. Compiled unconditionally — a pipeline is a few kilobytes and a
+    /// mode that compiled its shader on first use would pay a hitch at the exact keystroke
+    /// that turns it on.
+    lit_pipeline: wgpu::RenderPipeline,
+    lit_buffer: wgpu::Buffer,
+    lit_bind_group: wgpu::BindGroup,
+    /// Slabs the last packed scene could not fit into [`crate::lighting::LIT_SLABS`].
+    /// Reported rather than swallowed, like every other drop in this module.
+    lit_dropped: usize,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -372,6 +383,96 @@ impl Renderer {
             cache: None,
         });
 
+        // The lighting pass (specs/002 US1). One fullscreen triangle, fixed-function
+        // blending: the fragment writes `vec4(addition, attenuation)` and the blend applies
+        // `out = src.rgb + dst.rgb * src.a` — a multiply-and-add that never samples the
+        // surface image, which is what lets it draw INSIDE the same render pass, in the
+        // seam between the surface and content halves.
+        let lit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("qs-lighting-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/lighting.wgsl").into()),
+        });
+        let lit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qs-lighting-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let lit_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qs-lighting-scene"),
+            size: std::mem::size_of::<crate::lighting::LitSceneUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qs-lighting-bind-group"),
+            layout: &lit_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lit_buffer.as_entire_binding(),
+            }],
+        });
+        let lit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qs-lighting-pipeline-layout"),
+            bind_group_layouts: &[Some(&lit_layout)],
+            immediate_size: 0,
+        });
+        let lit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("qs-lighting-pipeline"),
+            layout: Some(&lit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &lit_shader,
+                entry_point: Some("vs_lit"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &lit_shader,
+                entry_point: Some("fs_lit"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        // `out.rgb = src.rgb + dst.rgb * src.a`: the addition (zero until
+                        // US2's bounce) plus the surface attenuated. The alpha component
+                        // keeps the destination's, untouched — the pass has no opinion
+                        // about coverage.
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::SrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             pipeline,
             globals_buffer,
@@ -389,6 +490,10 @@ impl Renderer {
             offscreen_allocations: 0,
             lighting: None,
             lighting_allocations: 0,
+            lit_pipeline,
+            lit_buffer,
+            lit_bind_group,
+            lit_dropped: 0,
         }
     }
 
@@ -529,6 +634,28 @@ impl Renderer {
         let offscreen = self.ensure_offscreen(ctx, list);
         self.ensure_lighting(ctx, list, scene);
 
+        // The lit frame's scene, packed and uploaded before the encoder opens, beside the
+        // other per-frame writes. An unlit frame writes nothing — the buffer keeps stale
+        // bytes nobody reads, because the draw below is guarded by the same condition.
+        let lit = scene.filter(|s| s.is_renderable());
+        if let Some(scene) = lit {
+            let (uniform, dropped) = crate::lighting::LitSceneUniform::pack(
+                scene,
+                [list.viewport[0] as f32, list.viewport[1] as f32],
+            );
+            if dropped > 0 && self.lit_dropped == 0 {
+                tracing::warn!(
+                    target: "qs::lighting",
+                    dropped,
+                    "the scene exceeds the shader's slab bound; the last {dropped} slabs \
+                     cast no shadow this frame"
+                );
+            }
+            self.lit_dropped = dropped;
+            ctx.queue
+                .write_buffer(&self.lit_buffer, 0, bytemuck::bytes_of(&uniform));
+        }
+
         ctx.queue.write_buffer(
             &self.globals_buffer,
             0,
@@ -604,11 +731,25 @@ impl Renderer {
             // The surface half: every batch before the first atlas-sampled one.
             draw_batches(&mut pass, list, surface_half);
 
-            // The lighting pass slots HERE (US1): it modulates the surfaces just drawn and
-            // is finished before any glyph exists to be lit. Today there is nothing to run
-            // -- the scene above has allocated the target and no more -- and keeping the
-            // seam inside one wgpu pass is what keeps the mode-off frame the exact frame it
-            // always was: no second pass begins until something renders into it.
+            // The lighting pass, in the seam (US1): it modulates the surfaces just drawn
+            // and is finished before any glyph exists to be lit — lit-contrast rule 1 as
+            // draw order. One fullscreen triangle inside the SAME wgpu pass, so an unlit
+            // frame's command stream is exactly what it always was; with a scene, the only
+            // additions are one pipeline switch each way and one draw.
+            if lit.is_some() {
+                pass.set_pipeline(&self.lit_pipeline);
+                pass.set_bind_group(0, &self.lit_bind_group, &[]);
+                pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
+                pass.draw(0..3, 0..1);
+
+                // The instance pipeline back, for the content half: pipeline, both bind
+                // groups and the vertex buffer, because a render pass forgets nothing but
+                // guarantees nothing across a pipeline switch.
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.globals_bind_group, &[]);
+                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+            }
 
             // The content half: text, icons, and whatever is composed above them, in the
             // order the list stated.

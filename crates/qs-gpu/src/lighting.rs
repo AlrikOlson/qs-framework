@@ -30,7 +30,103 @@
 //! moment it is drawn. That is a stronger guarantee than "the refinement stops on its own", and it
 //! is what keeps the zero-work-at-rest obligation untouched by this feature.
 
+use bytemuck::{Pod, Zeroable};
+
 use crate::path::RenderPath;
+use crate::scene::SceneList;
+
+/// How many slabs the shader can see. Mirrors `LIT_SLABS` in `shaders/lighting.wgsl`, and
+/// `the_shader_and_the_uniform_agree_about_the_slab_bound` reads the source to hold them
+/// equal — the same discipline the `KIND_` constants live under.
+///
+/// A **uniform** array rather than a storage buffer, because the Reduced tier is the lowest
+/// tier that draws shadows and it is GLES 3.1-class, where fragment-stage storage buffers
+/// are not guaranteed (`GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS` may be zero). 192 slabs at
+/// two `vec4`s each is 6,144 bytes against the 16 KB uniform minimum. The scene's own
+/// ceiling is 4,096; the pack takes the nearest 192 and reports the rest, and a real
+/// frame's walk admits well under a hundred.
+pub const LIT_SLABS: usize = 192;
+
+/// The scene as the lighting shader reads it. Layout mirrors `LitScene` in
+/// `shaders/lighting.wgsl` field for field; a divergence is a silently wrong render, not a
+/// validation error, because the byte counts still line up.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct LitSceneUniform {
+    viewport: [f32; 2],
+    count: u32,
+    _pad: u32,
+    /// xyz: toward the light, normalized. w: hardness `k` — see [`hardness`].
+    light: [f32; 4],
+    rect: [[f32; 4]; LIT_SLABS],
+    /// radius, elevation, thickness, attenuation floor.
+    shape: [[f32; 4]; LIT_SLABS],
+}
+
+/// The contact-hardening constant for a light of `size_deg` degrees: `1 / tan(size / 2)`.
+///
+/// The inverse of the angular size, which is the whole of research R4: `min(k * h / t)`
+/// along the shadow ray *is* the penumbra, and a larger light (smaller `k`) softens it.
+/// Clamped away from zero so an absurd authored size degrades to a soft shadow rather than
+/// a division by zero.
+#[must_use]
+pub fn hardness(size_deg: f32) -> f32 {
+    1.0 / (size_deg.to_radians() * 0.5).tan().max(1e-4)
+}
+
+impl std::fmt::Debug for LitSceneUniform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LitSceneUniform")
+            .field("count", &self.count)
+            .field("light", &self.light)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LitSceneUniform {
+    /// Pack `scene` for the shader. Returns the uniform and how many slabs did not fit.
+    ///
+    /// Over [`LIT_SLABS`] the excess is dropped from the END of the list — the builder
+    /// admits in paint order, canvas first, so the slabs that go are the ones painted last
+    /// — and the count is returned rather than swallowed, for the same reason
+    /// [`SceneList::push`] counts: a missing shadow needs a number to look at.
+    #[must_use]
+    pub fn pack(scene: &SceneList, viewport: [f32; 2]) -> (Self, usize) {
+        let mut uniform = Self::zeroed();
+        uniform.viewport = viewport;
+
+        let light = scene.key_light.as_ref();
+        let (direction, size) = light.map_or(([-0.32, -0.55, 0.77], 5.0), |l| (l.vector, l.size));
+        let len = (direction[0] * direction[0]
+            + direction[1] * direction[1]
+            + direction[2] * direction[2])
+            .sqrt()
+            .max(1e-6);
+        uniform.light = [
+            direction[0] / len,
+            direction[1] / len,
+            direction[2] / len,
+            hardness(size),
+        ];
+
+        let take = scene.slabs.len().min(LIT_SLABS);
+        for (slab, (rect, shape)) in scene
+            .slabs
+            .iter()
+            .zip(uniform.rect.iter_mut().zip(uniform.shape.iter_mut()))
+        {
+            *rect = slab.rect;
+            *shape = [
+                slab.radius,
+                slab.elevation,
+                slab.thickness,
+                slab.attenuation_floor.clamp(0.0, 1.0),
+            ];
+        }
+        uniform.count = take as u32;
+        (uniform, scene.slabs.len() - take)
+    }
+}
 
 /// One lighting behaviour, and what it becomes on every tier that cannot draw it.
 ///
@@ -147,6 +243,82 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+
+    #[test]
+    fn a_frame_is_a_complete_picture() {
+        // T033 / FR-023 / SC-011: the pass is a pure function of the scene — no
+        // accumulator, nothing to converge, nothing to terminate. Drawing the same view
+        // twice produces bit-identical attenuation for every pixel, which is a stronger
+        // guarantee than "the refinement stops" and is what keeps zero-work-at-rest true
+        // with the mode on.
+        use crate::scene::Slab;
+        use crate::tier_parity::shader;
+
+        let slabs = vec![
+            Slab {
+                rect: [0.0, 0.0, 256.0, 256.0],
+                thickness: 1.0,
+                attenuation_floor: 0.0,
+                ..Slab::default()
+            },
+            Slab {
+                rect: [40.0, 40.0, 80.0, 40.0],
+                radius: 6.0,
+                elevation: 12.0,
+                thickness: 12.0,
+                attenuation_floor: 0.0,
+                ..Slab::default()
+            },
+        ];
+        let toward = [-0.32, -0.55, 0.77];
+        let k = hardness(5.0);
+
+        let picture = || -> Vec<u32> {
+            (0..64u32 * 64)
+                .map(|i| {
+                    let p = [(i % 64) as f32 * 4.0, (i / 64) as f32 * 4.0];
+                    shader::lit_attenuation(p, &slabs, toward, k).to_bits()
+                })
+                .collect()
+        };
+        assert_eq!(
+            picture(),
+            picture(),
+            "drawing the same view twice diverged: something accumulates"
+        );
+    }
+
+    #[test]
+    fn the_uniform_packs_the_scene_the_shader_expects() {
+        // The pack takes the nearest-first slabs, normalizes the light, carries the floor,
+        // and reports what did not fit — the counted-drop discipline at the second ceiling.
+        use crate::scene::{Light, LightKind, SceneList, Slab};
+
+        let mut scene = SceneList::default();
+        scene.reset(3, crate::scene::Environment::default());
+        for i in 0..(LIT_SLABS + 5) {
+            scene.push(Slab {
+                rect: [i as f32, 0.0, 10.0, 10.0],
+                attenuation_floor: 0.25,
+                ..Slab::default()
+            });
+        }
+        scene.key_light = Some(Light {
+            kind: LightKind::Directional,
+            vector: [0.0, 0.0, 2.0],
+            colour: [1.0, 1.0, 1.0],
+            intensity: 0.7,
+            size: 10.0,
+        });
+
+        let (uniform, dropped) = LitSceneUniform::pack(&scene, [800.0, 600.0]);
+        assert_eq!(dropped, 5, "the overflow was not counted");
+        assert_eq!(uniform.count as usize, LIT_SLABS);
+        assert!((uniform.light[2] - 1.0).abs() < 1e-6, "the light was not normalized");
+        assert!((uniform.light[3] - hardness(10.0)).abs() < 1e-3);
+        assert!((uniform.shape[0][3] - 0.25).abs() < f32::EPSILON, "the floor was dropped");
+    }
 
     /// Capability rank, ascending. Stated here because `RenderPath`'s derived `Ord` is
     /// declaration order and runs the other way; a test that used `<` directly would pass while

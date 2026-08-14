@@ -102,11 +102,18 @@ impl SceneBuilder {
     ///
     /// Call this beside the `paint` that pushed the material's instances, with the same
     /// [`Surface`] -- the shared origin is what makes the slab equal the instance exactly
-    /// rather than approximately.
+    /// rather than approximately. Prefer [`crate::tokens::Tokens::scene_slab`] +
+    /// [`SceneBuilder::admit`] where a `Tokens` is at hand: this path leaves the
+    /// attenuation floor at its safe 1.0, so the slab casts but cannot be darkened.
     pub fn add(&mut self, material: &Material, surface: Surface) {
-        let Some(slab) = material.slab(surface) else {
-            return;
-        };
+        if let Some(slab) = material.slab(surface) {
+            self.admit(slab);
+        }
+    }
+
+    /// Admit one already-built slab, applying the widened-viewport cull (rule 4) and the
+    /// counted ceiling (rule 5, inside [`SceneList::push`]).
+    pub fn admit(&mut self, slab: Slab) {
         let [x, y, w, h] = slab.rect;
         let reach = self.margin;
         let inside = x < self.viewport[0] + reach

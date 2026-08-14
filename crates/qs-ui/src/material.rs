@@ -1111,6 +1111,10 @@ impl Material {
             metalness,
             emission: [0.0; 3],
             emission_strength: 0.0,
+            // The safe default: no darkening permitted. `Tokens::scene_slab` is the route
+            // that fills the real allowance, because the allowance is a `Tokens` fact (per
+            // material AND per theme) and this function has neither.
+            attenuation_floor: 1.0,
         })
     }
 

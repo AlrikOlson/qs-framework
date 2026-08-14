@@ -39,7 +39,7 @@ use crate::color::Srgba;
 /// `elevation` is the height of the top face above the canvas; `thickness` is how far the slab
 /// extends below it. A zero-thickness slab is a plane: it still casts, but it has no side for
 /// light to catch, which is usually not what an author meant.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Slab {
     /// `[x, y, w, h]`, physical pixels. **Equals** the corresponding instance's `rect`.
     pub rect: [f32; 4],
@@ -60,6 +60,32 @@ pub struct Slab {
     /// Zero means the slab is not a light. Kept separate from `emission` so a colour can be
     /// authored once and switched off without losing it.
     pub emission_strength: f32,
+    /// The least attenuation the lighting pass may apply to this surface — the material's
+    /// allowance (`Tokens::lit_bounds`), per theme, carried onto the slab so the shader can
+    /// enforce it per pixel. **This is how the contrast gate's closed-form worst case is a
+    /// bound on real frames rather than a hope** (lit-contrast rules 1a and 3a).
+    pub attenuation_floor: f32,
+}
+
+impl Default for Slab {
+    /// The floor defaults to **1.0** — no attenuation permitted at all — which is the safe
+    /// direction: a slab built without going through `Tokens` cannot be darkened, where a
+    /// zero default would hand full black to exactly the construction path that skipped the
+    /// allowance. Everything else genuinely is zero.
+    fn default() -> Self {
+        Self {
+            rect: [0.0; 4],
+            radius: 0.0,
+            elevation: 0.0,
+            thickness: 0.0,
+            albedo: [0.0; 3],
+            roughness: 0.0,
+            metalness: 0.0,
+            emission: [0.0; 3],
+            emission_strength: 0.0,
+            attenuation_floor: 1.0,
+        }
+    }
 }
 
 impl Slab {

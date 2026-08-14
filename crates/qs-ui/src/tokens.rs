@@ -475,6 +475,26 @@ impl Tokens {
         self.lighting.clone()
     }
 
+    /// The slab for one painted material, with its **allowance carried onto it**.
+    ///
+    /// The one route from a material to a scene slab that fills `attenuation_floor` from
+    /// [`Tokens::lit_bounds`] — per material, per theme. [`crate::material::Material::slab`]
+    /// alone leaves the floor at its safe default of 1.0 (no darkening permitted), so a
+    /// call site that bypasses this helper gets a surface shadows cannot touch rather than
+    /// one they can over-touch. Call it beside the `paint` that pushed the material's
+    /// instances, with the same [`Surface`].
+    #[must_use]
+    pub fn scene_slab(
+        &self,
+        name: &str,
+        surface: crate::material::Surface,
+    ) -> Option<qs_gpu::scene::Slab> {
+        let material = self.material(name)?;
+        let mut slab = material.slab(surface)?;
+        slab.attenuation_floor = self.lit_bounds(material).attenuation.0;
+        Some(slab)
+    }
+
     /// The rig's environment, resolved for this theme.
     ///
     /// The two stops are token *names* in the file, so the room a lit surface reflects
@@ -1097,7 +1117,11 @@ pub struct KeyLightTokens {
 impl Default for KeyLightTokens {
     fn default() -> Self {
         Self {
-            direction: [-0.42, -0.62, 0.66],
+            // Exactly `qs_gpu::frame::LIGHT_DIR`, and `the_rig_and_the_shader_agree_about
+            // _the_light` holds the two equal: the PBR bevels, the contact-shadow offsets
+            // and the raymarched shadows must agree about where the light is, or the
+            // window's shadows point two ways at once in a way nobody can name.
+            direction: [-0.32, -0.55, 0.77],
             share: 0.72,
             size_deg: 5.0,
         }
@@ -1823,5 +1847,55 @@ mod tests {
         let tokens = Tokens::embedded(Theme::Light).unwrap();
         assert_eq!(tokens.color("no/such/token"), Srgba::TRANSPARENT);
         assert_eq!(tokens.try_color("no/such/token"), None);
+    }
+
+    #[test]
+    fn the_rig_and_the_shader_agree_about_the_light() {
+        // The PBR bevels shade from `qs_gpu::frame::LIGHT_DIR`, the contact-shadow offsets
+        // displace along its negation, and the raymarched shadows march toward the rig's
+        // direction. One window, one light: the authored rig and the shader constant may
+        // only move together, and this is the test that makes drifting them a red build
+        // instead of a window whose shadows point two ways in a way nobody can name.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        assert_eq!(
+            tokens.lighting().rig.key.direction,
+            qs_gpu::frame::LIGHT_DIR,
+            "design/tokens.json's rig.key.direction diverged from qs_gpu::frame::LIGHT_DIR"
+        );
+        assert_eq!(KeyLightTokens::default().direction, qs_gpu::frame::LIGHT_DIR);
+    }
+
+    #[test]
+    fn a_scene_slab_carries_the_materials_allowance_and_a_bare_slab_carries_none() {
+        // The floor is how the contrast gate's closed-form worst case binds real frames:
+        // `Tokens::scene_slab` fills it from `lit_bounds` (per material, per theme), and
+        // the raw `Material::slab` leaves the safe 1.0 — a slab that skipped the allowance
+        // cannot be darkened at all, which fails visibly rather than fails legibility.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let surface = crate::material::Surface::new(0.0, 0.0, 100.0, 30.0, 6.0, 1.0);
+
+        let material = tokens.material(crate::material::name::ROW_BODY).unwrap();
+        let bare = material.slab(surface).unwrap();
+        assert!((bare.attenuation_floor - 1.0).abs() < f32::EPSILON);
+
+        let filled = tokens
+            .scene_slab(crate::material::name::ROW_BODY, surface)
+            .unwrap();
+        let expected = tokens.lit_bounds(material).attenuation.0;
+        assert!(
+            (filled.attenuation_floor - expected).abs() < f32::EPSILON,
+            "scene_slab carried {} where the allowance says {expected}",
+            filled.attenuation_floor
+        );
+        // The dark theme's text grounds afford full black (R13), so the row's floor is 0.
+        assert!((expected - 0.0).abs() < f32::EPSILON);
+
+        // And the light theme's is 0.87 — the per-theme half of rule 3a, on the slab.
+        let light = Tokens::embedded(Theme::Light).unwrap();
+        let light_floor = light
+            .scene_slab(crate::material::name::ROW_BODY, surface)
+            .unwrap()
+            .attenuation_floor;
+        assert!((light_floor - 0.87).abs() < 1e-6);
     }
 }

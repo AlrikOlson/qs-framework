@@ -126,7 +126,7 @@ use crate::frame::{DrawList, Fidelity, Floor, Instance, PrimKind};
 /// **If `instance.wgsl` changes, this must change with it.** Nothing enforces that
 /// automatically; what the suite does enforce is that the *set of primitives* on both
 /// sides matches, which is the drift that has actually happened.
-mod shader {
+pub(crate) mod shader {
     /// `const KIND_STROKE: u32 = 1u;` -- shader line 15.
     pub const KIND_STROKE: u32 = 1;
     /// `const KIND_GLYPH: u32 = 2u;` -- shader line 16.
@@ -642,6 +642,101 @@ mod shader {
         let top = texel(x0, y0) * (1.0 - fx) + texel(x0 + 1.0, y0) * fx;
         let bottom = texel(x0, y0 + 1.0) * (1.0 - fx) + texel(x0 + 1.0, y0 + 1.0) * fx;
         top * (1.0 - fy) + bottom * fy
+    }
+
+    // -- the lighting pass (T039), transcribed from `shaders/lighting.wgsl` -----------
+    //
+    // Function for function, constant for constant. If `lighting.wgsl` changes, this must
+    // change with it — the same standing rule the header states for `instance.wgsl`.
+
+    use crate::scene::Slab;
+
+    /// `SHADOW_STEPS` — shader constant.
+    pub const SHADOW_STEPS: u32 = 12;
+    /// `AO_SAMPLES` — shader constant.
+    pub const AO_SAMPLES: u32 = 4;
+    /// `AO_STRENGTH` — shader constant.
+    pub const AO_STRENGTH: f32 = 0.35;
+
+    /// `fn slab_distance` — the 2D rounded box extruded from `elevation - thickness` up to
+    /// `elevation`.
+    pub fn slab_distance(q: [f32; 3], slab: &Slab) -> f32 {
+        let centre = [
+            slab.rect[0] + slab.rect[2] * 0.5,
+            slab.rect[1] + slab.rect[3] * 0.5,
+        ];
+        let half = [slab.rect[2] * 0.5, slab.rect[3] * 0.5];
+        let d2 = sd_rounded_box([q[0] - centre[0], q[1] - centre[1]], half, slab.radius);
+        let half_thick = (slab.thickness * 0.5).max(0.5);
+        let dz = (q[2] - (slab.elevation - half_thick)).abs() - half_thick;
+        let outside = [d2.max(0.0), dz.max(0.0)];
+        d2.max(dz).min(0.0) + (outside[0] * outside[0] + outside[1] * outside[1]).sqrt()
+    }
+
+    /// `fn scene_distance` — the least distance to any slab.
+    pub fn scene_distance(q: [f32; 3], slabs: &[Slab]) -> f32 {
+        slabs
+            .iter()
+            .map(|slab| slab_distance(q, slab))
+            .fold(1e9, f32::min)
+    }
+
+    /// `fn soft_shadow` — `min(k * h / t)` along one ray toward the light (research R4).
+    pub fn soft_shadow(origin: [f32; 3], toward: [f32; 3], k: f32, slabs: &[Slab]) -> f32 {
+        let mut res = 1.0_f32;
+        let mut t = 0.35_f32;
+        for _ in 0..SHADOW_STEPS {
+            let q = [
+                origin[0] + toward[0] * t,
+                origin[1] + toward[1] * t,
+                origin[2] + toward[2] * t,
+            ];
+            let h = scene_distance(q, slabs);
+            res = res.min((k * h / t).clamp(0.0, 1.0));
+            t += h.clamp(0.5, 24.0);
+            if res < 0.005 || t > 400.0 {
+                break;
+            }
+        }
+        res.clamp(0.0, 1.0)
+    }
+
+    /// `fn occlusion` — bounded samples straight up, weights halving.
+    pub fn occlusion(origin: [f32; 3], slabs: &[Slab]) -> f32 {
+        let mut occ = 0.0_f32;
+        let mut weight = 0.5_f32;
+        for i in 1..=AO_SAMPLES {
+            let up = i as f32 * 3.0;
+            let d = scene_distance([origin[0], origin[1], origin[2] + up], slabs);
+            occ += weight * ((up - d) / up).clamp(0.0, 1.0);
+            weight *= 0.5;
+        }
+        occ.clamp(0.0, 1.0)
+    }
+
+    /// `fs_lit`, minus the blend: the attenuation the pass writes for pixel `p`.
+    ///
+    /// Includes the receiver scan (topmost slab under the pixel, rect containment) and the
+    /// allowance clamp — the line that makes the contrast gate's closed form a bound.
+    pub fn lit_attenuation(p: [f32; 2], slabs: &[Slab], toward: [f32; 3], k: f32) -> f32 {
+        let mut top = -1e9_f32;
+        let mut floor = 1.0_f32;
+        let mut found = false;
+        for slab in slabs {
+            let [x, y, w, h] = slab.rect;
+            if p[0] >= x && p[0] <= x + w && p[1] >= y && p[1] <= y + h && slab.elevation >= top {
+                top = slab.elevation;
+                floor = slab.attenuation_floor;
+                found = true;
+            }
+        }
+        if !found {
+            return 1.0;
+        }
+        let origin = [p[0], p[1], top + 0.5];
+        let mut atten = soft_shadow(origin, toward, k, slabs);
+        atten *= 1.0 - AO_STRENGTH * occlusion(origin, slabs);
+        atten.clamp(floor.clamp(0.0, 1.0), 1.0)
     }
 }
 
@@ -1949,6 +2044,176 @@ fn every_declared_scene_floor_is_exercised_and_held_exactly() {
             );
         }
     }
+}
+
+// A little scene for the lighting tests: the canvas, and one caster standing over it.
+fn lit_fixture(elevation: f32) -> Vec<crate::scene::Slab> {
+    use crate::scene::Slab;
+    let ground = Slab {
+        rect: [0.0, 0.0, 512.0, 512.0],
+        radius: 0.0,
+        elevation: 0.0,
+        thickness: 1.0,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    };
+    let caster = Slab {
+        rect: [96.0, 96.0, 128.0, 64.0],
+        radius: 6.0,
+        elevation,
+        thickness: elevation,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    };
+    vec![ground, caster]
+}
+
+#[test]
+fn a_caster_at_two_elevations_produces_penumbras_that_scale_with_height() {
+    // T032, against the ANALYTIC curve rather than a recorded array. For an edge at height
+    // `h` over a receiver, `min(k*h/t)` (research R4) makes the penumbra width at the
+    // receiver proportional to the distance the ray travels before passing the edge —
+    // which is proportional to `h`. That linearity IS SC-002: shadows must differ by
+    // height or elevation is not readable. The shadow term is probed directly, because
+    // `lit_attenuation` composes occlusion in and ambient darkening near the caster's wall
+    // would pollute a threshold count.
+    //
+    // A 20-degree light rather than the shipped 5: the mechanism under test is linearity,
+    // and a wider penumbra gives the fixed-step march more samples to resolve it with.
+    use crate::frame::LIGHT_DIR;
+
+    let k = crate::lighting::hardness(20.0);
+    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
+        + LIGHT_DIR[1] * LIGHT_DIR[1]
+        + LIGHT_DIR[2] * LIGHT_DIR[2])
+        .sqrt();
+    let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
+
+    // The shadow profile marching down-screen from under the caster's bottom edge
+    // (y = 160), through the shadow it throws, out into the light. 0.125 px steps so a
+    // narrow penumbra still spans many samples.
+    let profile = |elevation: f32| -> Vec<f32> {
+        let slabs = lit_fixture(elevation);
+        (0..480)
+            .map(|i| {
+                let y = 158.0 + i as f32 * 0.125;
+                shader::soft_shadow([160.0, y, 0.5], toward, k, &slabs)
+            })
+            .collect()
+    };
+    let width = |profile: &[f32]| -> usize {
+        profile.iter().filter(|&&a| a > 0.02 && a < 0.98).count()
+    };
+
+    let near = width(&profile(8.0));
+    let far = width(&profile(24.0));
+    assert!(
+        far > near && near > 0,
+        "a higher caster must throw a softer shadow: {near} penumbra samples at 8 px,          {far} at 24 px"
+    );
+    let ratio = far as f32 / near as f32;
+    assert!(
+        (1.6..=5.0).contains(&ratio),
+        "penumbra width should scale roughly linearly with elevation (analytic curve):          3x height gave {ratio:.2}x width ({near} -> {far} samples)"
+    );
+}
+
+#[test]
+fn the_shadow_lands_where_the_contact_shadow_offset_already_points() {
+    // One light, everywhere: `GeometryDef::offset` displaces contact shadows along
+    // `shadow_direction()`, and the raymarched shadow must fall the same way — down and to
+    // the right — or the window's shadows point two ways at once. The rig test in qs-ui
+    // holds the tokens to LIGHT_DIR; this holds the march to it.
+    use crate::frame::{LIGHT_DIR, shadow_direction};
+
+    let k = crate::lighting::hardness(5.0);
+    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
+        + LIGHT_DIR[1] * LIGHT_DIR[1]
+        + LIGHT_DIR[2] * LIGHT_DIR[2])
+        .sqrt();
+    let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
+    let slabs = lit_fixture(16.0);
+
+    // A caster at 16 px reaches roughly 0.8 x 16 = 13 px past its edge. Sample inside that
+    // reach on the shadow side (down-right of the bottom edge), and mirrored on the light
+    // side (up-left of the top edge), where the same wall proximity gives the same
+    // occlusion but no shadow.
+    let direction = shadow_direction();
+    assert!(
+        direction[0] > 0.0 && direction[1] > 0.0,
+        "the shipped light is up-and-left"
+    );
+    let shade = shader::soft_shadow([166.0, 168.0, 0.5], toward, k, &slabs);
+    let lit = shader::soft_shadow([154.0, 88.0, 0.5], toward, k, &slabs);
+    assert!(
+        shade < lit,
+        "the raymarched shadow falls opposite `shadow_direction()`: shadow side {shade},          light side {lit}"
+    );
+}
+
+#[test]
+fn the_allowance_floor_bounds_the_attenuation_per_slab() {
+    // The clamp is the contrast gate's closed-form claim being true on real frames
+    // (lit-contrast rules 1a/3a). A receiver directly under the caster, floored at 0.87 —
+    // the light theme's text-ground allowance — may not darken past it, however hard the
+    // geometry shadows it.
+    use crate::frame::LIGHT_DIR;
+    let k = crate::lighting::hardness(5.0);
+    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
+        + LIGHT_DIR[1] * LIGHT_DIR[1]
+        + LIGHT_DIR[2] * LIGHT_DIR[2])
+        .sqrt();
+    let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
+    let mut slabs = lit_fixture(24.0);
+    slabs[0].attenuation_floor = 0.87;
+
+    // Deep in the caster's shadow: a 24 px caster reaches ~20 px past its edge along
+    // the shadow direction, so (170, 175) sits in the umbra.
+    let atten = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k);
+    assert!(
+        atten >= 0.87,
+        "the shader may not exceed the allowance: floor 0.87, attenuation {atten}"
+    );
+
+    slabs[0].attenuation_floor = 0.0;
+    let free = shader::lit_attenuation([170.0, 175.0], &slabs, toward, k);
+    assert!(
+        free <= atten,
+        "with the floor released the same pixel should be at least as dark"
+    );
+}
+
+#[test]
+fn the_lighting_shader_and_its_transcription_state_the_same_bounds() {
+    // The lighting half of `the_transcription_matches_the_shader_source`: every constant
+    // and function the transcription mirrors must exist in the WGSL, and no derivative may
+    // — the CPU side cannot reproduce one, and the header forbids them by name.
+    let source = include_str!("shaders/lighting.wgsl");
+    for needle in [
+        "fn slab_distance",
+        "fn scene_distance",
+        "fn soft_shadow",
+        "fn occlusion",
+        "fn sd_rounded_box",
+        "const LIT_SLABS: u32 = 192u",
+        "const SHADOW_STEPS: u32 = 12u",
+        "const AO_SAMPLES: u32 = 4u",
+        "const AO_STRENGTH: f32 = 0.35",
+    ] {
+        assert!(
+            source.contains(needle),
+            "lighting.wgsl has no `{needle}`; the transcription describes a shader that \
+             does not exist"
+        );
+    }
+    assert!(
+        !source.contains("fwidth(") && !source.contains("dpdx(") && !source.contains("dpdy("),
+        "a derivative reached lighting.wgsl, which the CPU transcription cannot reproduce"
+    );
+    assert_eq!(crate::lighting::LIT_SLABS, 192);
+    assert_eq!(shader::SHADOW_STEPS, 12);
+    assert_eq!(shader::AO_SAMPLES, 4);
+    assert!((shader::AO_STRENGTH - 0.35).abs() < f32::EPSILON);
 }
 
 #[test]

@@ -73,6 +73,20 @@ fn linear(tokens: &Tokens, name: &str) -> [f32; 3] {
     ]
 }
 
+/// The key light as this shader spells it, from the rig: direction toward the light and
+/// the penumbra hardness `1 / tan(size / 2)` — one light for the whole product.
+fn rig_light(tokens: &Tokens) -> [f32; 4] {
+    let key = tokens.lighting().rig.key;
+    let d = key.direction;
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
+    [
+        d[0] / len,
+        d[1] / len,
+        d[2] / len,
+        1.0 / (key.size_deg.to_radians() * 0.5).tan().max(1e-4),
+    ]
+}
+
 fn slab(
     centre: [f32; 3],
     half: [f32; 3],
@@ -89,95 +103,89 @@ fn slab(
     }
 }
 
-/// One window's worth of interface, as slabs.
+/// One window's worth of interface, from the REAL scene (T005).
 ///
-/// Elevations are the proposal's token scale, in physical pixels: the canvas is the ground,
-/// a row stands a little off it, the selected row stands well off it, and the command bar
-/// stands off everything. Those four numbers are the entire third dimension.
+/// Promoted from the hand-built spike: the slabs now come from `qs_ui::scene::SceneBuilder`
+/// over the shipped materials, so the elevations are the authored scale in
+/// `design/tokens.json` and the allowances ride along — the preview can no longer drift
+/// from what the application actually publishes. What is still local: the conversion into
+/// this shader's own slab layout, and one **US2 preview** override marked below.
 fn build(tokens: &Tokens) -> Vec<Slab> {
+    use qs_ui::material::{Surface, name};
+    use qs_ui::scene::SceneBuilder;
+
     let px = |logical: f32| logical * SCALE;
-    let w = WIDTH as f32;
-    let mut out = Vec::new();
+    let (w, h) = (WIDTH as f32, HEIGHT as f32);
+    let mut builder = SceneBuilder::new(1, [w, h], 64.0, Default::default());
+    let mut admit = |material: &str, surface: Surface| {
+        if let Some(slab) = tokens.scene_slab(material, surface) {
+            builder.admit(slab);
+        }
+    };
 
-    // The canvas: the ground plane everything casts onto. Its top face is z = 0.
-    out.push(slab(
-        [w * 0.5, HEIGHT as f32 * 0.5, -60.0],
-        [w * 0.5, HEIGHT as f32 * 0.5, 60.0],
-        0.0,
-        linear(tokens, "surface/base"),
-        0.92,
-        0.0,
-    ));
-
-    // The command bar, standing well off the canvas -- which is what a bar has always been
-    // claiming with its drop shadow, now stated as a number.
+    // The same arrangement the spike drew, painted with the shipped materials.
+    admit(name::SURFACE_CANVAS, Surface::new(0.0, 0.0, w, h, 0.0, SCALE));
     let bar_h = px(44.0);
-    out.push(slab(
-        [w * 0.5, bar_h * 0.5, 14.0],
-        [w * 0.5, bar_h * 0.5, 14.0],
-        0.0,
-        linear(tokens, "surface/overlay-lift"),
-        0.55,
-        0.08,
-    ));
+    admit(name::CHROME_BAR, Surface::new(0.0, 0.0, w, bar_h, 0.0, SCALE));
+    admit(
+        name::CHROME_CHIP_HOVER,
+        Surface::new(px(70.0), bar_h * 0.5 - px(13.0), px(78.0), px(26.0), px(6.0), SCALE),
+    );
 
-    // A hovered chip on the bar, higher again.
-    let chip_w = px(78.0);
-    let chip_h = px(26.0);
-    out.push(slab(
-        [px(70.0) + chip_w * 0.5, bar_h * 0.5, 34.0],
-        [chip_w * 0.5, chip_h * 0.5, 6.0],
-        px(6.0),
-        linear(tokens, "content/on-overlay"),
-        0.22,
-        0.15,
-    ));
-
-    // The list.
     let row_x = px(14.0);
     let row_w = w - row_x * 2.0;
     let row_h = px(30.0);
     let top = bar_h + px(26.0);
-    let radius = px(6.0);
-
     for i in 0..7u32 {
-        let cy = top + i as f32 * (row_h + px(5.0)) + row_h * 0.5;
-        let (elevation, thickness, albedo, rough) = match i {
-            2 => (10.0, 5.0, linear(tokens, "surface/row-hover"), 0.55),
-            4 => (30.0, 10.0, linear(tokens, "surface/row-selected"), 0.34),
-            _ => (4.0, 2.0, linear(tokens, "surface/row-alt"), 0.8),
+        let y = top + i as f32 * (row_h + px(5.0));
+        let surface = Surface::new(row_x, y, row_w, row_h, px(6.0), SCALE);
+        let material = match i {
+            2 => name::ROW_HOVER,
+            4 => name::ROW_SELECTED,
+            _ if i % 2 == 1 => name::ROW_BODY_ALT,
+            _ => name::ROW_BODY,
         };
-        let mut s = slab(
-            [w * 0.5, cy, elevation - thickness],
-            [row_w * 0.5, row_h * 0.5, thickness],
-            radius,
-            albedo,
-            rough,
-            0.0,
-        );
-        if i == 4 {
-            // STATE AS LIGHT. The selected row does not merely look different, it *emits*,
-            // so the rows around it and the canvas beneath pick up the accent. That is the
-            // idea worth building the demo around: you notice the room has changed colour
-            // before you have found the row that changed it.
-            let accent = linear(tokens, "border/focus");
-            s.emissive = [accent[0], accent[1], accent[2], 1.5];
-        }
-        out.push(s);
+        admit(material, surface);
     }
-
-    // The status shelf.
     let shelf_h = px(26.0);
-    out.push(slab(
-        [w * 0.5, HEIGHT as f32 - shelf_h * 0.5, 12.0],
-        [w * 0.5, shelf_h * 0.5, 12.0],
-        0.0,
-        linear(tokens, "surface/overlay-lift"),
-        0.6,
-        0.08,
-    ));
+    admit(
+        name::CHROME_SHELF,
+        Surface::new(0.0, h - shelf_h, w, shelf_h, 0.0, SCALE),
+    );
 
-    out
+    let scene = builder.finish();
+    let accent = linear(tokens, "border/focus");
+    let selected = tokens
+        .material(name::ROW_SELECTED)
+        .map(|m| m.elevation * SCALE)
+        .unwrap_or(0.0);
+    scene
+        .slabs
+        .iter()
+        .map(|s| {
+            let half_thick = (s.thickness * 0.5).max(0.5);
+            let mut converted = slab(
+                [
+                    s.rect[0] + s.rect[2] * 0.5,
+                    s.rect[1] + s.rect[3] * 0.5,
+                    s.elevation - half_thick,
+                ],
+                [s.rect[2] * 0.5, s.rect[3] * 0.5, half_thick],
+                s.radius,
+                s.albedo,
+                s.roughness,
+                s.metalness,
+            );
+            // A US2 PREVIEW, marked as one: emission is not authored on any material yet
+            // (T050 is US2's task), and the emissive selection is the idea this preview
+            // exists to look at. The override names the elevation it keys on so it breaks
+            // loudly if the selected row's step changes.
+            if (s.elevation - selected).abs() < 0.01 && selected > 0.0 && s.rect[3] < 100.0 {
+                converted.emissive = [accent[0], accent[1], accent[2], 1.5];
+            }
+            converted
+        })
+        .collect()
 }
 
 fn main() {
@@ -231,7 +239,7 @@ fn main() {
                     viewport: [TILE_W as f32, TILE_H as f32],
                     count: slabs.len() as u32,
                     flags: FLAG_SHADOW | FLAG_AO | FLAG_BOUNCE,
-                    light: [-0.42, -0.62, 0.66, 5.0],
+                    light: rig_light(&tokens),
                     env_horizon: [horizon[0], horizon[1], horizon[2], 1.0],
                     env_zenith: [sky(lift[0]), sky(lift[1]), sky(lift[2]), 1.0],
                     focus: [0.0, 0.0, 0.0, 0.0],
@@ -265,10 +273,9 @@ fn main() {
             viewport: [WIDTH as f32, HEIGHT as f32],
             count: slabs.len() as u32,
             flags,
-            // Toward the light: above and to the left, and `w` is the penumbra hardness --
-            // the inverse of the light's angular size, so a smaller number is a broader lamp
-            // and a softer shadow.
-            light: [-0.42, -0.62, 0.66, 5.0],
+            // Toward the light, from the rig — the same direction the PBR bevels, the
+            // contact shadows and the shipped raymarch use. `w` is the penumbra hardness.
+            light: rig_light(&tokens),
             env_horizon: [horizon[0], horizon[1], horizon[2], 1.0],
             env_zenith: [zenith[0], zenith[1], zenith[2], 1.0],
             // The focus lamp, parked over the selected row.
