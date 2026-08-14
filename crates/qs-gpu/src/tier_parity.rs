@@ -682,6 +682,9 @@ pub(crate) mod shader {
     pub const AO_SAMPLES: u32 = 4;
     /// `AO_STRENGTH` — shader constant.
     pub const AO_STRENGTH: f32 = 0.35;
+    /// `BOUNCE_REACH` — shader constant. How far bounced light reaches before it has fallen
+    /// to a quarter, in physical pixels.
+    pub const BOUNCE_REACH: f32 = 90.0;
 
     /// `fn slab_distance` — the 2D rounded box extruded from `elevation - thickness` up to
     /// `elevation`.
@@ -726,6 +729,29 @@ pub(crate) mod shader {
         res.clamp(0.0, 1.0)
     }
 
+    /// `fn bounce_shadow` — visibility along a segment of known, finite length.
+    ///
+    /// Fixed steps across the segment rather than [`soft_shadow`]'s distance-driven march:
+    /// a bounce ray skims its own receiver, so the scene distance never grows and the
+    /// adaptive march spends its whole budget inside ~17 px of a 90 px reach.
+    pub fn bounce_shadow(origin: [f32; 3], toward: [f32; 3], d: f32, k: f32, slabs: &[Slab]) -> f32 {
+        let mut res = 1.0_f32;
+        for i in 1..=SHADOW_STEPS {
+            let t = d * i as f32 / (SHADOW_STEPS + 1) as f32;
+            let q = [
+                origin[0] + toward[0] * t,
+                origin[1] + toward[1] * t,
+                origin[2] + toward[2] * t,
+            ];
+            let h = scene_distance(q, slabs);
+            res = res.min((k * h / t).clamp(0.0, 1.0));
+            if res < 0.005 {
+                break;
+            }
+        }
+        res.clamp(0.0, 1.0)
+    }
+
     /// `fn occlusion` — bounded samples straight up, weights halving.
     pub fn occlusion(origin: [f32; 3], slabs: &[Slab]) -> f32 {
         let mut occ = 0.0_f32;
@@ -739,29 +765,103 @@ pub(crate) mod shader {
         occ.clamp(0.0, 1.0)
     }
 
+    /// `fn bounce` — one-bounce light from every emitting slab onto `receiver`.
+    ///
+    /// The nearest point on the emitter's top face is what the receiver sees, so a full-width
+    /// row lights like a strip rather than like a bulb over its centre. Falloff is the
+    /// shader's bounded inverse-square, the receiver's upward normal gives the cosine term,
+    /// and the shadow ray toward the emitter is what makes the light **occluded** — a
+    /// surface hidden behind something taller receives nothing.
+    pub fn bounce(origin: [f32; 3], receiver: usize, slabs: &[Slab], k: f32) -> [f32; 3] {
+        let mut added = [0.0_f32; 3];
+        for (i, slab) in slabs.iter().enumerate() {
+            if slab.emission_strength <= 0.0 || i == receiver {
+                continue;
+            }
+            let [x, y, w, h] = slab.rect;
+            // Nearest point on the emitter's top face.
+            let q = [origin[0].clamp(x, x + w), origin[1].clamp(y, y + h)];
+            let to_light = [
+                q[0] - origin[0],
+                q[1] - origin[1],
+                slab.elevation - origin[2],
+            ];
+            let d = (to_light[0] * to_light[0] + to_light[1] * to_light[1]
+                + to_light[2] * to_light[2])
+                .sqrt();
+            if d > BOUNCE_REACH * 2.0 {
+                continue;
+            }
+            let n_dot_l = (to_light[2] / d.max(0.001)).clamp(0.0, 1.0);
+            let falloff = 1.0 / (1.0 + (d / BOUNCE_REACH) * (d / BOUNCE_REACH));
+            let toward = [
+                to_light[0] / d.max(0.001),
+                to_light[1] / d.max(0.001),
+                to_light[2] / d.max(0.001),
+            ];
+            let shade = bounce_shadow(origin, toward, d, k, slabs);
+            let gain = slab.emission_strength * falloff * n_dot_l * shade;
+            for (channel, emitted) in added.iter_mut().zip(slab.emission) {
+                *channel += emitted * gain;
+            }
+        }
+        added
+    }
+
+    /// `fs_lit`'s receiver scan: the topmost slab under the pixel, by rect containment.
+    ///
+    /// Deliberately ignoring the corner radius, exactly as the shader does. Shared by both
+    /// halves of the fragment so the two cannot disagree about which surface is being lit —
+    /// a second copy of this scan is how a bounce lands on one slab's allowance while the
+    /// attenuation is clamped to another's.
+    fn receiver_at(p: [f32; 2], slabs: &[Slab]) -> Option<(usize, f32, f32, f32)> {
+        let mut found: Option<(usize, f32, f32, f32)> = None;
+        let mut top = -1e9_f32;
+        for (i, slab) in slabs.iter().enumerate() {
+            let [x, y, w, h] = slab.rect;
+            if p[0] >= x && p[0] <= x + w && p[1] >= y && p[1] <= y + h && slab.elevation >= top {
+                top = slab.elevation;
+                found = Some((i, top, slab.attenuation_floor, slab.addition_max));
+            }
+        }
+        found
+    }
+
     /// `fs_lit`, minus the blend: the attenuation the pass writes for pixel `p`.
     ///
     /// Includes the receiver scan (topmost slab under the pixel, rect containment) and the
     /// allowance clamp — the line that makes the contrast gate's closed form a bound.
     pub fn lit_attenuation(p: [f32; 2], slabs: &[Slab], toward: [f32; 3], k: f32) -> f32 {
-        let mut top = -1e9_f32;
-        let mut floor = 1.0_f32;
-        let mut found = false;
-        for slab in slabs {
-            let [x, y, w, h] = slab.rect;
-            if p[0] >= x && p[0] <= x + w && p[1] >= y && p[1] <= y + h && slab.elevation >= top {
-                top = slab.elevation;
-                floor = slab.attenuation_floor;
-                found = true;
-            }
-        }
-        if !found {
+        let Some((_, top, floor, _)) = receiver_at(p, slabs) else {
             return 1.0;
-        }
+        };
         let origin = [p[0], p[1], top + 0.5];
         let mut atten = soft_shadow(origin, toward, k, slabs);
         atten *= 1.0 - AO_STRENGTH * occlusion(origin, slabs);
         atten.clamp(floor.clamp(0.0, 1.0), 1.0)
+    }
+
+    /// `fs_lit`'s other half: the light the pass **adds** at pixel `p`, per channel.
+    ///
+    /// Clamped to the receiver's own `addition_max`, per channel, which is the arithmetic
+    /// form of lit-contrast rule 1a: a text ground's allowance is zero, so a filename's
+    /// background is untouched however hard the row beside it glows. Per channel rather than
+    /// on the magnitude, so a coloured bounce cannot exceed the allowance by arriving as
+    /// three components that individually fit and jointly do not.
+    pub fn lit_addition(p: [f32; 2], slabs: &[Slab], k: f32) -> [f32; 3] {
+        let Some((receiver, top, _, take)) = receiver_at(p, slabs) else {
+            return [0.0; 3];
+        };
+        if take <= 0.0 {
+            return [0.0; 3];
+        }
+        let origin = [p[0], p[1], top + 0.5];
+        let added = bounce(origin, receiver, slabs, k);
+        [
+            added[0].clamp(0.0, take),
+            added[1].clamp(0.0, take),
+            added[2].clamp(0.0, take),
+        ]
     }
 }
 
@@ -2020,15 +2120,104 @@ fn zero_contribution() -> Surface {
     }
 }
 
-/// The lighting pass as it exists today: no shaders, no contribution, on any tier.
+/// The lighting pass's contribution for one effect on one tier, through the **real**
+/// transcription rather than a stub.
 ///
-/// Not a stub pretending to be a pass — this **is** the pass's current declared behaviour,
-/// which is what lets contract rule 5 ("every rung exercised on every build") hold from
-/// the first build instead of the last. US1's transcriptions (T039) replace this with the
-/// real per-effect maths, and T041's fixtures feed real scenes through it; this function
-/// is the seam they land in.
-fn lit_contribution(_effect: SceneEffect, _tier: RenderPath) -> Surface {
-    zero_contribution()
+/// This function used to return zero for every effect on every tier, which was honest while
+/// no shader existed and became vacuous the moment one did: `scene_effect_holds_its_floor`
+/// only compares when the floor is `Nothing`, so a contribution that is zero everywhere
+/// compares zero against zero and the sweep passes without touching the pass. The fixture is
+/// what makes the comparison mean something — a scene that genuinely produces the effect, so
+/// a tier that declares `Nothing` is asserted to have dropped something that was there.
+///
+/// The tier gate is [`SceneEffect::draws`] rather than a match, so a tier's answer comes from
+/// the same declaration the floor does and the two cannot drift apart.
+fn lit_contribution(effect: SceneEffect, tier: RenderPath) -> Surface {
+    let mut surface = zero_contribution();
+    if !effect.draws(tier) {
+        return surface;
+    }
+    let slabs = effect_fixture(effect);
+    let k = crate::lighting::hardness(5.0);
+    let toward = normalized_light();
+    for y in 0..SURFACE {
+        for x in 0..SURFACE {
+            let p = [x as f32 + 0.5, y as f32 + 0.5];
+            let value = match effect {
+                // The two that ride the attenuation channel. Recorded as the pass's
+                // departure from 1.0, so an untouched pixel is zero and the floor's
+                // expected image is the zero surface without a special case.
+                SceneEffect::Shadow | SceneEffect::Occlusion => {
+                    let atten = shader::lit_attenuation(p, &slabs, toward, k);
+                    [1.0 - atten, 0.0, 0.0, 0.0]
+                }
+                // The additive one, per channel.
+                SceneEffect::Bounce => {
+                    let added = shader::lit_addition(p, &slabs, k);
+                    [added[0], added[1], added[2], 0.0]
+                }
+                // Nothing draws refraction yet: US4's shader (T069) is unwritten, so the
+                // honest contribution is zero and this arm is the seam it lands in. Stated
+                // rather than silent, because a zero here is indistinguishable from a
+                // dropped effect and the difference is the whole point of the sweep.
+                SceneEffect::Refraction => [0.0; 4],
+            };
+            surface.pixels[(y * SURFACE + x) as usize] = value;
+        }
+    }
+    surface
+}
+
+/// The shipped key light, normalized — the direction every lighting fixture marches along.
+fn normalized_light() -> [f32; 3] {
+    use crate::frame::LIGHT_DIR;
+    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
+        + LIGHT_DIR[1] * LIGHT_DIR[1]
+        + LIGHT_DIR[2] * LIGHT_DIR[2])
+        .sqrt();
+    [
+        LIGHT_DIR[0] / len,
+        LIGHT_DIR[1] / len,
+        LIGHT_DIR[2] / len,
+    ]
+}
+
+/// A scene that genuinely produces `effect`, sized to the `SURFACE` x `SURFACE` fixture.
+///
+/// One per effect rather than one shared scene: a scene that casts a shadow does not
+/// necessarily emit, and a fixture that produced nothing would make its floor assertion
+/// vacuous in exactly the way this whole function exists to stop.
+fn effect_fixture(effect: SceneEffect) -> Vec<crate::scene::Slab> {
+    use crate::scene::Slab;
+    let ground = Slab {
+        rect: [0.0, 0.0, SURFACE as f32, SURFACE as f32],
+        radius: 0.0,
+        elevation: 0.0,
+        thickness: 1.0,
+        attenuation_floor: 0.0,
+        // The ground is what receives the bounce; a zero allowance here would make the
+        // additive fixture produce nothing and pass for the wrong reason.
+        addition_max: 1.0,
+        ..Slab::default()
+    };
+    let mut caster = Slab {
+        rect: [
+            SURFACE as f32 * 0.25,
+            SURFACE as f32 * 0.25,
+            SURFACE as f32 * 0.5,
+            SURFACE as f32 * 0.25,
+        ],
+        radius: 2.0,
+        elevation: 12.0,
+        thickness: 12.0,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    };
+    if effect == SceneEffect::Bounce {
+        caster.emission = [1.0, 0.8, 0.4];
+        caster.emission_strength = 1.0;
+    }
+    vec![ground, caster]
 }
 
 /// Whether `draw`'s output on `tier` is **exactly** the floor `effect` declares.
@@ -2221,10 +2410,13 @@ fn the_lighting_shader_and_its_transcription_state_the_same_bounds() {
         "fn soft_shadow",
         "fn occlusion",
         "fn sd_rounded_box",
+        "fn bounce",
+        "fn bounce_shadow",
         "const LIT_SLABS: u32 = 192u",
         "const SHADOW_STEPS: u32 = 12u",
         "const AO_SAMPLES: u32 = 4u",
         "const AO_STRENGTH: f32 = 0.35",
+        "const BOUNCE_REACH: f32 = 90.0",
     ] {
         assert!(
             source.contains(needle),
@@ -2256,6 +2448,101 @@ fn the_scene_floor_harness_can_go_red() {
         !scene_effect_holds_its_floor(SceneEffect::Bounce, RenderPath::Reduced, wrong),
         "a contribution where the floor declares Nothing was accepted — the harness \
          cannot detect the failure it exists for"
+    );
+}
+
+#[test]
+fn a_floored_effect_drops_something_that_was_actually_there() {
+    // T055's real content, and the assertion that stops the sweep above from passing for the
+    // wrong reason. `scene_effect_holds_its_floor` compares nothing at all on a tier that
+    // draws the effect in full, so a contribution function that returned zero everywhere
+    // would satisfy every declared `Nothing` floor by never producing anything to drop. This
+    // asserts the other half: on the lowest tier that DOES draw it, the fixture's
+    // contribution is non-zero.
+    //
+    // Refraction is excluded by name rather than by a general skip, because its shader (T069)
+    // is unwritten and a blanket "skip the empty ones" would silently re-admit exactly the
+    // vacuity this test exists to close once bounce or shadow regressed to nothing.
+    for effect in SceneEffect::ALL {
+        if effect == SceneEffect::Refraction {
+            continue;
+        }
+        let tier = effect.requires();
+        assert!(
+            effect.draws(tier),
+            "{effect:?} does not draw on the tier it says it requires"
+        );
+        let drawn = lit_contribution(effect, tier);
+        let energy: f32 = drawn.pixels.iter().map(|p| p[0] + p[1] + p[2]).sum();
+        assert!(
+            energy > 0.0,
+            "{effect:?} contributes nothing on {tier:?}, the lowest tier that draws it — \
+             every floor assertion for it is therefore comparing nothing against nothing"
+        );
+
+        // And the floor below it drops that contribution entirely.
+        for lower in [RenderPath::Reduced, RenderPath::Cpu] {
+            if effect.floor(lower) == Some(SceneFloor::Nothing) {
+                assert!(
+                    scene_effect_holds_its_floor(effect, lower, lit_contribution),
+                    "{effect:?} on {lower:?} declares Nothing and drew something"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bounce_is_occluded_by_what_stands_between_the_emitter_and_the_receiver() {
+    // T047. The contract's word is "occluded", and the difference between an occluded bounce
+    // and an unoccluded one is not cosmetic: an unoccluded bounce leaks the selected row's
+    // light through the interface's own geometry, so a surface visibly behind something
+    // taller glows anyway. That reads as a rendering fault rather than as light.
+    //
+    // The control is the same scene with the obstruction removed — measuring one number and
+    // asserting it is small would pass on a scene that was too far away to be lit at all.
+    use crate::scene::Slab;
+    let k = crate::lighting::hardness(5.0);
+
+    let ground = Slab {
+        rect: [0.0, 0.0, 512.0, 512.0],
+        elevation: 0.0,
+        thickness: 1.0,
+        attenuation_floor: 0.0,
+        addition_max: 1.0,
+        ..Slab::default()
+    };
+    let emitter = Slab {
+        rect: [0.0, 100.0, 40.0, 40.0],
+        elevation: 10.0,
+        thickness: 10.0,
+        attenuation_floor: 0.0,
+        emission: [1.0, 1.0, 1.0],
+        emission_strength: 1.0,
+        ..Slab::default()
+    };
+    // Tall, thin, and directly between the emitter and the sample point.
+    let wall = Slab {
+        rect: [60.0, 90.0, 10.0, 60.0],
+        elevation: 60.0,
+        thickness: 60.0,
+        attenuation_floor: 0.0,
+        ..Slab::default()
+    };
+
+    let sample = [100.0, 120.0];
+    let open = shader::lit_addition(sample, &[ground, emitter], k);
+    let blocked = shader::lit_addition(sample, &[ground, emitter, wall], k);
+
+    assert!(
+        open[0] > 0.0,
+        "the control scene lights nothing, so the occlusion assertion below would hold \
+         for a scene with no light in it: {open:?}"
+    );
+    assert!(
+        blocked[0] < open[0] * 0.1,
+        "a receiver behind an obstruction still took the emitter's light: {blocked:?} \
+         behind the wall against {open:?} with it removed"
     );
 }
 

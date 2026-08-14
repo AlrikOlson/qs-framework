@@ -1929,6 +1929,189 @@ mod tests {
         );
     }
 
+    /// Every shipped material that is a **light source**, by the same test the scene builder
+    /// uses to decide what emits: a layer that declares both a colour and a strength.
+    ///
+    /// Derived rather than listed. A hand-written list of emitting states is a second answer
+    /// to "what emits", and the failure it produces is the quiet one — a state authored as a
+    /// lamp after this test was written, checked by nothing.
+    fn emitting_materials(tokens: &Tokens) -> Vec<(&'static str, &Material)> {
+        name::ALL
+            .iter()
+            .filter_map(|&n| tokens.material(n).map(|m| (n, m)))
+            .filter(|(_, m)| {
+                m.layers
+                    .iter()
+                    .any(|l| l.emits_strength > 0.0 && l.emits.a > 0.0)
+            })
+            .collect()
+    }
+
+    /// The inverse of [`Srgba::to_premul_linear_rgba8`], written independently of it.
+    ///
+    /// An instance carries its colour packed, and `cpu_floor` passes that field through
+    /// untouched — so recovering it is the only way to ask what the CPU tier actually draws
+    /// rather than what the token file hoped it would. Written as the inverse rather than by
+    /// comparing against a re-encoded candidate, for the reason `drop.rs`'s `unquote` is: a
+    /// comparison against a value the same file just built agrees with itself.
+    fn unpack_premul_linear(packed: u32) -> Srgba {
+        let byte = |shift: u32| f32::from(((packed >> shift) & 0xFF) as u8) / 255.0;
+        let a = byte(24);
+        let un = |c: f32| {
+            if a <= 0.0 {
+                0.0
+            } else {
+                qs_gpu::color::linear_to_srgb((c / a).clamp(0.0, 1.0))
+            }
+        };
+        Srgba {
+            r: un(byte(0)),
+            g: un(byte(8)),
+            b: un(byte(16)),
+            a,
+        }
+    }
+
+    /// WCAG 2.1 SC 1.4.11 (non-text contrast): the floor for a user-interface component or a
+    /// state indicator against what is next to it.
+    ///
+    /// Cited rather than chosen. A threshold picked here would be a number that moves when a
+    /// material fails it, which is the failure mode `cargo xtask contrast` exists to prevent
+    /// one level up.
+    const STATE_CUE_MIN: f32 = 3.0;
+
+    /// The strongest contrast this material's CPU-tier drawing reaches against `ground`.
+    ///
+    /// Goes through `compile` and `Instance::cpu_floor` — the authority on what a tier draws
+    /// — rather than reading the token file's layers, because the two can disagree and the
+    /// disagreement is exactly what a fallback bug is.
+    fn cpu_cue_against(material: &Material, ground: Srgba) -> f32 {
+        let mut out = Vec::new();
+        material.compile(surface(), 1.0, Drive::REST, true, &mut out);
+        out.iter()
+            .filter_map(Instance::cpu_floor)
+            .map(|i| unpack_premul_linear(i.color).over(ground).contrast_ratio(ground))
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn every_lit_state_is_also_drawn_unlit() {
+        // T048 — FR-026, SC-006. The claim is not that the fallback looks as good; it is that
+        // the fallback still SAYS THE SAME THING. A state carried only by emitted light is
+        // invisible on the two tiers that declare `SceneFloor::Nothing` for bounce, and on
+        // every machine in forced-colours mode.
+        //
+        // This is not hypothetical for the material it currently finds. `row/selected` became
+        // a lamp and lost its status rail in the same commit, so the question "what is left
+        // when nothing can light" had a new answer and nothing was asking it.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        let emitting = emitting_materials(&tokens);
+        assert!(
+            !emitting.is_empty(),
+            "no material emits, so this test is checking nothing — if emission was removed \
+             on purpose, remove this test with it rather than leaving it green"
+        );
+
+        for (theme, name) in [Theme::Dark, Theme::Light]
+            .into_iter()
+            .flat_map(|t| emitting.iter().map(move |(n, _)| (t, *n)))
+        {
+            let tokens = Tokens::embedded(theme).unwrap();
+            let material = tokens.material(name).unwrap();
+
+            // 1. Something survives the floor at all.
+            let mut out = Vec::new();
+            material.compile(surface(), 1.0, Drive::REST, true, &mut out);
+            let floored: Vec<Instance> = out.iter().filter_map(Instance::cpu_floor).collect();
+            assert!(
+                !floored.is_empty(),
+                "{name} on {theme:?} draws nothing at all on the CPU tier, so the state it \
+                 carries is conveyed by light and by nothing else"
+            );
+
+            // 2. And what survives is legible as a cue against every ground it is painted
+            //    over — not merely present, which a transparent instance also satisfies.
+            assert!(
+                !material.over.is_empty(),
+                "{name} declares no `over`, so there is nothing to be a cue against"
+            );
+            for base in &material.over {
+                let ground = tokens.color(base);
+                let ratio = cpu_cue_against(material, ground);
+                assert!(
+                    ratio >= STATE_CUE_MIN,
+                    "{name} over {base} on {theme:?}: the CPU tier's strongest cue is \
+                     {ratio:.2}:1, under the {STATE_CUE_MIN}:1 non-text floor. The state is \
+                     readable only when the machine can light it."
+                );
+            }
+
+            // 3. And the unlit form is not merely the lit form with the light removed: with
+            //    effects off entirely — forced colours — it still draws.
+            let mut forced = Vec::new();
+            material.compile(surface(), 1.0, Drive::REST, false, &mut forced);
+            assert!(
+                !forced.is_empty(),
+                "{name} on {theme:?} draws nothing in forced-colours mode"
+            );
+        }
+    }
+
+    #[test]
+    fn an_emitting_state_is_identifiable_in_both_themes() {
+        // T049 — research R6. The dark theme reflects less, so the same authored emission
+        // buys less visible bounce there; a state tuned until it read on the light theme can
+        // land under the noise on the dark one. The two themes are therefore checked
+        // separately and against each other, not averaged.
+        let dark = Tokens::embedded(Theme::Dark).unwrap();
+        let light = Tokens::embedded(Theme::Light).unwrap();
+
+        for (name, _) in emitting_materials(&dark) {
+            let mut ratios = Vec::new();
+            for (theme, tokens) in [("dark", &dark), ("light", &light)] {
+                let material = tokens.material(name).unwrap();
+                // The worst ground the material declares, since a cue only has to fail
+                // against one of them to be a state somebody cannot find.
+                let worst = material
+                    .over
+                    .iter()
+                    .map(|base| cpu_cue_against(material, tokens.color(base)))
+                    .fold(f32::INFINITY, f32::min);
+                assert!(
+                    worst >= STATE_CUE_MIN,
+                    "{name} is not identifiable in the {theme} theme: worst ground gives \
+                     {worst:.2}:1"
+                );
+                ratios.push((theme, worst));
+
+                // And the emission itself is not what is carrying it: the peak the gate
+                // bounds is a property of the theme's own palette, and a state whose lit and
+                // unlit forms differ in KIND rather than in degree is two designs.
+                let peak = material.emission_peak();
+                assert!(
+                    peak.iter().any(|c| *c > 0.0),
+                    "{name} is in the emitting set and its emission peak is zero in the \
+                     {theme} theme — `emitting_materials` and `emission_peak` disagree about \
+                     what emits"
+                );
+            }
+
+            // Neither theme may be carrying the state on its own. Stated as a ratio between
+            // the two rather than as two independent floors, because a state that is 12:1 in
+            // one theme and 3.1:1 in the other passes both floors and is still a state that
+            // only really exists in one of them.
+            let [(_, a), (_, b)] = ratios[..] else {
+                unreachable!("two themes")
+            };
+            let spread = a.max(b) / a.min(b);
+            assert!(
+                spread <= 4.0,
+                "{name} reads {a:.2}:1 dark and {b:.2}:1 light — a {spread:.1}x spread means \
+                 the state was authored for one theme and inherited by the other"
+            );
+        }
+    }
+
     #[test]
     fn effects_off_drops_the_halo_and_flattens_the_ramp() {
         // Forced-colours mode. Both are token-layer facts rather than tier ones: the OS

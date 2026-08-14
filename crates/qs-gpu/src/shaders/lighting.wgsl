@@ -135,6 +135,33 @@ fn soft_shadow(origin: vec3f, toward: vec3f, k: f32) -> f32 {
     return clamp(res, 0.0, 1.0);
 }
 
+// Visibility along a segment of KNOWN, FINITE length — the receiver to a point on an emitter.
+//
+// `soft_shadow` above cannot answer this, and the reason is worth stating because the two look
+// interchangeable. Its step is the scene distance, which is what makes a directional ray with no
+// end cheap: empty space is crossed in one stride. A bounce ray skims half a pixel above its own
+// receiver for its whole length, so the scene distance is ~0.5 the entire way, every step is
+// clamped to the 0.5 minimum, and SHADOW_STEPS of budget is spent inside ~17 px. BOUNCE_REACH is
+// 90. Used for bounce, it reports "unoccluded" for four fifths of the distance the light travels,
+// which is not a soft shadow -- it is no shadow with a plausible shape.
+//
+// A finite segment is a different problem and takes the obvious answer: fixed steps across it, so
+// coverage is uniform and the cost is exactly SHADOW_STEPS regardless of geometry. `t` stays
+// strictly between the two ends -- the receiver's own face would occlude at 0 and the emitter's
+// own face at `d`, and both would return black everywhere.
+fn bounce_shadow(origin: vec3f, toward: vec3f, d: f32, k: f32) -> f32 {
+    var res = 1.0;
+    for (var i = 1u; i <= SHADOW_STEPS; i++) {
+        let t = d * f32(i) / f32(SHADOW_STEPS + 1u);
+        let h = scene_distance(origin + toward * t);
+        res = min(res, clamp(k * h / t, 0.0, 1.0));
+        if res < 0.005 {
+            break;
+        }
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
 // Bounded-sample occlusion straight up from the receiver (T038): how much of the sky the
 // point can see. Weights halve so the nearest sample dominates, which is what darkens seams.
 fn occlusion(origin: vec3f) -> f32 {
@@ -177,7 +204,7 @@ fn bounce(origin: vec3f, receiver: u32) -> vec3f {
         }
         let n_dot_l = clamp(to_light.z / max(d, 0.001), 0.0, 1.0);
         let falloff = 1.0 / (1.0 + (d / BOUNCE_REACH) * (d / BOUNCE_REACH));
-        let shade = soft_shadow(origin, to_light / max(d, 0.001), scene.light.w);
+        let shade = bounce_shadow(origin, to_light / max(d, 0.001), d, scene.light.w);
         added += e.rgb * e.w * falloff * n_dot_l * shade;
     }
     return added;
