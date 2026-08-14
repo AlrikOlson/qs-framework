@@ -519,6 +519,15 @@ pub fn row_text_fit(row_height: u32, ascent: f32, descent: f32, x_height: f32) -
 /// see [`qs_text::Shaper`].
 pub struct ListRenderer {
     pub tokens: Tokens,
+    /// Whether this frame's rows are being drawn **lit** — set for the duration of
+    /// [`ListRenderer::render_lit`] and false everywhere else.
+    ///
+    /// It exists for one reason: an emitting surface changes the ground under its own
+    /// label, so the ink that reads on the unlit row is washed out on the lit one. The row
+    /// therefore asks for `content/on-lit` when it is lit and `content/primary` when it is
+    /// not — the same shape `Tokens::effects_enabled` already gives the materials, one
+    /// level up. Both states are checked: see `MaterialDef::text_lit`.
+    lit: bool,
     pub atlas: GlyphAtlas,
     shaper: Shaper,
     cache: ShapedRunCache,
@@ -680,6 +689,7 @@ impl ListRenderer {
 
         Self {
             tokens,
+            lit: false,
             atlas: GlyphAtlas::new(config.atlas_size, config.max_glyph_uploads_per_frame),
             shaper: Shaper::new(Arc::clone(&db)),
             cache: ShapedRunCache::new(config.shaped_run_cache_entries),
@@ -889,7 +899,9 @@ impl ListRenderer {
         motion: &InteractionMotion,
         scene: &mut crate::scene::SceneBuilder,
     ) {
+        self.lit = true;
         self.render_rows(list, buf, layout, interaction, motion, true, Some(scene));
+        self.lit = false;
     }
 
     /// Draw one **Miller column**: the same rows, name only.
@@ -1048,11 +1060,10 @@ impl ListRenderer {
         self.draw_selection(
             list,
             layout,
-            &columns,
             &region,
             interaction.selection,
             motion,
-            scene.as_deref_mut(),
+            scene,
         );
 
         // The surface/content seam, recorded where it actually is (specs/002 T019). Layers
@@ -1184,7 +1195,32 @@ impl ListRenderer {
         }
 
         let hidden = row.flags.contains(RowFlags::IS_HIDDEN);
-        let name_color = fade(self.tokens.color("content/primary"), hidden);
+        // The lit row's ink. A selected row is a lamp when the mode is on, and lettering on
+        // a lit panel is a different colour from lettering on a dark one — measured at
+        // 1.53:1 before this existed, which is a filename nobody can read. `content/on-lit`
+        // is white in the dark theme and near-black in the light one, because the lit panel
+        // lands on opposite sides of the two themes' grounds; the contrast gate checks both
+        // pairs, so neither is a guess.
+        // Three inks, because a selected row is a coloured object and a LIT one is a light,
+        // and neither takes the ordinary row ink. The material declares both pairs — `text`
+        // and `text_lit` — so the contrast gate checks the state that is on screen rather
+        // than the one that happens to be first in the file.
+        let selected = flags.contains(RowFlags::IS_SELECTED);
+        let on_lamp = self.lit && selected;
+        let (primary_ink, secondary_ink, tertiary_ink) = if on_lamp {
+            let lamp = self.tokens.color("content/on-lit");
+            (lamp, lamp, lamp)
+        } else if selected {
+            let on_accent = self.tokens.color("content/on-accent");
+            (on_accent, on_accent, on_accent)
+        } else {
+            (
+                self.tokens.color("content/primary"),
+                self.tokens.color("content/secondary"),
+                self.tokens.color("content/tertiary"),
+            )
+        };
+        let name_color = fade_on(primary_ink, hidden, on_lamp);
 
         // Icon slot: a kind-based vector icon rasterized into the same atlas as the text
         // (`qs_gpu::icon`), so it is a coverage mask tinted at draw time exactly like a
@@ -1203,7 +1239,20 @@ impl ListRenderer {
                 size,
                 entry.height as f32,
                 entry.uv,
-                fade(icon_tint(&self.tokens, row), hidden),
+                // The icon takes the row's ink on a lit or accent panel, for the reason the
+                // text does and one more: a folder's icon is tinted `icon/folder`, and on a
+                // panel painted in the accent the two are close enough that the icon
+                // disappeared entirely — visible in the first lamp render as rows whose
+                // folder marks had simply gone.
+                fade_on(
+                    if on_lamp || selected {
+                        primary_ink
+                    } else {
+                        icon_tint(&self.tokens, row)
+                    },
+                    hidden,
+                    on_lamp,
+                ),
             ));
             // The emblem is a *modifier* on an icon the reader has already identified, so it
             // is drawn after the silhouette and never instead of it. `IS_SYMLINK` has been
@@ -1223,7 +1272,22 @@ impl ListRenderer {
             top + baseline,
             columns.name,
             type_roles.primary_px,
-            self.face_for(type_roles.primary),
+            // Bolder on a lit or accent panel. The lamp's ground is bright and busy — it
+            // has ribs and a hot centre-line — and a 400-weight name on it reads thinner
+            // than the same name on a flat dark row even at the same measured contrast,
+            // because contrast is a property of two colours and legibility is a property of
+            // the stroke that carries one of them. `face_for` already resolves a face per
+            // weight class, and `weight_coverage` records what this machine could actually
+            // satisfy, so asking for 600 costs a map lookup and degrades to the UI face on
+            // a machine that has no bold.
+            self.face_for(if on_lamp || selected {
+                TypeRole {
+                    weight: 600,
+                    ..type_roles.primary
+                }
+            } else {
+                type_roles.primary
+            }),
             Features::default(),
             name_color,
             true,
@@ -1255,8 +1319,8 @@ impl ListRenderer {
             return;
         }
 
-        let secondary = fade(self.tokens.color("content/secondary"), hidden);
-        let tertiary = fade(self.tokens.color("content/tertiary"), hidden);
+        let secondary = fade_on(secondary_ink, hidden, on_lamp);
+        let tertiary = fade_on(tertiary_ink, hidden, on_lamp);
 
         // Size and modified use tabular figures so a column of numbers forms a grid rather
         // than a ragged edge as rows scroll past (FR-013).
@@ -1345,7 +1409,6 @@ impl ListRenderer {
         &mut self,
         list: &mut DrawList,
         layout: &ViewportLayout,
-        columns: &Columns,
         region: &StateRegion,
         selection: &Selection,
         motion: &InteractionMotion,
@@ -1371,7 +1434,6 @@ impl ListRenderer {
                 self.push_selection(
                     list,
                     layout,
-                    columns,
                     region,
                     top_of(index),
                     1.0,
@@ -1385,7 +1447,6 @@ impl ListRenderer {
                 self.push_selection(
                     list,
                     layout,
-                    columns,
                     region,
                     top_of(index),
                     1.0,
@@ -1417,7 +1478,6 @@ impl ListRenderer {
         self.push_selection(
             list,
             layout,
-            columns,
             region,
             top,
             draw.alpha,
@@ -1429,7 +1489,6 @@ impl ListRenderer {
         self.push_selection(
             list,
             layout,
-            columns,
             region,
             top,
             draw.alpha,
@@ -1454,7 +1513,6 @@ impl ListRenderer {
         &self,
         list: &mut DrawList,
         layout: &ViewportLayout,
-        columns: &Columns,
         region: &StateRegion,
         top: f32,
         alpha: f32,
@@ -1513,22 +1571,21 @@ impl ListRenderer {
         }
 
         if pass == Pass::Bleed {
-            return;
         }
 
-        // Status rail. Nothing at M0 sets a VCS status, so this draws only for selection --
-        // but the slot is reserved so M1's rail does not reflow every row. It travels with
-        // the region because it is one indicator, not two, and it is not part of the
-        // material because it is a different *object*: a rail marks the row's status, where
-        // the material is the row's surface.
-        list.instances.push(Instance::rect(
-            columns.rail_x(),
-            top + height * 0.15,
-            columns.rail,
-            height * 0.7,
-            columns.rail * 0.5,
-            at_alpha(self.tokens.color("border/focus"), alpha),
-        ));
+        // The status rail is NOT drawn here any more, and the deletion is the point.
+        //
+        // It marks a row's VCS status — modified, added, conflicted — and nothing sets one
+        // yet, so it was being drawn for *selection* to keep the slot warm. A rail that
+        // means "this file changed" appearing because you clicked a row does not read as a
+        // reserved slot; it reads as a stray blue tick floating inside the selection, which
+        // is exactly how it was described the first time somebody who had not written it
+        // looked at it. A placeholder that is indistinguishable from an artefact is not
+        // reserving anything.
+        //
+        // `Columns` still reserves the rail's WIDTH, so `git-status-column` can draw a real
+        // rail without reflowing a single row — which was the reservation actually worth
+        // keeping. What went is the pretend indicator, not the space for the real one.
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2288,7 +2345,12 @@ impl StateRegion {
             width: (layout.width as f32 - inset * 2.0).max(1.0),
             inset,
             height: (layout.row_height as f32 - inset * 2.0).max(1.0),
-            radius: tokens.radius(crate::tokens::radius::ROW) * scale,
+            // `CHIP`, not `ROW`. The region is a row's height minus its inset — about
+            // fifteen logical pixels — and a six-pixel radius is forty per cent of that,
+            // which reads as a lozenge rather than as a row: the selection and the focus
+            // ring both looked like pills. Three is the same proportion on this shape that
+            // `ROW` is on a card, which is what the radius scale is for.
+            radius: tokens.radius(crate::tokens::radius::CHIP) * scale,
         }
     }
 
@@ -2331,18 +2393,24 @@ const PRESS_SQUISH: &str = crate::tokens::space::XS;
 ///
 /// Multiplicative, not absolute: a token that is already translucent stays in proportion, so
 /// an animation cannot make a state *more* opaque than the design system says it is.
-fn at_alpha(color: Srgba, factor: f32) -> Srgba {
-    Srgba {
-        a: color.a * factor.clamp(0.0, 1.0),
-        ..color
-    }
-}
-
 /// Hidden files render dimmed rather than absent.
 fn fade(color: Srgba, hidden: bool) -> Srgba {
+    fade_on(color, hidden, false)
+}
+
+/// [`fade`], told whether the ground it will sit on is a **lit panel**.
+///
+/// A hidden entry is drawn at reduced opacity, which on the ordinary dark row moves its ink
+/// toward the ground and reads as "present but quiet". On a lamp it does the same thing and
+/// the result is different in kind: the panel is bright, the lit ink is dark, and dropping
+/// its alpha slides it straight through the ground's own colour — a hidden file on a
+/// selected lit row was the least readable text in the window, at the exact moment the user
+/// had selected it. So the lit panel fades **less**: enough to keep the distinction between
+/// hidden and not, not enough to spend the contrast the gate just bought.
+fn fade_on(color: Srgba, hidden: bool, lit: bool) -> Srgba {
     if hidden {
         Srgba {
-            a: color.a * 0.55,
+            a: color.a * if lit { 0.82 } else { 0.55 },
             ..color
         }
     } else {
@@ -3592,8 +3660,13 @@ mod tests {
 
         assert_eq!(moving.len(), 1, "one selected row, one halo");
         assert_eq!(landed.len(), 1);
+        // 1.3x, not 1.5x. The halo's authored reach swell came down from 1.75 to 1.4 when
+        // its resting alpha and reach went UP -- a spill that already reaches two space
+        // steps does not need to nearly double again to read as flaring, and at the old
+        // swell it washed over three rows. The claim under test is unchanged: the drive
+        // reaches the material, and the flare is visible moving versus at rest.
         assert!(
-            moving[0].param > landed[0].param * 1.5,
+            moving[0].param > landed[0].param * 1.3,
             "the halo reached {} while moving against {} at rest: the drive is not reaching \
              the material",
             moving[0].param,
@@ -3802,7 +3875,16 @@ mod tests {
             total / viewport
         );
 
-        assert_eq!(halos, rows as usize, "one halo per selected row");
+        // One per selected row, plus one for the HOVERED row, which now has a spill of its
+        // own: when the selection became a lamp, hover became the dimmer light beside it
+        // rather than a flat wash. Stated as the sum rather than loosened to an inequality,
+        // because what this test exists to catch is a halo per *pass* or per *layer*
+        // creeping in, and only an exact count sees that.
+        assert_eq!(
+            halos,
+            rows as usize + 1,
+            "one halo per selected row, plus the hovered row's own"
+        );
         // And one shadow. Counted separately rather than folded into the number above,
         // because they are the two halves of what a selected row costs in fill and they are
         // allowed to move independently -- the spill's reach swells with the drive and the

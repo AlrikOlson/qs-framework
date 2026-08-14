@@ -491,7 +491,11 @@ impl Tokens {
     ) -> Option<qs_gpu::scene::Slab> {
         let material = self.material(name)?;
         let mut slab = material.slab(surface)?;
-        slab.attenuation_floor = self.lit_bounds(material).attenuation.0;
+        let bounds = self.lit_bounds(material);
+        slab.attenuation_floor = bounds.attenuation.0;
+        // The other half of the same allowance. A material that declares `text` gets zero
+        // here by derivation — it may emit, and it may not receive.
+        slab.addition_max = bounds.addition.1;
         Some(slab)
     }
 
@@ -1217,6 +1221,41 @@ pub fn material_results_policy(
             let base = tokens
                 .try_color(base_name)
                 .ok_or_else(|| TokenError::UnknownToken(base_name.clone()))?;
+
+            // The LIT extreme, when this material emits: the same composites with the
+            // emission's closed-form peak added, checked against the ink the material says
+            // it carries when lit. This is the half the gate was structurally blind to —
+            // `Material::composites` walks albedo, and a lamp moves the ground under its
+            // own label without moving a single albedo. Checking it here is what lets a
+            // surface be bright and legible instead of one or the other.
+            let emitting = material.emission_peak().iter().any(|v| *v > 0.0);
+            if emitting {
+                let lit_inks: &[String] = if material.text_lit.is_empty() {
+                    &material.text
+                } else {
+                    &material.text_lit
+                };
+                for composite in material.lit_composites(base) {
+                    for foreground_name in lit_inks {
+                        let foreground = tokens
+                            .try_color(foreground_name)
+                            .ok_or_else(|| TokenError::UnknownToken(foreground_name.clone()))?;
+                        let kind = match tokens.role(foreground_name) {
+                            Some(TokenRole::Border) => PairKind::Boundary,
+                            _ => PairKind::Text,
+                        };
+                        results.push(ContrastResult {
+                            foreground: foreground_name.clone(),
+                            background: format!("{name} over {base_name} (lit)"),
+                            kind,
+                            theme,
+                            ratio: foreground.over(composite).contrast_ratio(composite),
+                            required: kind.minimum_ratio(),
+                        });
+                    }
+                }
+            }
+
             for composite in material.composites(base) {
                 for foreground_name in &material.text {
                     let foreground = tokens
@@ -1887,8 +1926,13 @@ mod tests {
             "scene_slab carried {} where the allowance says {expected}",
             filled.attenuation_floor
         );
-        // The dark theme's text grounds afford full black (R13), so the row's floor is 0.
-        assert!((expected - 0.0).abs() < f32::EPSILON);
+        // The dark theme's text grounds afforded FULL BLACK when R13 measured them, and
+        // no longer do: the lamp made an emitting row's ground run from shadowed to lit,
+        // and no single ink survives a range that reaches black at one end and
+        // accent-bright at the other — measured at 1.04:1 before the floor moved. 0.55 is
+        // the value that lets one ink cover the whole range. See `lighting.$allowance_note`
+        // in design/tokens.json.
+        assert!((expected - 0.55).abs() < 1e-6, "dark text-ground floor is {expected}");
 
         // And the light theme's is 0.87 — the per-theme half of rule 3a, on the slab.
         let light = Tokens::embedded(Theme::Light).unwrap();

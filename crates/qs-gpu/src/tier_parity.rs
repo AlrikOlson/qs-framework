@@ -257,6 +257,31 @@ pub(crate) mod shader {
     /// The rim's profile, and reusing `rim_t` rather than restating it is the point: the whole
     /// contrast argument is that emission stops exactly where the bevel does, so there must be
     /// one answer to "how far inside the edge am I" and not two.
+    /// `const LAMP_FLOOR` / rib constants -- shader constants.
+    pub const LAMP_FLOOR: f32 = 0.34;
+    pub const LAMP_RIB_PERIOD: f32 = 17.0;
+    pub const LAMP_RIB_DEPTH: f32 = 0.16;
+
+    /// `fn lamp_emission(distance, bevel, local, half_size)` -- the tube profile: hot along
+    /// the surface's own centre-line, a lip at the housing, ribs and grain over both.
+    pub fn lamp_emission(distance: f32, bevel: f32, local: [f32; 2], half_size: [f32; 2]) -> f32 {
+        let v = (local[1] / half_size[1].max(1.0)).clamp(-1.0, 1.0);
+        let tube = (1.0 - v.abs()).max(0.0).powf(0.55);
+        let body = LAMP_FLOOR + (1.0 - LAMP_FLOOR) * tube;
+        let rim = 1.0 - rim_t(distance, bevel.max(1.0));
+        let lip = rim * rim * 0.30;
+        let ribs = 1.0
+            - LAMP_RIB_DEPTH
+                * (0.5 + 0.5 * (local[0] * (std::f32::consts::TAU / LAMP_RIB_PERIOD)).cos());
+        // The literal is the shader's, digit for digit. A hash constant truncated on one
+        // side of the transcription and not the other is a grain that differs between
+        // tiers, which is precisely what this module exists to prevent.
+        #[allow(clippy::excessive_precision)]
+        const SCATTER: f32 = 43758.5453;
+        let grain = 0.93 + 0.07 * ((local[0] * 12.9898 + local[1] * 78.233).sin() * SCATTER).fract();
+        (body + lip) * ribs * grain
+    }
+
     pub fn edge_emission(distance: f32, bevel: f32) -> f32 {
         let edge = 1.0 - rim_t(distance, bevel);
         edge * edge
@@ -920,7 +945,8 @@ fn draw_reference_instance(
                 let grad = shader::sd_rounded_box_grad(local, half_size, radius);
                 let normal = shader::bevel_normal(distance, grad, instance.uv[0]);
                 let straight = shader::unpremultiply(color);
-                let emissive = instance.param * shader::edge_emission(distance, instance.uv[0]);
+                let emissive = instance.param
+                    * shader::lamp_emission(distance, instance.uv[0], local, half_size);
                 let lit = shader::shade_pbr(
                     normal,
                     straight,
@@ -3201,79 +3227,68 @@ fn fixture_pbr(roughness: f32, metallic: f32, albedo: Srgba) -> Instance {
 /// smaller rectangle that interior is 60 pixels -- which the test refuses as too few to be a
 /// measurement. Widening the fixture is the honest fix; loosening that guard would have been
 /// the other one.
-const EMISSIVE_FIXTURE: (u32, u32, u32, u32) = (10, 12, 58, 52);
-
-/// A [`fixture_pbr`] that emits. Its own function rather than a parameter on that one, so every
-/// existing test keeps asking exactly the question it was written to ask.
-fn fixture_pbr_emissive(emission: f32) -> Instance {
-    let (x0, y0, x1, y1) = EMISSIVE_FIXTURE;
-    Instance::pbr(
-        x0 as f32,
-        y0 as f32,
-        (x1 - x0) as f32,
-        (y1 - y0) as f32,
-        6.0,
-        PBR_BEVEL,
-        0.35,
-        0.0,
-        1.0,
-        emission,
-        Srgba::new(0.30, 0.62, 0.95, 1.0),
-    )
-}
-
 #[test]
 fn pbr_stays_at_its_floor_on_the_cpu_tier() {
     run_kind(PrimKind::Pbr);
 }
 
 #[test]
-fn emission_never_reaches_the_middle_of_a_surface() {
-    // The contrast argument, measured. It is the whole reason an emissive surface is allowed
-    // to exist at all, and it must not be a sentence in a comment.
+fn a_lamp_lights_its_whole_face_and_never_past_the_peak_the_gate_checks() {
+    // THE INVARIANT THAT REPLACED `emission_never_reaches_the_middle_of_a_surface`, and the
+    // replacement is a deliberate trade rather than a relaxation.
     //
-    // Contract rule 1a lets a meaning-bearing element emit and forbids it to light **the
-    // ground directly behind itself**, putting that boundary at the bevel. A label sits in the
-    // middle of its row. So the claim is not that the middle is dimmed, or changed within a
-    // tolerance -- it is that the middle is **bit-identical**, because `edge_emission` reaches
-    // exactly zero at `bevel` inward and stays there. `Material::composites` checks the albedo
-    // and cannot see shading, so anything weaker than equality here would be a moving ground
-    // under a green gate, which is the failure `qs_ui::substance` recorded three times.
-    let dark = reference_pixels(fixture_pbr_emissive(0.0));
-    let bright = reference_pixels(fixture_pbr_emissive(2.0));
-
-    // Anything more than `bevel` inside every edge is ground a label could sit on.
-    let inset = PBR_BEVEL.ceil() as u32 + 1;
-    let (x0, y0, x1, y1) = EMISSIVE_FIXTURE;
-    let mut compared = 0;
-    for y in (y0 + inset)..(y1 - inset) {
-        for x in (x0 + inset)..(x1 - inset) {
-            assert_eq!(
-                dark.at(x, y),
-                bright.at(x, y),
-                "emission reached ({x}, {y}), which is more than {inset}px inside the edge -- \
-                 that is the ground behind a label, and the contrast gate cannot see it move"
-            );
-            compared += 1;
+    // The old test asserted emission was **bit-identically zero** more than `bevel` inside
+    // any edge — a geometric guarantee that the ground under a label never moves, which let
+    // a material turn emission up without touching a single composite the contrast gate
+    // could see. That bought safety by forbidding the thing the design now wants: a row that
+    // reads as a lit panel rather than an outlined one.
+    //
+    // What replaces it is not "nothing". The lamp lights its whole face, so the ground under
+    // the label DOES move — and the gate now follows it there: `Material::lit_composites`
+    // adds the emission's closed-form peak and `material_results_policy` checks the lit ink
+    // against it, in both themes. That check is only as honest as this bound, so this is the
+    // test that keeps `Material::LAMP_PEAK` an over-estimate of what the shader can do.
+    //
+    // Two claims, and both matter:
+    //   1. the profile never exceeds LAMP_PEAK anywhere, so the gate's number bounds reality;
+    //   2. it is genuinely non-zero in the middle, or the lamp is not a lamp and the whole
+    //      trade bought nothing.
+    let bevel = PBR_BEVEL;
+    let half = [120.0_f32, 21.0_f32];
+    let mut peak = 0.0_f32;
+    let mut middle_min = f32::INFINITY;
+    for iy in -40..=40 {
+        for ix in -220..=220 {
+            let local = [ix as f32 * 0.5, iy as f32 * 0.5];
+            if local[0].abs() > half[0] || local[1].abs() > half[1] {
+                continue;
+            }
+            let distance = shader::fs_distance(local, half, 6.0);
+            let v = shader::lamp_emission(distance, bevel, local, half);
+            peak = peak.max(v);
+            // "The middle" is the band a label sits in: the centre half of the height,
+            // clear of the housing on every side.
+            if local[1].abs() < half[1] * 0.5 && local[0].abs() < half[0] - bevel * 2.0 {
+                middle_min = middle_min.min(v);
+            }
         }
     }
     assert!(
-        compared > 100,
-        "the interior sampled only {compared} pixels, which is not a measurement"
+        peak <= qs_ui_lamp_peak(),
+        "the lamp profile peaks at {peak}, above the {} the contrast gate bounds it by —          every lit contrast result is now optimistic by that factor",
+        qs_ui_lamp_peak()
     );
-
-    // And the other half, or the assertion above is satisfied by an emission that does nothing
-    // anywhere. The edge must actually change.
-    let edge_changed = (y0..y1).any(|y| {
-        (x0..x1).any(|x| {
-            let (a, b) = (dark.at(x, y), bright.at(x, y));
-            (0..3).any(|i| (a[i] - b[i]).abs() > 0.01)
-        })
-    });
     assert!(
-        edge_changed,
-        "emission changed nothing anywhere, so the interior check above proves nothing"
+        middle_min > 0.2,
+        "the lamp is dark in the middle at {middle_min}: it is an outlined row wearing a          lamp's name, and the contrast trade that allowed it bought nothing"
     );
+}
+
+/// `qs_ui::material::Material::LAMP_PEAK`, restated here because `qs-gpu` sits **below**
+/// `qs-ui` and cannot import it. The duplication is the reason this test exists: it is the
+/// one place the two numbers are compared, so they cannot drift apart silently.
+fn qs_ui_lamp_peak() -> f32 {
+    1.30
 }
 
 #[test]

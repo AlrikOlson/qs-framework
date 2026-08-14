@@ -65,6 +65,12 @@ pub struct Slab {
     /// enforce it per pixel. **This is how the contrast gate's closed-form worst case is a
     /// bound on real frames rather than a hope** (lit-contrast rules 1a and 3a).
     pub attenuation_floor: f32,
+    /// The most light, in linear units, the pass may ADD to this surface — the other half
+    /// of the same allowance. Zero for a text ground, which is rule 1a's whole content: a
+    /// surface carrying a label may emit as hard as the design likes and may receive
+    /// nothing, so bounced light lands on the canvas and the gaps rather than under
+    /// anybody's filename.
+    pub addition_max: f32,
 }
 
 impl Default for Slab {
@@ -84,6 +90,7 @@ impl Default for Slab {
             emission: [0.0; 3],
             emission_strength: 0.0,
             attenuation_floor: 1.0,
+            addition_max: 0.0,
         }
     }
 }

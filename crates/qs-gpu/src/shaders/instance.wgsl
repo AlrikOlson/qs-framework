@@ -617,6 +617,52 @@ fn edge_emission(distance: f32, bevel: f32) -> f32 {
     return edge * edge;
 }
 
+// The LAMP profile: a surface that emits across the whole of itself, brighter at the rim,
+// like a frosted panel with a source behind it.
+//
+// `edge_emission` above confines emission to `bevel` of the boundary; this deliberately does
+// not, and the difference is the difference between a surface with a glowing edge and a
+// surface that IS a light. The interior sits at `LAMP_FLOOR` of full strength and the last
+// `bevel` climbs to 1, so the panel reads as lit through rather than outlined.
+//
+// **This spends the geometric half of lit-contrast rule 1a and replaces it with a measured
+// one.** The old guarantee was that emission was identically zero under any text, so a
+// material could turn it up without moving a composite. A lamp lights its own label's
+// ground, so what bounds legibility now is the authored strength and the measurement in
+// `docs/lit-mode/` — not the shape of the falloff. `a_lamp_keeps_its_label_legible` in
+// `tier_parity` is that bound as a test.
+// How dim the panel gets away from its centre-line. Not zero: a lamp's housing still glows.
+const LAMP_FLOOR: f32 = 0.34;
+// Rib period, in physical pixels, and rib depth. The period is deliberately close to a row's
+// own height so the ridges read as structure at the size a row actually is, rather than as
+// moire at some other scale.
+const LAMP_RIB_PERIOD: f32 = 17.0;
+const LAMP_RIB_DEPTH: f32 = 0.16;
+
+fn lamp_emission(distance: f32, bevel: f32, local: vec2<f32>, half_size: vec2<f32>) -> f32 {
+    // The tube. A lamp is brightest along its axis and falls away toward the housing, and
+    // for a surface that is far wider than it is tall the axis is horizontal — so this is a
+    // function of the surface's own `y`, which keeps the hot line pinned to the panel rather
+    // than to the screen when the row scrolls.
+    let v = clamp(local.y / max(half_size.y, 1.0), -1.0, 1.0);
+    let tube = pow(max(1.0 - abs(v), 0.0), 0.55);
+    let body = LAMP_FLOOR + (1.0 - LAMP_FLOOR) * tube;
+
+    // The housing's lip: the last `bevel` catches a little extra, which is what stops the
+    // panel from ending in mid-air.
+    let rim = 1.0 - rim_t(distance, max(bevel, 1.0));
+    let lip = rim * rim * 0.30;
+
+    // The texture, and it is what makes this read as a made object rather than a gradient.
+    // Ribs across the panel like a frosted tube's ridges, plus a fine grain from the same
+    // kind of hash the dither uses. Both are analytic — no derivatives, per this file's
+    // header — and both are functions of the surface's own coordinates, so they travel with
+    // the row instead of swimming under it.
+    let ribs = 1.0 - LAMP_RIB_DEPTH * (0.5 + 0.5 * cos(local.x * (6.2831853 / LAMP_RIB_PERIOD)));
+    let grain = 0.93 + 0.07 * fract(sin(dot(local, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    return (body + lip) * ribs * grain;
+}
+
 fn shade_pbr(
     normal: vec3<f32>,
     albedo: vec3<f32>,
@@ -771,8 +817,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let grad = sd_rounded_box_grad(in.local, in.half_size, radius);
         let normal = bevel_normal(distance, grad, in.aux.x);
         let straight = unpremultiply(in.color);
-        // `in.param` is the emissive strength; the weight is what confines it to the bevel.
-        let emissive = in.param * edge_emission(distance, in.aux.x);
+        // `in.param` is the emissive strength. A lamp emits across its whole face; the
+        // profile carries the rim falloff and the texture. See `lamp_emission`.
+        let emissive = in.param * lamp_emission(distance, in.aux.x, in.local, in.half_size);
         let lit = shade_pbr(normal, straight, in.aux.y, in.aux.z, in.aux.w, emissive);
         // Back to premultiplied, which is the one form this pipeline's blend state accepts.
         tint = vec4<f32>(lit * in.color.a, in.color.a);

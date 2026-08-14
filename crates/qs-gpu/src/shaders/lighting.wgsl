@@ -56,6 +56,10 @@ const LIT_SLABS: u32 = 192u;
 const SHADOW_STEPS: u32 = 12u;
 const AO_SAMPLES: u32 = 4u;
 const AO_STRENGTH: f32 = 0.35;
+// How far bounced light reaches before it has fallen to a quarter, in physical pixels.
+// Stated rather than tuned per material: one room, one falloff, so two emitters at the
+// same distance contribute the same and a surface cannot buy itself extra reach.
+const BOUNCE_REACH: f32 = 90.0;
 
 struct LitScene {
     viewport: vec2f,
@@ -69,6 +73,10 @@ struct LitScene {
     // x: corner radius. y: elevation (top face). z: thickness (downward). w: attenuation
     // floor from the material's allowance.
     shape: array<vec4f, LIT_SLABS>,
+    // rgb: what this slab emits into the scene, linear. w: strength, zero = not a light.
+    emission: array<vec4f, LIT_SLABS>,
+    // x: addition_max — how much light this slab may RECEIVE. Zero on a text ground.
+    props: array<vec4f, LIT_SLABS>,
 }
 
 @group(0) @binding(0) var<uniform> scene: LitScene;
@@ -141,6 +149,40 @@ fn occlusion(origin: vec3f) -> f32 {
     return clamp(occ, 0.0, 1.0);
 }
 
+// One-bounce light from every emitting slab (T052).
+//
+// The nearest point on the emitter is what the receiver sees, so a full-width row lights
+// like a strip rather than like a bulb hanging over its centre — the difference is the
+// whole reason a selected row can wash the rows beside it evenly. Falloff is inverse-square
+// in a bounded form (`1 / (1 + (d/reach)^2)`), which is finite at zero distance instead of
+// dividing by it, and the receiver's own upward normal gives the cosine term.
+//
+// Occluded, per contract: a shadow ray toward the emitter, so a surface hidden behind
+// something taller receives nothing. That is what stops the glow leaking through the
+// interface's own geometry.
+fn bounce(origin: vec3f, receiver: u32) -> vec3f {
+    var added = vec3f(0.0);
+    for (var i = 0u; i < min(scene.count, LIT_SLABS); i++) {
+        let e = scene.emission[i];
+        if e.w <= 0.0 || i == receiver {
+            continue;
+        }
+        let r = scene.rect[i];
+        // Nearest point on the emitter's top face.
+        let q = clamp(origin.xy, r.xy, r.xy + r.zw);
+        let to_light = vec3f(q, scene.shape[i].y) - origin;
+        let d = length(to_light);
+        if d > BOUNCE_REACH * 2.0 {
+            continue;
+        }
+        let n_dot_l = clamp(to_light.z / max(d, 0.001), 0.0, 1.0);
+        let falloff = 1.0 / (1.0 + (d / BOUNCE_REACH) * (d / BOUNCE_REACH));
+        let shade = soft_shadow(origin, to_light / max(d, 0.001), scene.light.w);
+        added += e.rgb * e.w * falloff * n_dot_l * shade;
+    }
+    return added;
+}
+
 @fragment
 fn fs_lit(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     let p = frag.xy;
@@ -151,6 +193,8 @@ fn fs_lit(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     // evaluation per slab per pixel for nothing anyone can see.
     var top = -1e9;
     var floor_ = 1.0;
+    var take = 0.0;
+    var receiver = 0u;
     var found = false;
     for (var i = 0u; i < min(scene.count, LIT_SLABS); i++) {
         let r = scene.rect[i];
@@ -158,6 +202,8 @@ fn fs_lit(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         if p.x >= r.x && p.x <= r.x + r.z && p.y >= r.y && p.y <= r.y + r.w && s.y >= top {
             top = s.y;
             floor_ = s.w;
+            take = scene.props[i].x;
+            receiver = i;
             found = true;
         }
     }
@@ -176,17 +222,26 @@ fn fs_lit(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     // The allowance clamp. This line is the contrast gate's closed-form claim being true.
     atten = clamp(atten, floor_, 1.0);
 
+    // Bounced light, clamped to what THIS surface is allowed to receive. A text ground's
+    // `addition_max` is zero, so a filename's background is untouched however hard the row
+    // beside it glows — rule 1a as arithmetic rather than as a convention. The clamp is per
+    // channel so a coloured bounce cannot exceed the allowance by arriving as three
+    // components that individually fit and jointly do not.
+    var added = vec3f(0.0);
+    if take > 0.0 {
+        added = clamp(bounce(origin, receiver), vec3f(0.0), vec3f(take));
+    }
+
     // An untouched pixel is not written at all. `dst * 1.0 + 0` is an identity only in
     // exact arithmetic — a real blend decodes and re-encodes the sRGB attachment, and the
     // round-trip is not promised bit-exact — so the identity fragment discards instead,
     // which is also what makes an unshadowed frame cost fill rate and nothing else.
     // `a_scene_with_nothing_elevated_changes_no_pixel` is this line as a test. When US2
     // adds bounce, the condition grows `&& addition == vec3f(0.0)`.
-    if atten >= 1.0 {
+    if atten >= 1.0 && added.r <= 0.0 && added.g <= 0.0 && added.b <= 0.0 {
         discard;
     }
 
-    // addition_rgb is zero until US2's bounce; the blend state applies
-    // `dst * atten + addition`.
-    return vec4f(0.0, 0.0, 0.0, atten);
+    // The blend state applies `dst * atten + added`.
+    return vec4f(added, atten);
 }

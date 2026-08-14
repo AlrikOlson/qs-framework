@@ -61,6 +61,17 @@ pub struct LitSceneUniform {
     rect: [[f32; 4]; LIT_SLABS],
     /// radius, elevation, thickness, attenuation floor.
     shape: [[f32; 4]; LIT_SLABS],
+    /// Emission this slab gives the scene: linear rgb, and strength in `w`. Zero strength
+    /// is not a light. `addition_max` — how much light this slab may RECEIVE, from its
+    /// material's allowance — rides in the fourth component of [`LitSceneUniform::props`],
+    /// because a surface's two lighting roles are independent: the selected row emits hard
+    /// and receives nothing.
+    emission: [[f32; 4]; LIT_SLABS],
+    /// `addition_max`, then three unused. A whole `vec4` for one float because a uniform
+    /// array's stride is 16 bytes whatever is in it; packing it into a spare component of
+    /// one of the arrays above would save nothing and would make three meanings share a
+    /// field. 192 slabs x 4 vec4 = 12,288 bytes, inside the 16 KB uniform minimum.
+    props: [[f32; 4]; LIT_SLABS],
 }
 
 /// The contact-hardening constant for a light of `size_deg` degrees: `1 / tan(size / 2)`.
@@ -122,6 +133,19 @@ impl LitSceneUniform {
                 slab.thickness,
                 slab.attenuation_floor.clamp(0.0, 1.0),
             ];
+        }
+        for (slab, (emission, props)) in scene
+            .slabs
+            .iter()
+            .zip(uniform.emission.iter_mut().zip(uniform.props.iter_mut()))
+        {
+            *emission = [
+                slab.emission[0],
+                slab.emission[1],
+                slab.emission[2],
+                slab.emission_strength.max(0.0),
+            ];
+            *props = [slab.addition_max.clamp(0.0, 4.0), 0.0, 0.0, 0.0];
         }
         uniform.count = take as u32;
         (uniform, scene.slabs.len() - take)

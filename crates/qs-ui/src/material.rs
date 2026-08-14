@@ -367,9 +367,34 @@ pub enum LayerDef {
         /// A surface with no bevel does not emit, because it has no edge to emit from.
         #[serde(default)]
         emission: f32,
+        /// What colour this surface emits **into the scene**, when the lit mode is on.
+        ///
+        /// Two things emit and they are deliberately different. The `emission` above is what
+        /// the surface's own EDGE draws — a bevel that glows, bounded by rule 1a. This is
+        /// what the surface contributes to everything AROUND it: the light the bounce pass
+        /// carries onto neighbouring rows and the canvas.
+        ///
+        /// Separating them is what lets a selected row read as fully emissive without
+        /// touching the ground under its own filename. The row is a **source** at whatever
+        /// strength the design wants; what it may not do is receive, and receivers are
+        /// bounded by their own `addition_max` allowance. Contract lit-contrast rule 1a,
+        /// which is the rule that makes "the whole row glows" and "the label stays legible"
+        /// compatible rather than opposed.
+        ///
+        /// Absent means the surface lights nothing, which is every material but one.
+        #[serde(default)]
+        emits: Option<String>,
+        /// How brightly, into the scene. Zero, or an absent [`LayerDef::Pbr::emits`], is a
+        /// surface that is not a light.
+        #[serde(default)]
+        emits_strength: f32,
         /// How this layer responds to the material's drive. See [`SwellDef`].
         #[serde(default)]
         swell: SwellDef,
+        /// What the material's phase does to this layer — here, the lamp's shimmer. See
+        /// [`PhaseDef::flicker`].
+        #[serde(default)]
+        phase: PhaseDef,
         #[serde(flatten)]
         geometry: GeometryDef,
     },
@@ -503,6 +528,25 @@ pub struct PhaseDef {
     /// and `rotate: 1.0` carries it around the shape exactly once per cycle.
     #[serde(default)]
     pub rotate: f32,
+    /// How hard this layer's **emission** shimmers over one cycle, as a fraction.
+    ///
+    /// A real lamp is never perfectly steady: mains ripple, filament thermals and the
+    /// convection over a tube all put a small aperiodic wobble on the light. `0.06` is a
+    /// six per cent peak-to-peak shimmer, which is about what a person reads as "alive"
+    /// without reading as "faulty".
+    ///
+    /// It rides the same **phase** the canvas field and the chrome sweeps ride, and that is
+    /// the whole reason it is affordable: `InteractionMotion::advance` moves the phase only
+    /// while some other animation is already holding the frame loop open, so the lamp
+    /// shimmers through a scroll, a selection move or a navigation and is a still picture
+    /// between them. A lamp that flickered forever would render forever, and SC-003 — zero
+    /// rendering work at rest — is a gate this project measures rather than hopes for.
+    ///
+    /// The shimmer's own peak is folded into [`Material::LAMP_PEAK`]'s companion
+    /// [`Material::FLICKER_PEAK`], so the contrast gate bounds the brightest instant rather
+    /// than the average one.
+    #[serde(default)]
+    pub flicker: f32,
 }
 
 /// How much louder a layer gets while its material is being driven.
@@ -598,6 +642,20 @@ pub struct MaterialDef {
     /// Foregrounds drawn on top of this material, for the contrast gate.
     #[serde(default)]
     pub text: Vec<String>,
+    /// The foregrounds this material carries **when it is drawn lit**.
+    ///
+    /// A surface that emits changes the ground under its own label, so the ink that works
+    /// on it unlit is not the ink that works on it lit — an emissive panel wants dark
+    /// lettering the way a lightbox sign does. Declaring the second set is what lets the
+    /// gate check BOTH states instead of one: `text` against the albedo composite, these
+    /// against the same composite plus the emission's closed-form peak.
+    ///
+    /// Empty means the material's ink does not change, which is every material that does
+    /// not emit. A material that declares emission and no lit ink is checked at its lit
+    /// extreme with its ordinary ink, and fails there if the lamp washes it out — which is
+    /// the honest outcome rather than a special case.
+    #[serde(default)]
+    pub text_lit: Vec<String>,
     #[serde(default)]
     pub description: String,
     /// A step from the elevation scale, or absent for a surface that lies on the canvas.
@@ -647,6 +705,12 @@ pub struct Layer {
     pub env: f32,
     /// Edge emission, for [`PrimKind::Pbr`]. See [`LayerDef::Pbr::emission`].
     pub emission: f32,
+    /// Emission shimmer amplitude. See [`PhaseDef::flicker`].
+    pub flicker: f32,
+    /// What this surface contributes to the scene around it, and how brightly. See
+    /// [`LayerDef::Pbr::emits`]. Transparent at zero strength means "not a light".
+    pub emits: Srgba,
+    pub emits_strength: f32,
     /// Displacement along the shadow direction, logical pixels. See [`GeometryDef::offset`].
     pub offset: f32,
     /// The ambient field's centres, for [`PrimKind::Field`]. See [`LayerDef::Field`].
@@ -711,6 +775,13 @@ impl Layer {
         let phased = if self.phased() {
             Self {
                 angle: self.angle + drive.phase * self.phase.rotate * std::f32::consts::TAU,
+                // The lamp's shimmer. Three incommensurate components rather than one sine,
+                // because a single sine reads as a pulsing prop and what a real lamp does is
+                // never quite repeat: the periods here (1, 2.7 and 6.3 per cycle) share no
+                // common multiple inside a cycle, so the wobble does not visibly loop. The
+                // amplitudes fall off with frequency, which is what makes it read as ripple
+                // over a steady source rather than as noise.
+                emission: self.emission * flicker(drive.phase, self.flicker),
                 ..self
             }
         } else {
@@ -735,6 +806,16 @@ impl Layer {
         }
     }
 
+    /// The shimmer factor at `phase`, for an amplitude of `amount`.
+    ///
+    /// Bounded by construction: the three components sum to at most `amount`, so the factor
+    /// lies in `1 ± amount` and [`Material::FLICKER_PEAK`] can state the brightest instant
+    /// in closed form — which is what the contrast gate needs to bound a lamp that moves.
+    #[must_use]
+    pub fn shimmer(phase: f32, amount: f32) -> f32 {
+        flicker(phase, amount)
+    }
+
     /// Whether the drive's **intensity** changes this layer at all.
     #[must_use]
     pub fn swells(self) -> bool {
@@ -750,7 +831,11 @@ impl Layer {
     /// colours they are.
     #[must_use]
     pub fn phased(self) -> bool {
-        self.phase.rotate != 0.0
+        // A shimmering lamp is phase-consuming even with no rotation: its emission moves
+        // with the cycle. Missing this arm is how a layer that declares a flicker gets
+        // returned untouched by `driven` and never flickers — the bit-for-bit claim in
+        // `driven`'s docs is about layers that state NEITHER, and this is the second one.
+        self.phase.rotate != 0.0 || self.flicker > 0.0
     }
 
     /// Which pass this layer belongs to. A halo is the only thing that leaves its own rect.
@@ -820,6 +905,8 @@ pub struct Material {
     pub layers: Vec<Layer>,
     pub over: Vec<String>,
     pub text: Vec<String>,
+    /// See [`MaterialDef::text_lit`].
+    pub text_lit: Vec<String>,
     pub description: String,
     /// Height of this material's top face above the canvas, **logical** pixels. Zero for a
     /// material that authored no step. Resolved from the elevation scale, so an unknown step
@@ -1097,6 +1184,10 @@ impl Material {
             .iter()
             .find(|layer| layer.kind == PrimKind::Pbr)
             .map_or((1.0, 0.0), |layer| (layer.roughness, layer.metallic));
+        let emitter = self
+            .layers
+            .iter()
+            .find(|layer| layer.emits_strength > 0.0 && layer.emits.a > 0.0);
         let elevation = self.elevation * surface.scale;
         Some(qs_gpu::scene::Slab {
             rect: [x, y, w, h],
@@ -1109,13 +1200,89 @@ impl Material {
             albedo: linear(body.flat),
             roughness,
             metalness,
-            emission: [0.0; 3],
-            emission_strength: 0.0,
+            // What this surface gives the room. Read off whichever layer declares it —
+            // one per material in practice — so a material becomes a light by authoring a
+            // token rather than by a call site deciding.
+            emission: linear(emitter.map_or(Srgba::TRANSPARENT, |layer| layer.emits)),
+            emission_strength: emitter.map_or(0.0, |layer| layer.emits_strength),
             // The safe default: no darkening permitted. `Tokens::scene_slab` is the route
             // that fills the real allowance, because the allowance is a `Tokens` fact (per
             // material AND per theme) and this function has neither.
             attenuation_floor: 1.0,
+            addition_max: 0.0,
         })
+    }
+
+    /// The most this material's emission can add to its own surface, as a multiplier on the
+    /// emitting layer's albedo.
+    ///
+    /// **Closed form, and it has to be**: the contrast gate's whole method is bounding what
+    /// a frame can do without rendering one. `lamp_emission` in `shaders/instance.wgsl` is
+    /// `(body + lip) * ribs * grain`, whose factors peak at `1.0`, `0.30`, `1.0` and `1.0`
+    /// respectively — the centre-line and the housing lip cannot both peak at the same
+    /// pixel, so `1.30` is an over-estimate rather than a sample, which is the direction a
+    /// bound has to err in. `the_lamp_peak_matches_the_shader` holds this against the
+    /// shader's own constants.
+    pub const LAMP_PEAK: f32 = 1.30;
+
+    /// The brightest instant of the lamp's shimmer, as a multiplier on its authored
+    /// emission — `1 + amplitude`, since [`flicker`]'s three components sum to at most one.
+    ///
+    /// Folded into [`Material::emission_peak`] so the contrast gate bounds the lamp at its
+    /// PEAK rather than at its resting value. A gate that checked the average would pass a
+    /// row whose label is unreadable for a tenth of every cycle, which is worse than one
+    /// that is unreadable all the time: it would never reproduce.
+    #[must_use]
+    pub fn flicker_peak(&self) -> f32 {
+        1.0 + self
+            .layers
+            .iter()
+            .filter(|layer| layer.kind == PrimKind::Pbr)
+            .map(|layer| layer.flicker)
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// What this material adds to its own ground when lit, per channel, in linear light.
+    ///
+    /// Zero for everything that does not emit, which is why the lit gate costs the other
+    /// seven materials nothing.
+    #[must_use]
+    pub fn emission_peak(&self) -> [f32; 3] {
+        self.layers
+            .iter()
+            .find(|layer| layer.kind == PrimKind::Pbr && layer.emission > 0.0)
+            .map_or([0.0; 3], |layer| {
+                let a = layer.near;
+                let e = layer.emission * Self::LAMP_PEAK * self.flicker_peak();
+                [
+                    qs_gpu::color::srgb_to_linear(a.r) * e,
+                    qs_gpu::color::srgb_to_linear(a.g) * e,
+                    qs_gpu::color::srgb_to_linear(a.b) * e,
+                ]
+            })
+    }
+
+    /// [`Material::composites`], at the material's **lit** extreme: every composite with the
+    /// emission's closed-form peak added. What the lit ink is checked against.
+    #[must_use]
+    pub fn lit_composites(&self, base: Srgba) -> Vec<Srgba> {
+        let add = self.emission_peak();
+        self.composites(base)
+            .into_iter()
+            .map(|c| {
+                let lift = |v: f32, a: f32| {
+                    qs_gpu::color::linear_to_srgb(
+                        (qs_gpu::color::srgb_to_linear(v) + a).clamp(0.0, 1.0),
+                    )
+                };
+                Srgba {
+                    r: lift(c.r, add[0]),
+                    g: lift(c.g, add[1]),
+                    b: lift(c.b, add[2]),
+                    a: c.a,
+                }
+            })
+            .collect()
     }
 
     /// Every colour text can end up sitting on, when this material is painted over `base`.
@@ -1241,6 +1408,23 @@ fn layer_shape(layer: Layer, surface: Surface) -> Option<(f32, f32, f32, f32, f3
     (w > 0.0 && h > 0.0).then_some((x, y, w, h, radius))
 }
 
+/// The lamp shimmer: three incommensurate ripples over one cycle, summing to `amount`.
+///
+/// Free-standing so the contrast gate, the renderer and the test that bounds it all read
+/// one definition. See [`PhaseDef::flicker`] for why it is shaped this way and why it costs
+/// no wakefulness.
+#[must_use]
+fn flicker(phase: f32, amount: f32) -> f32 {
+    if amount <= 0.0 {
+        return 1.0;
+    }
+    let tau = std::f32::consts::TAU;
+    let a = (phase * tau).sin() * 0.55;
+    let b = (phase * tau * 2.7 + 1.7).sin() * 0.30;
+    let c = (phase * tau * 6.3 + 3.1).sin() * 0.15;
+    1.0 + amount * (a + b + c)
+}
+
 /// Scale a colour's opacity, the way an animated state scales a token's.
 ///
 /// Multiplicative: a layer authored translucent stays in proportion, so a material can never
@@ -1347,6 +1531,9 @@ pub(crate) fn resolve_all(
                 // `Layer::driven`, which is what the bit-for-bit claim rests on.
                 phase: PhaseDef::default(),
                 bevel: 0.0,
+                flicker: 0.0,
+                emits: Srgba::TRANSPARENT,
+                emits_strength: 0.0,
                 roughness: 1.0,
                 metallic: 0.0,
                 env: 0.0,
@@ -1523,9 +1710,16 @@ pub(crate) fn resolve_all(
                     metallic,
                     env,
                     emission,
+                    emits,
+                    emits_strength,
+                    phase,
                     ..
                 } => {
                     let tint = at(color(name, material)?, *alpha);
+                    let emits = match emits {
+                        Some(token) => color(token, material)?,
+                        None => Srgba::TRANSPARENT,
+                    };
                     Layer {
                         kind: PrimKind::Pbr,
                         near: tint,
@@ -1538,6 +1732,9 @@ pub(crate) fn resolve_all(
                         metallic: *metallic,
                         env: *env,
                         emission: emission.max(0.0),
+                        flicker: phase.flicker.max(0.0),
+                        emits,
+                        emits_strength: emits_strength.max(0.0),
                         ..common
                     }
                 }
@@ -1581,6 +1778,7 @@ pub(crate) fn resolve_all(
                 layers,
                 over: def.over.clone(),
                 text: def.text.clone(),
+                text_lit: def.text_lit.clone(),
                 description: def.description.clone(),
                 elevation,
             },
@@ -1909,9 +2107,14 @@ mod tests {
             selected.bleed(2.0, Drive::REST) > selected.bleed(1.0, Drive::REST),
             "the halo's reach is authored in logical pixels and must scale"
         );
+        // `ROW_BODY`, not `ROW_HOVER`. Hover gained its own spill when the selection
+        // became a lamp — the hovered row is a dimmer light, not a flat wash — so the
+        // no-halo case had to move to a material that genuinely has no glow layer. The
+        // claim being made is unchanged: a stack with no halo reaches past nothing, at any
+        // drive.
         assert_eq!(
             tokens
-                .material(name::ROW_HOVER)
+                .material(name::ROW_BODY)
                 .unwrap()
                 .bleed(1.0, Drive::new(1.0, 0.0)),
             0.0,
