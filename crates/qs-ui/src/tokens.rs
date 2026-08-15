@@ -136,6 +136,42 @@ pub struct TokenDef {
     pub description: String,
 }
 
+/// A colour that is **light rather than paint**, and therefore not a token.
+///
+/// # Why this is its own block and not a `TokenRole`
+///
+/// [`Tokens::bloom_ceiling`] is a fold over every entry in `tokens`: a pixel blooms when it
+/// is brighter than every colour the palette can name. So an emissive placed *in* the palette
+/// raises the ceiling to exactly its own luminance and is then not above it — the bloom stays
+/// off, and the criterion "an emissive above the ceiling" becomes unsatisfiable by
+/// construction. That is not a bug in the fold; it is the fold saying an emissive is not a
+/// colour a designer wrote down.
+///
+/// Keeping the block outside `tokens` makes three separate safeties structural rather than
+/// careful. The ceiling cannot rise to meet an emissive because it never sees one.
+/// [`Tokens::color`] cannot reach one, so no call site can paint a fill or set a glyph in it
+/// by typo. And "not meaning-bearing" stops being prose in a design document: it is refused
+/// at load time by [`crate::material::resolve_all`], which admits an emissive only on a layer
+/// that declares an `edge` — the band geometry [`crate::material::Material::composites`]
+/// already excludes — and never in a material's `text`, `text_lit` or `over`.
+///
+/// # There is no `role`
+///
+/// [`TokenRole`] exists so the contrast gate knows which side of a pair a colour can be on.
+/// An emissive is on neither side: it is not a background, because nothing is read on it, and
+/// it is not a foreground, because it carries no meaning. Giving it a role would be inviting
+/// the gate to check a pair that cannot occur.
+/// What every emissive's name must start with. See [`EmissiveDef`].
+pub const EMISSIVE_PREFIX: &str = "emissive/";
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct EmissiveDef {
+    pub light: ColorValue,
+    pub dark: ColorValue,
+    #[serde(default)]
+    pub description: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ContrastPair {
     pub foreground: String,
@@ -231,6 +267,11 @@ pub struct TokenFile {
     #[serde(default)]
     pub ramps: BTreeMap<String, Ramp>,
     pub tokens: BTreeMap<String, TokenDef>,
+    /// Light the renderer makes, deliberately *not* in `tokens`. Defaulted so a token file
+    /// predating the bloom's source still loads — and loads with the bloom off, which is what
+    /// it had. See [`EmissiveDef`] for why the placement is the whole safety.
+    #[serde(default)]
+    pub emissive: BTreeMap<String, EmissiveDef>,
     /// The five type roles. Defaulted so a token file predating them still loads; a caller
     /// asking for a role that is absent gets `None` and can say so.
     #[serde(default, rename = "type")]
@@ -333,6 +374,25 @@ pub enum TokenError {
          to composite its layers against"
     )]
     MaterialMissingBase { material: String },
+    #[error(
+        "material `{material}` paints emissive `{token}` on a layer with no `edge`; an \
+         emissive is light rather than paint and is admitted only on an edge band, which is \
+         the one geometry `Material::composites` excludes and therefore the one colour no \
+         text is ever read against"
+    )]
+    MaterialEmissiveOffABand { material: String, token: String },
+    #[error(
+        "material `{material}` names emissive `{token}` as text or as a base; an emissive has \
+         no `role` because it belongs on neither side of a contrast pair, and this one would \
+         put it on one"
+    )]
+    MaterialEmissiveIsNotAColour { material: String, token: String },
+    #[error(
+        "emissive `{name}` does not start with `{prefix}`; a layer names one string and two \
+         maps can answer it, so the name has to say which",
+        prefix = EMISSIVE_PREFIX
+    )]
+    EmissiveUnprefixed { name: String },
 }
 
 impl ColorValue {
@@ -387,6 +447,11 @@ impl ColorValue {
 pub struct Tokens {
     theme: Theme,
     colors: BTreeMap<String, Srgba>,
+    /// Resolved emissives, kept in a **separate map from `colors`** on purpose. See
+    /// [`EmissiveDef`]: merging the two would let [`Tokens::bloom_ceiling`] rise to meet the
+    /// very thing it exists to be cleared by, and would put light within reach of
+    /// [`Tokens::color`].
+    emissive: BTreeMap<String, Srgba>,
     roles: BTreeMap<String, TokenRole>,
     type_roles: BTreeMap<String, TypeRole>,
     space: BTreeMap<String, f32>,
@@ -426,9 +491,25 @@ impl Tokens {
             colors.insert(name.clone(), color);
             roles.insert(name.clone(), def.role);
         }
+        let mut emissive = BTreeMap::new();
+        for (name, def) in &file.emissive {
+            // The prefix is required, not conventional. A material's layer names one string
+            // and two different maps can answer it; if the name did not say which, a reader of
+            // `chrome/bar` could not tell that its far stop is light rather than a border
+            // colour, and the rules that apply to it are entirely different.
+            if !name.starts_with(EMISSIVE_PREFIX) {
+                return Err(TokenError::EmissiveUnprefixed { name: name.clone() });
+            }
+            let (value, label) = match theme {
+                Theme::Light => (&def.light, "light"),
+                Theme::Dark => (&def.dark, "dark"),
+            };
+            emissive.insert(name.clone(), value.resolve(&file.ramps, name, label)?);
+        }
         let materials = crate::material::resolve_all(
             &file.materials,
             &colors,
+            &emissive,
             &file.space,
             &file.radius,
             &file.elevation,
@@ -436,6 +517,7 @@ impl Tokens {
         Ok(Self {
             theme,
             colors,
+            emissive,
             roles,
             type_roles: file.type_roles.clone(),
             space: file.space.clone(),
@@ -647,17 +729,46 @@ impl Tokens {
             .as_ref()
             .map(|f| f.elevation.clone())
             .unwrap_or_default();
+        // Forced colours shows no light: `effects_enabled` is false below, so `bloom` returns
+        // NONE whatever is in here. But the names still have to RESOLVE, and mapping them to
+        // the OS foreground is the same substitution every other colour above gets rather
+        // than a fifth colour invented for them -- an emissive is only ever authored on an
+        // edge band, and a band the user's own text colour is exactly the separation forced
+        // colours asks for.
+        //
+        // Leaving this empty would not be "no light". `resolve_all` here is followed by
+        // `.ok().unwrap_or_default()`, so one unresolvable name removes EVERY material and
+        // the window renders with no rows in it -- the failure the `surface/raised` comment
+        // above records happening once already, and `forced-colours-resolve-is-all-or-nothing`
+        // exists to make loud.
+        let emissive: BTreeMap<String, Srgba> = embedded
+            .as_ref()
+            .map(|f| {
+                f.emissive
+                    .keys()
+                    .map(|name| (name.clone(), window_text))
+                    .collect()
+            })
+            .unwrap_or_default();
         let materials = embedded
             .as_ref()
             .and_then(|f| {
-                crate::material::resolve_all(&f.materials, &colors, &space, &radius, &elevation)
-                    .ok()
+                crate::material::resolve_all(
+                    &f.materials,
+                    &colors,
+                    &emissive,
+                    &space,
+                    &radius,
+                    &elevation,
+                )
+                .ok()
             })
             .unwrap_or_default();
 
         Self {
             theme: Theme::Light,
             colors,
+            emissive,
             roles,
             type_roles: embedded
                 .as_ref()
@@ -856,33 +967,71 @@ impl Tokens {
     pub fn bloom_ceiling(&self) -> f32 {
         // Every token, every role. See below for why narrowing this to backgrounds was the
         // wrong answer and what it did.
+        //
+        // `self.colors`, and NOT `self.emissive`. That is the one line this whole mechanism
+        // rests on: an emissive folded in here would raise the ceiling to exactly its own
+        // luminance, and a value is not greater than itself, so the bloom would be off
+        // forever with a source authored, present and drawn. See `EmissiveDef`.
         self.colors
             .values()
             .map(|color| color.relative_luminance())
             .fold(0.0_f32, f32::max)
     }
 
+    /// A named emissive, if this palette has one. See [`EmissiveDef`].
+    ///
+    /// Separate from [`Tokens::color`] rather than folded into it, so that "a call site cannot
+    /// paint a fill in light" is a fact about the API rather than a rule about call sites.
+    #[must_use]
+    pub fn emissive(&self, name: &str) -> Option<Srgba> {
+        self.emissive.get(name).copied()
+    }
+
+    /// Every emissive this palette carries, brightest first. For gates and instruments.
+    pub fn emissives(&self) -> impl Iterator<Item = (&str, Srgba)> {
+        self.emissive.iter().map(|(name, c)| (name.as_str(), *c))
+    }
+
+    /// Whether this palette gives the bright pass anything to select: an emissive strictly
+    /// above [`Tokens::bloom_ceiling`].
+    ///
+    /// The light theme answers `false` by **derivation and not by a special case**: several of
+    /// its tokens resolve to white, so its ceiling is 1.0 and nothing in an 8-bit target can
+    /// exceed it. The same emissive that is a source in the dark theme is not one here, and no
+    /// code says so — the fold does.
+    #[must_use]
+    pub fn has_bloom_source(&self) -> bool {
+        let ceiling = self.bloom_ceiling();
+        self.emissive
+            .values()
+            .any(|light| light.relative_luminance() > ceiling)
+    }
+
     /// The frame's bloom, for [`qs_gpu::frame::DrawList::set_bloom`].
     ///
-    /// **On the shipped palette this is [`qs_gpu::frame::Bloom::NONE`], and the reason is a
-    /// measurement rather than a preference.** The mechanism is built, exercised and costed —
-    /// `cargo run --release -p qs-gpu --example bloom_cost` renders it and reports +0.021 ms on
-    /// Vulkan, +0.171 ms on GL, and an 84/255 change 20,808 px away from a bright element. What
-    /// it has no source for is light.
+    /// **Active on the shipped dark theme and off on the light one, and both answers are
+    /// derived rather than chosen.** The mechanism is costed at +0.021 ms on Vulkan and
+    /// +0.171 ms on GL (`cargo run --release -p qs-gpu --example bloom_cost`). For three
+    /// chunks it had no source: nothing the product drew exceeded the palette's own ink
+    /// ceiling. `emissive/sweep-peak` is that source — see [`EmissiveDef`] for why it is not
+    /// a token, and `chrome/bar` in `design/tokens.json` for why the command bar's travelling
+    /// hairline is the one band in the window that can carry it.
     ///
-    /// # The two numbers, and why they cannot both be satisfied here
+    /// # The two numbers
     ///
     /// The threshold is [`Tokens::bloom_ceiling`]: brighter than every colour this theme can
     /// name. Above that line a pixel is light the *renderer* made — a glow's falloff, a sweep's
     /// highlight, the lit mode's addition — and below it, it is a fill somebody authored.
     ///
-    /// Nothing in this product reaches that line, and that is structural rather than a gap
-    /// waiting on content. Every primitive composites authored colours, so none can exceed the
-    /// brightest authored colour; and the lit mode's addition is bounded to **receivers** by
-    /// `lighting.allowance`, which are grounds sitting two orders of magnitude below the ink.
-    /// Rendering the shipped dark theme through `--shot-gpu`, with and without `--lit`, peaks at
-    /// 0.8969 relative luminance against a ceiling of 0.8986 — short by one 8-bit step, because
-    /// the ceiling is the ideal value of a token whose quantized form is what actually lands.
+    /// Nothing *composited from the palette* can reach that line, and that is structural rather
+    /// than a gap waiting on content. Every primitive composites authored colours, so none can
+    /// exceed the brightest authored colour; and the lit mode's addition is bounded to
+    /// **receivers** by `lighting.allowance`, which are grounds sitting two orders of magnitude
+    /// below the ink. Before the emissive existed, the shipped dark theme through `--shot-gpu`
+    /// peaked at 0.8969 relative luminance against a ceiling of 0.8986 — short by one 8-bit
+    /// step, because the ceiling is the ideal value of a token whose quantized form is what
+    /// actually lands. That measurement is why the source had to come from *outside* the
+    /// palette rather than from a brighter entry inside it.
     ///
     /// # Why the threshold is not simply lowered
     ///
@@ -899,34 +1048,46 @@ impl Tokens {
     /// 0.618 while body text sits at 0.817, so that threshold bloomed every glyph on screen —
     /// the 42.8% above, everywhere, under a green build.
     ///
-    /// # What would unlock it
+    /// # What the threshold cannot see, and what does
     ///
-    /// An emissive element that is **not meaning-bearing** and sits above the ink ceiling: a
-    /// lamp, a focus halo's core, a sweep peak authored deliberately above the palette rather
-    /// than mixed from it. That is a palette decision, not this chunk's, and it is filed as
-    /// `bloom-needs-a-source-above-the-ink`. The other route — sourcing the bright pass from the
-    /// **surface half** of the frame only, using the `surface_content_split` seam the lighting
-    /// pass already uses, so ink is not in the source at all — is filed with it, and is a
-    /// second render target rather than a threshold change, because the target holds the whole
-    /// frame and a pass cannot sample the attachment it is writing.
+    /// The bright pass selects by luminance; it has no idea which pixels are grounds behind
+    /// text. So the threshold buys one guarantee only — no *authored* colour is a source — and
+    /// says nothing about where the light it does select **lands**. A text ground's allowance
+    /// is `lighting.allowance.text_ground.addition_max`, which is 0.0 in both themes, and this
+    /// function cannot check it because a token file has no frame in it.
+    ///
+    /// `cargo run --release -p qs -- --bloom-reach` is what checks it: one frame rendered
+    /// twice in one process, bloom present and bloom absent, reporting the worst lift on a
+    /// ground behind text. That is why the spend site is a one-logical-pixel edge band with no
+    /// text within reach of it rather than an argument about where a glow looks nice.
+    ///
+    /// # The other route, still open
+    ///
+    /// Sourcing the bright pass from the **surface half** of the frame only, using the
+    /// `surface_content_split` seam the lighting pass already uses, so ink is not in the
+    /// source at all and the threshold could drop below it. That is a second render target
+    /// rather than a threshold change — the offscreen target holds the whole frame and a pass
+    /// cannot sample the attachment it is writing — and it is what would let a *mark* bloom.
     #[must_use]
     pub fn bloom(&self) -> qs_gpu::frame::Bloom {
         // Forced colours switch effects off entirely, and a bloom is the loudest possible
-        // violation of "use only the colours the user said they can see". Kept as its own
-        // early return rather than folded into the line below, so it stays correct when this
-        // function stops returning NONE unconditionally.
+        // violation of "use only the colours the user said they can see".
         if !self.effects_enabled {
             return qs_gpu::frame::Bloom::NONE;
         }
         // NONE, not `{ threshold: self.bloom_ceiling(), strength: ... }`. The distinction is a
         // frame's worth of work: an inactive bloom allocates no chain and encodes no passes,
         // where a bloom whose threshold nothing reaches would allocate 1.6 MB and run three
-        // full-screen passes every frame to produce a black image and add it to nothing.
-        //
-        // The ceiling is still derived, still tested, and still what the effect will use --
-        // `bloom_ceiling` is where it lives -- so the number is ready for the palette decision
-        // rather than deleted along with the feature.
-        qs_gpu::frame::Bloom::NONE
+        // full-screen passes every frame to produce a black image and add it to nothing. That
+        // is the light theme's answer, and it arrives from `has_bloom_source` rather than from
+        // a branch on the theme.
+        if !self.has_bloom_source() {
+            return qs_gpu::frame::Bloom::NONE;
+        }
+        qs_gpu::frame::Bloom {
+            threshold: self.bloom_ceiling(),
+            strength: self.bloom_strength(),
+        }
     }
 
     /// Paint a named material onto `surface`, appending to `out`.
@@ -1674,26 +1835,102 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_palette_blooms_nothing_and_pays_nothing_for_it() {
-        // The chunk's outcome, asserted rather than described. `bloom_cost`'s
-        // `contrast_cost_of_blooming_a_mark` measured what a lower threshold costs -- 14.34:1
-        // to 8.21:1 against a mark's own ground, 42.8%, invisible to `cargo xtask contrast` --
-        // and nothing in the product reaches the ceiling that spares it. `--shot-gpu` on the
-        // dark theme peaks at 0.8969 against 0.8986, with and without `--lit`.
+    fn the_dark_theme_blooms_from_one_emissive_and_the_light_theme_still_pays_nothing() {
+        // THIS TEST USED TO ASSERT THE OPPOSITE, and the history is the reason it was updated
+        // rather than replaced. For three chunks it read
+        // `the_shipped_palette_blooms_nothing_and_pays_nothing_for_it`: the bloom was built,
+        // exercised and costed (+0.021 ms Vulkan, +0.171 ms GL, 84/255 change 20,808 px from a
+        // bright element) and switched OFF, because nothing the product drew reached the
+        // ceiling that spares text. `--shot-gpu` on the dark theme peaked at 0.8969 against
+        // 0.8986 -- short by one 8-bit step. That was a measurement, not an oversight, and it
+        // is why the source could not be a brighter token: `bloom_ceiling` folds over the token
+        // map, so a bright token raises the line it was meant to clear.
         //
-        // NONE rather than a threshold nothing reaches, and the difference is a frame's work:
-        // an inactive bloom allocates no chain and encodes no passes. If this test ever needs
-        // changing, the thing to check first is whether a source above the ceiling now exists
-        // -- see `bloom-needs-a-source-above-the-ink`.
+        // What changed is `design/tokens.json`'s `emissive` block, which is outside `tokens`
+        // for exactly that reason. Both halves below are DERIVED -- one value, 0.9414, above
+        // the dark ceiling and below the light one -- so neither theme is special-cased.
+        let dark = Tokens::embedded(Theme::Dark).unwrap();
+        assert!(
+            dark.has_bloom_source(),
+            "the dark theme must have something above its ink ceiling to bleed, or the bloom \
+             is three passes producing a black image"
+        );
+        let bloom = dark.bloom();
+        assert!(bloom.is_active(), "dark: {bloom:?}");
+        assert!(
+            (bloom.threshold - dark.bloom_ceiling()).abs() < 1e-6,
+            "the threshold is the ink ceiling and nothing else: below it, a bloom lifts the \
+             ground behind a mark by the 42.8% `bloom_cost` measured"
+        );
+        assert!(
+            (bloom.strength - dark.bloom_strength()).abs() < 1e-6,
+            "the strength is the measured receiver allowance, not a number chosen here"
+        );
+
+        // The light theme pays for no chain at all, and NOT because anything says so: several
+        // of its tokens resolve to white, its ceiling is 1.0, and nothing in an 8-bit target
+        // exceeds that. Deleting the emissive block would make this half pass for the wrong
+        // reason, which is what the dark assertions above are guarding.
+        let light = Tokens::embedded(Theme::Light).unwrap();
+        assert!(
+            !light.has_bloom_source(),
+            "the light theme has no emitter: its page is already the brightest thing in it"
+        );
+        assert!(
+            !light.bloom().is_active(),
+            "an inactive bloom allocates no chain and encodes no passes"
+        );
+    }
+
+    #[test]
+    fn an_emissive_is_light_and_not_a_colour_the_palette_can_name() {
+        // The three structural properties, asserted rather than trusted to the comments that
+        // explain them. Any one of them failing puts the emissive back inside the palette in
+        // effect, whatever the file looks like.
         for theme in [Theme::Light, Theme::Dark] {
             let tokens = Tokens::embedded(theme).unwrap();
             assert!(
-                !tokens.bloom().is_active(),
-                "{theme:?}: a bloom with no source must cost no passes"
+                tokens.emissives().next().is_some(),
+                "{theme:?}: no emissive at all, so the two assertions below check nothing"
             );
-            // And the ceiling it would use is still real, so the number survives the decision.
-            assert!(tokens.bloom_ceiling() > 0.0, "{theme:?}");
+            for (name, light) in tokens.emissives() {
+                // (1) It is not reachable as a colour. A call site that names it gets
+                // transparent, which is a missing element in a screenshot rather than a glyph
+                // drawn in light.
+                assert!(
+                    tokens.try_color(name).is_none(),
+                    "{theme:?}: {name} is reachable through Tokens::color, so a fill or a glyph \
+                     can be painted in light"
+                );
+                // (2) It does not raise the ceiling it has to clear. This is the one that
+                // makes the whole mechanism possible; folding the two maps together in
+                // `bloom_ceiling` would leave the bloom off forever with a source drawn.
+                let _ = light;
+                assert!(
+                    tokens
+                        .colors
+                        .values()
+                        .any(|c| (c.relative_luminance() - tokens.bloom_ceiling()).abs() < 1e-6),
+                    "{theme:?}: the ceiling is no longer any token's luminance, so an emissive \
+                     has leaked into the fold"
+                );
+            }
         }
+        // (3) And the dark theme's is genuinely above the line rather than equal to it, with
+        // enough headroom that an interpolated sweep has an arc above the threshold rather
+        // than one pixel. The margin is authored in tokens.json; this is what makes it a
+        // number somebody has to keep rather than a comment.
+        let dark = Tokens::embedded(Theme::Dark).unwrap();
+        let peak = dark
+            .emissive("emissive/sweep-peak")
+            .expect("the shipped emissive")
+            .relative_luminance();
+        let margin = peak - dark.bloom_ceiling();
+        assert!(
+            margin > 0.02,
+            "emissive/sweep-peak clears the ceiling by only {margin}; a sweep interpolates to \
+             this stop, so a thin margin means a source one pixel wide that quantizes away"
+        );
     }
 
     #[test]

@@ -1609,19 +1609,11 @@ fn scaled(color: Srgba, alpha: f32) -> Srgba {
 pub(crate) fn resolve_all(
     defs: &BTreeMap<String, MaterialDef>,
     colors: &BTreeMap<String, Srgba>,
+    emissive: &BTreeMap<String, Srgba>,
     space: &BTreeMap<String, f32>,
     radius: &BTreeMap<String, f32>,
     elevation: &BTreeMap<String, f32>,
 ) -> Result<BTreeMap<String, Material>, TokenError> {
-    let color = |name: &str, material: &str| -> Result<Srgba, TokenError> {
-        colors
-            .get(name)
-            .copied()
-            .ok_or_else(|| TokenError::MaterialUnknownToken {
-                material: material.to_string(),
-                token: name.to_string(),
-            })
-    };
     let step = |name: &str, material: &str| -> Result<f32, TokenError> {
         space
             .get(name)
@@ -1643,6 +1635,24 @@ pub(crate) fn resolve_all(
 
     let mut out = BTreeMap::new();
     for (material, def) in defs {
+        // An emissive is light, not paint: it may not be the colour of a mark, and it may not
+        // be a ground a mark is read against. Both would put it on one side of a contrast pair
+        // the gate is required to check, and a name that is not in `colors` resolves through
+        // `Tokens::color` to transparent -- so without this the failure is a glyph that
+        // silently does not draw rather than a build that says why.
+        for token in def
+            .text
+            .iter()
+            .chain(def.text_lit.iter())
+            .chain(def.over.iter())
+        {
+            if emissive.contains_key(token) {
+                return Err(TokenError::MaterialEmissiveIsNotAColour {
+                    material: material.clone(),
+                    token: token.clone(),
+                });
+            }
+        }
         let mut layers = Vec::with_capacity(def.layers.len());
         for layer in &def.layers {
             let geometry = match layer {
@@ -1655,6 +1665,36 @@ pub(crate) fn resolve_all(
                 | LayerDef::Pbr { geometry, .. }
                 | LayerDef::Backdrop { geometry, .. }
                 | LayerDef::Stroke { geometry, .. } => geometry,
+            };
+            // Where an emissive is allowed, and it is one place. `Material::composites` skips
+            // a layer that declares an `edge` -- a hairline along one side is not a background
+            // -- so a band is the only geometry whose colour no text is ever read against.
+            // That exclusion already existed for its own reasons; this reuses it rather than
+            // inventing a second notion of "somewhere text cannot be", because two notions
+            // would be two places to get it wrong and the gate follows only one of them.
+            //
+            // Deriving the permission from the geometry is the point. The alternative is a
+            // flag on the emissive saying it is safe, which is a colour awarding itself an
+            // allowance -- refused here for the same reason `Material::fidelity` is derived
+            // and `Tokens::lit_bounds` reads whether a material declares `text`.
+            let on_a_band = geometry.edge.is_some();
+            let color = |name: &str, material: &str| -> Result<Srgba, TokenError> {
+                if let Some(light) = emissive.get(name) {
+                    if !on_a_band {
+                        return Err(TokenError::MaterialEmissiveOffABand {
+                            material: material.to_string(),
+                            token: name.to_string(),
+                        });
+                    }
+                    return Ok(*light);
+                }
+                colors
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| TokenError::MaterialUnknownToken {
+                        material: material.to_string(),
+                        token: name.to_string(),
+                    })
             };
             let swell = match layer {
                 LayerDef::Fill { swell, .. }
@@ -2947,6 +2987,114 @@ mod tests {
         assert!(matches!(
             Tokens::from_str(bad, Theme::Light),
             Err(TokenError::MaterialUnknownStep { .. })
+        ));
+    }
+
+    /// A token file with one emissive, one token, and whatever material the caller wants to
+    /// try to spend the emissive on.
+    #[cfg(test)]
+    fn file_spending_an_emissive(material: &str) -> String {
+        format!(
+            r##"{{
+            "version": 2,
+            "ramps": {{ "neutral": {{ "hue": 268, "chroma": 0.024 }} }},
+            "tokens": {{ "a/b": {{
+                "role": "background",
+                "light": {{ "ramp": "neutral", "l": 500 }},
+                "dark": {{ "ramp": "neutral", "l": 500 }}
+            }} }},
+            "emissive": {{ "emissive/core": {{
+                "light": {{ "ramp": "neutral", "l": 980 }},
+                "dark": {{ "ramp": "neutral", "l": 980 }}
+            }} }},
+            "materials": {{ "x/y": {material} }},
+            "contrast_pairs": []
+        }}"##
+        )
+    }
+
+    #[test]
+    fn an_emissive_on_a_band_resolves_and_anywhere_else_is_refused() {
+        // The permission is derived from the geometry, and this is the pair that proves it is
+        // a real distinction rather than a comment: the SAME emissive, in the SAME layer kind,
+        // legal on an edge band and refused in the middle of the shape.
+        //
+        // Both halves are needed. Without the green one the rule could be "an emissive is
+        // never usable" and every test would still pass, which is the vacuous-parity trap this
+        // repository has recorded twice.
+        let on_a_band = file_spending_an_emissive(
+            r#"{ "layers": [
+                { "effect": "fill", "color": "emissive/core", "edge": "bottom", "thickness": 1 }
+            ] }"#,
+        );
+        assert!(
+            Tokens::from_str(&on_a_band, Theme::Dark).is_ok(),
+            "an emissive on an edge band is the one place it is admitted"
+        );
+
+        let in_the_middle = file_spending_an_emissive(
+            r#"{ "layers": [
+                { "effect": "fill", "color": "emissive/core" }
+            ] }"#,
+        );
+        assert!(
+            matches!(
+                Tokens::from_str(&in_the_middle, Theme::Dark),
+                Err(TokenError::MaterialEmissiveOffABand { .. })
+            ),
+            "a full-shape fill IS counted by Material::composites, so light there is a ground \
+             text gets read against and the contrast gate would be checking a colour the \
+             palette never named"
+        );
+    }
+
+    #[test]
+    fn an_emissive_named_as_text_or_as_a_base_is_refused_rather_than_drawn_transparent() {
+        // The failure this replaces is the quiet one. An emissive is not in `colors`, so
+        // `Tokens::color` answers transparent -- a glyph authored in light would simply not
+        // appear, and nothing in the build would say why.
+        for spent in [
+            r#"{ "over": ["a/b"], "text": ["emissive/core"], "layers": [
+                { "effect": "fill", "color": "a/b" }
+            ] }"#,
+            r#"{ "over": ["emissive/core"], "text": ["a/b"], "layers": [
+                { "effect": "fill", "color": "a/b" }
+            ] }"#,
+        ] {
+            let bad = file_spending_an_emissive(spent);
+            assert!(
+                matches!(
+                    Tokens::from_str(&bad, Theme::Dark),
+                    Err(TokenError::MaterialEmissiveIsNotAColour { .. })
+                ),
+                "expected a refusal for {spent}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_emissive_without_its_prefix_is_refused() {
+        // A layer names one string and two maps can answer it. Without the prefix a reader of
+        // `chrome/bar` cannot tell that its far stop is light rather than a border colour, and
+        // the rules that apply to the two are entirely different.
+        let bad = r##"{
+            "version": 2,
+            "ramps": { "neutral": { "hue": 268, "chroma": 0.024 } },
+            "tokens": { "a/b": {
+                "role": "background",
+                "light": { "ramp": "neutral", "l": 500 },
+                "dark": { "ramp": "neutral", "l": 500 }
+            } },
+            "emissive": { "border/glow": {
+                "light": { "ramp": "neutral", "l": 980 },
+                "dark": { "ramp": "neutral", "l": 980 }
+            } },
+            "materials": {},
+            "contrast_pairs": []
+        }"##;
+        assert!(matches!(
+            Tokens::from_str(bad, Theme::Dark),
+            Err(TokenError::EmissiveUnprefixed { .. })
         ));
     }
 }
