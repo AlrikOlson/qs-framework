@@ -2286,6 +2286,61 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 ink_area: 0.0,
             },
         ],
+        // The floor question in its sharpest form yet, because this is the one primitive whose
+        // floor was written down -- UXDD 10.7, "opaque `surface/raised`" -- years before the
+        // effect existed, and whose obvious encoding satisfies every OTHER check while
+        // shipping the answer the same table calls wrong.
+        //
+        // What `assert_floor` holds here is that the CPU tier draws the instance's `color` as
+        // an opaque rounded fill. So the fixtures below give `color` an opaque panel and `uv` a
+        // TRANSLUCENT glass, which is the arrangement that makes the two distinguishable: with
+        // the fields swapped these cases still pass `Floor::Plain(Rect)` -- a rect is a rect --
+        // and would render a 22%-alpha panel. `the_floor_is_the_opaque_panel_and_not_the_glass`
+        // below is the test that tells them apart, and it is not one of these.
+        PrimKind::Blur => vec![
+            Case {
+                name: "blur/panel",
+                instance: Instance::blur(
+                    8.0,
+                    8.0,
+                    44.0,
+                    32.0,
+                    10.0,
+                    // The glass: mostly transparent, which is what a blur is seen through.
+                    Srgba::new(0.11, 0.11, 0.13, 0.22),
+                    // The floor: opaque, which is what a machine that cannot blur shows.
+                    Srgba::new(0.14, 0.14, 0.17, 1.0),
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Square corners and flush against the origin, which is the popover geometry
+                // the fixture above is not: a radius of zero takes a different branch of
+                // `rounded_rect`, and a rect at (0,0) is where an off-by-one in the floor's
+                // geometry would be swallowed by the antialiased edge everywhere else.
+                name: "blur/square-at-origin",
+                instance: Instance::blur(
+                    0.0,
+                    0.0,
+                    30.0,
+                    30.0,
+                    0.0,
+                    Srgba::new(0.90, 0.92, 0.98, 0.35),
+                    Srgba::new(0.96, 0.96, 0.98, 1.0),
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
     }
 }
 
@@ -2972,6 +3027,79 @@ fn glyph_agrees_across_tiers() {
 #[test]
 fn image_agrees_across_tiers() {
     run_kind(PrimKind::Image);
+}
+
+#[test]
+fn blur_falls_back_to_the_floor_uxdd_chose() {
+    run_kind(PrimKind::Blur);
+}
+
+/// The one assertion that can tell the right encoding from the wrong one.
+///
+/// [`run_kind`] above asks whether the CPU tier drew `Floor::Plain(Rect)`, and a rect is a
+/// rect: it holds whichever colour is in [`Instance::color`], so it passes just as happily on
+/// the arrangement UXDD 10.7 names as wrong -- a **translucent unblurred panel**. Every other
+/// check in this file passes on it too. The fidelity declaration is right, the floor kind is
+/// right, the geometry is right, and the product is wrong.
+///
+/// So this asks the question the table actually poses: is the fallback OPAQUE. It reads the
+/// pixels rather than the instance, because the claim is about what a machine without a GPU
+/// shows and not about which field a constructor happened to fill.
+#[test]
+fn the_floor_is_the_opaque_panel_and_not_the_glass() {
+    for case in &cases_for(PrimKind::Blur) {
+        let floored = case
+            .instance
+            .cpu_floor()
+            .unwrap_or_else(|| panic!("{}: a blur must degrade to something", case.name));
+
+        // The alpha the fallback tier paints with, straight from the pixels the floor
+        // produces. `color` is premultiplied linear RGBA8 and the fourth byte is the alpha.
+        let alpha = (floored.color >> 24) & 0xff;
+        assert_eq!(
+            alpha, 0xff,
+            "{}: the floor is {alpha}/255 opaque. UXDD 10.7 requires an OPAQUE panel and \
+             names a translucent unblurred one as the wrong answer -- which is what shipping \
+             the glass tint in `Instance::color` produces. See `PrimKind::Blur`.",
+            case.name
+        );
+
+        // And the glass genuinely is translucent, so the assertion above had something to be
+        // wrong about. A fixture whose tint happened to be opaque would satisfy this test
+        // under either encoding, which is the vacuous-pass trap the image fixtures recorded.
+        assert!(
+            case.instance.uv[3] < 1.0,
+            "{}: the fixture's glass is opaque, so this test cannot tell the two encodings \
+             apart",
+            case.name
+        );
+
+        // The floor keeps the shape and loses the effect: same rect, same radius, and the
+        // glass gone rather than carried down into a field the fill would read as something
+        // else. This is `Instance::cpu_floor`'s rule, restated where the consequence is.
+        assert_eq!(floored.rect, case.instance.rect, "{}", case.name);
+        assert_eq!(floored.radius, case.instance.radius, "{}", case.name);
+        assert_eq!(floored.uv, [0.0; 4], "{}", case.name);
+        assert_eq!(floored.kind, PrimKind::Rect as u32, "{}", case.name);
+    }
+}
+
+/// The blur fixtures put ink on the surface, so agreeing about them means something.
+///
+/// Same guard as the image fixtures below, and it earns its place for a sharper reason here:
+/// a floor check compares two renderings of the *same* rasterizer, so an instance that drew
+/// nothing would satisfy it perfectly. `Floor::Nothing` and "a bug that draws nothing" are
+/// indistinguishable to [`assert_floor`] on their own.
+#[test]
+fn the_blur_fixtures_lay_down_ink_so_a_floor_check_means_something() {
+    for case in &cases_for(PrimKind::Blur) {
+        let d = run_case(case);
+        assert!(
+            d.cpu_ink.is_some(),
+            "{}: the fixture drew no ink at all, so its floor check holds vacuously",
+            case.name
+        );
+    }
 }
 
 /// The image fixtures put ink on the surface, so agreeing about them means something.

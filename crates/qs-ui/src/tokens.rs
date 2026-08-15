@@ -549,6 +549,22 @@ impl Tokens {
         set("surface/row-hover", window, TokenRole::Background);
         set("surface/row-selected", highlight, TokenRole::Background);
         set("surface/overlay", window, TokenRole::Background);
+        // The popover's panel, and unlike `surface/overlay-lift` below this one IS DRAWN with
+        // effects off: a backdrop layer collapses to its flat stop, and its flat stop is this.
+        // So the value is not arbitrary -- it is the panel a forced-colours popover shows,
+        // and `window` is the right answer twice over. It is a background, so the OS's
+        // background colour is the colour the user chose for one; and the panel is then
+        // separated from the list by its border rather than by a lightness the OS did not
+        // supply, which is exactly the separation UXDD 10.5 leaves when it disables blur and
+        // tint.
+        //
+        // Omitting it is not a missing panel. `resolve_all` here is followed by
+        // `.ok().unwrap_or_default()`, so one unknown token removes EVERY material and
+        // forced-colours mode renders a window with no rows in it -- which is what happened
+        // when this material was added and this line was not, caught by the same row test the
+        // field centres' comment above names. `forced-colours-resolve-is-all-or-nothing` is
+        // the roadmap chunk for making that loud instead of silent.
+        set("surface/raised", window, TokenRole::Background);
 
         // The stop that exists only as one end of a ramp. It is mapped onto the same OS
         // colour as the stop it ramps from, which is the honest answer here: with effects

@@ -16,7 +16,7 @@ use crate::atlas::{PendingImage, PendingUpload};
 use crate::device::GpuContext;
 use crate::frame::{Batch, DrawList, FIELD_CENTRES, Instance, PrimKind};
 use crate::scene::SceneList;
-use crate::target::{LightingTarget, OffscreenTarget};
+use crate::target::{BlurChain, LightingTarget, OffscreenTarget};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
@@ -111,6 +111,31 @@ pub struct Renderer {
     /// Slabs the last packed scene could not fit into [`crate::lighting::LIT_SLABS`].
     /// Reported rather than swallowed, like every other drop in this module.
     lit_dropped: usize,
+    /// The layout every backdrop-shaped binding shares: one filtered texture and one sampler.
+    ///
+    /// One layout for four different bind groups — the blur chain's two halves, its view of
+    /// the offscreen target, and the placeholder — because they are the same thing seen from
+    /// different passes. It is also group 2 of the instance pipeline, which is what makes
+    /// "bind the finished blur" and "bind a 1x1 stand-in" the same call.
+    backdrop_layout: wgpu::BindGroupLayout,
+    /// **Linear**, unlike [`Renderer::resolve_sampler`], and the difference is the whole
+    /// technique. The downsample's four taps land on 2x2 texel corners and the blur's pairs
+    /// land between texel centres; both depend on the hardware returning a weighted average
+    /// rather than a nearest texel. With a nearest sampler the chain still runs, still looks
+    /// blurred, and quietly computes a different kernel from the one `blur.wgsl` documents.
+    blur_sampler: wgpu::Sampler,
+    blur_downsample_pipeline: wgpu::RenderPipeline,
+    blur_h_pipeline: wgpu::RenderPipeline,
+    blur_v_pipeline: wgpu::RenderPipeline,
+    /// The quarter-resolution ping-pong pair. Lazy for the same reason the colour target is,
+    /// and allocated with it — see [`crate::target::BlurChain`] for the cost.
+    blur: Option<BlurChain>,
+    /// What group 2 binds on a frame with no blur in it: a 1x1 texture nothing samples.
+    ///
+    /// A placeholder rather than an optional binding, because a pipeline layout is fixed at
+    /// creation. The alternative is two instance pipelines differing only in whether group 2
+    /// exists, which doubles a shader compile to avoid four bytes.
+    backdrop_placeholder: wgpu::BindGroup,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -280,9 +305,38 @@ impl Renderer {
             ],
         });
 
+        // Group 2: whatever a blur samples. The same layout serves the chain's two halves, its
+        // view of the offscreen target and the placeholder, so every one of them is
+        // interchangeable at the `set_bind_group` call site.
+        let backdrop_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qs-backdrop-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("qs-pipeline-layout"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&atlas_layout)],
+            bind_group_layouts: &[
+                Some(&globals_layout),
+                Some(&atlas_layout),
+                Some(&backdrop_layout),
+            ],
             immediate_size: 0,
         });
 
@@ -425,6 +479,108 @@ impl Renderer {
             cache: None,
         });
 
+        // The blur chain. Three pipelines over one shader module and one bind-group layout,
+        // built at construction for the resolve pipeline's reason: a shader compile inside the
+        // frame that first opens a popover is a hitch on the exact keystroke the effect exists
+        // to make feel immediate. The *textures* stay lazy.
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("qs-blur-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur.wgsl").into()),
+        });
+        let blur_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("qs-blur-sampler"),
+            // Clamped, so a tap that reaches past the edge reads the edge rather than wrapping
+            // to the far side of the window -- which is what a repeat address mode does to a
+            // panel in the corner, and it looks like the blur has torn.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qs-blur-pipeline-layout"),
+            bind_group_layouts: &[Some(&backdrop_layout)],
+            immediate_size: 0,
+        });
+        let blur_pipeline = |label: &str, entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&blur_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blur_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blur_shader,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        // `None`, like the resolve and for the same reason: each pass in the
+                        // chain writes the whole of its target from its source. Blending would
+                        // composite the previous frame's blur under this one, which converges
+                        // to a smear that only shows up while something moves.
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let blur_downsample_pipeline = blur_pipeline("qs-blur-downsample", "fs_downsample");
+        let blur_h_pipeline = blur_pipeline("qs-blur-horizontal", "fs_blur_h");
+        let blur_v_pipeline = blur_pipeline("qs-blur-vertical", "fs_blur_v");
+
+        // The placeholder group 2 binds when no blur is in the frame. One texel, never
+        // sampled: a KIND_BLUR instance is exactly what makes the chain run, so a frame that
+        // binds this contains nothing that reads it.
+        let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("qs-backdrop-placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let placeholder_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+        let backdrop_placeholder = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qs-backdrop-placeholder-bind-group"),
+            layout: &backdrop_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blur_sampler),
+                },
+            ],
+        });
+
         // The lighting pass (specs/002 US1). One fullscreen triangle, fixed-function
         // blending: the fragment writes `vec4(addition, attenuation)` and the blend applies
         // `out = src.rgb + dst.rgb * src.a` — a multiply-and-add that never samples the
@@ -531,6 +687,13 @@ impl Renderer {
             offscreen: None,
             force_offscreen: false,
             offscreen_allocations: 0,
+            backdrop_layout,
+            blur_sampler,
+            blur_downsample_pipeline,
+            blur_h_pipeline,
+            blur_v_pipeline,
+            blur: None,
+            backdrop_placeholder,
             lighting: None,
             lighting_allocations: 0,
             lit_pipeline,
@@ -669,11 +832,47 @@ impl Renderer {
     /// somebody has to remember to set, and a flag that disagrees with the instances is a
     /// frame that samples an unallocated target.
     fn needs_offscreen(&self, list: &DrawList) -> bool {
-        self.force_offscreen
-            || list
-                .instances
-                .iter()
-                .any(|i| PrimKind::from_raw(i.kind).is_some_and(PrimKind::needs_backdrop))
+        self.force_offscreen || list.instances.iter().any(instance_needs_backdrop)
+    }
+
+    /// The blur chain, if one has been allocated. Its memory is reported the way the colour
+    /// target's is — `renderer.blur().map_or(0, BlurChain::bytes)`.
+    #[must_use]
+    pub fn blur(&self) -> Option<&BlurChain> {
+        self.blur.as_ref()
+    }
+
+    /// Allocate or resize the blur chain if this frame draws a backdrop-sampling primitive.
+    ///
+    /// Called after [`Renderer::ensure_offscreen`] and reading its allocation count, because
+    /// the chain's downsample pass holds a bind group onto the target's view: a resize that
+    /// replaces the target has to replace the chain even when the viewport rounds to the same
+    /// downsampled size. Like the target, an existing chain is **not** freed on a frame that
+    /// happens to draw no panel — that would reallocate once per popover open.
+    fn ensure_blur(&mut self, ctx: &GpuContext, list: &DrawList, offscreen: bool) {
+        if !offscreen || !list.instances.iter().any(instance_needs_backdrop) {
+            return;
+        }
+        let Some(target) = self.offscreen.as_ref() else {
+            return;
+        };
+        let viewport = [list.viewport[0].max(1), list.viewport[1].max(1)];
+        let generation = self.offscreen_allocations;
+        let fits = self
+            .blur
+            .as_ref()
+            .is_some_and(|c| c.fits(viewport, self.format, generation));
+        if !fits {
+            self.blur = Some(BlurChain::new(
+                &ctx.device,
+                &self.backdrop_layout,
+                &self.blur_sampler,
+                self.format,
+                viewport,
+                target.view(),
+                generation,
+            ));
+        }
     }
 
     /// Encode one frame.
@@ -714,6 +913,7 @@ impl Renderer {
     ) -> wgpu::CommandBuffer {
         self.ensure_capacity(ctx, list.instances.len() as u64);
         let offscreen = self.ensure_offscreen(ctx, list);
+        self.ensure_blur(ctx, list, offscreen);
         self.ensure_lighting(ctx, list, scene);
 
         // The lit frame's scene, packed and uploaded before the encoder opens, beside the
@@ -775,6 +975,28 @@ impl Renderer {
             _ => target,
         };
 
+        // The two cuts in the batch sequence, and they are independent.
+        //
+        // `lit_at` is US1's surface/content seam. `backdrop_at` is where the frame stops being
+        // *the backdrop*: the first batch carrying a primitive that samples what is behind it.
+        // Everything before it goes into the offscreen target, the chain blurs THAT, and the
+        // rest is drawn on the surface afterwards. Without the cut, the target a blur sampled
+        // would contain the panel itself, and the effect would be a feedback loop rather than
+        // depth.
+        //
+        // With no such primitive -- including the `force_offscreen` case, which is what keeps
+        // the path exercised -- `backdrop_at` is the end of the list, the whole frame goes into
+        // the target and the second pass is exactly the resolve it has always been. That is
+        // what lets `the_two_pass_path_is_pixel_identical_to_the_one_pass_path` keep meaning
+        // what it meant.
+        let lit_at = surface_content_split(&list.batches);
+        let backdrop_at = if offscreen {
+            backdrop_split(list)
+        } else {
+            u32::MAX
+        };
+        let blurring = backdrop_at != u32::MAX;
+
         {
             let clear = list.clear;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -802,44 +1024,82 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-
-            let split = surface_content_split(&list.batches);
-            let (surface_half, content_half) = list.batches.split_at(split);
-
-            // The surface half: every batch before the first atlas-sampled one.
-            draw_batches(&mut pass, list, surface_half);
-
-            // The lighting pass, in the seam (US1): it modulates the surfaces just drawn
-            // and is finished before any glyph exists to be lit — lit-contrast rule 1 as
-            // draw order. One fullscreen triangle inside the SAME wgpu pass, so an unlit
-            // frame's command stream is exactly what it always was; with a scene, the only
-            // additions are one pipeline switch each way and one draw.
-            if lit.is_some() {
-                pass.set_pipeline(&self.lit_pipeline);
-                pass.set_bind_group(0, &self.lit_bind_group, &[]);
-                pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
-                pass.draw(0..3, 0..1);
-
-                // The instance pipeline back, for the content half: pipeline, both bind
-                // groups and the vertex buffer, because a render pass forgets nothing but
-                // guarantees nothing across a pipeline switch.
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.globals_bind_group, &[]);
-                pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            }
-
-            // The content half: text, icons, and whatever is composed above them, in the
-            // order the list stated.
-            draw_batches(&mut pass, list, content_half);
+            // Everything up to the backdrop cut. On the ordinary frame that is every batch,
+            // and this call is the whole of `render` as it was.
+            self.draw_span(
+                &mut pass,
+                list,
+                0..backdrop_at,
+                lit.is_some().then_some(lit_at),
+                self.backdrop_placeholder(),
+            );
+            // The panel and everything above it are NOT here; they are drawn in the resolve
+            // pass below, over the surface, with the blur bound. `backdrop_at` is u32::MAX
+            // when nothing samples a backdrop, and this span is then the whole frame.
         }
 
-        // The resolve. Nothing at all on the single-pass path, which is the shape acceptance
-        // asks for: the existing path stays the path when no effect wants the target.
+        // The chain: downsample the backdrop, then one Gaussian per axis, all at a quarter of
+        // the viewport in each direction. Three passes rather than two because the downsample
+        // is exact only as its own step -- folding it into the horizontal blur would make the
+        // first axis sample a full-resolution image with a quarter-resolution kernel, which is
+        // aliasing dressed as an optimisation.
+        if blurring {
+            if let Some(blur) = self.blur.as_ref() {
+                let mut chain_pass =
+                    |label: &str,
+                     pipeline: &wgpu::RenderPipeline,
+                     source: &wgpu::BindGroup,
+                     into: &wgpu::TextureView| {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some(label),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: into,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    // `Load` for the resolve's reason: the triangle covers every
+                                    // texel of its target, so a clear would be a full write
+                                    // immediately overwritten.
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, source, &[]);
+                        pass.draw(0..3, 0..1);
+                    };
+                // Full-resolution backdrop -> ping, at a quarter of the size.
+                chain_pass(
+                    "qs-blur-downsample-pass",
+                    &self.blur_downsample_pipeline,
+                    blur.source_bind_group(),
+                    blur.pong(),
+                );
+                // ping <- horizontal(pong), pong <- ... -- the names follow the ping-pong and
+                // the LAST write lands in `ping`, which is what the instance pipeline samples.
+                chain_pass(
+                    "qs-blur-horizontal-pass",
+                    &self.blur_h_pipeline,
+                    blur.pong_bind_group(),
+                    blur.ping(),
+                );
+                chain_pass(
+                    "qs-blur-vertical-pass",
+                    &self.blur_v_pipeline,
+                    blur.ping_bind_group(),
+                    blur.pong(),
+                );
+            }
+        }
+
+        // The resolve, and everything from the backdrop cut on. Nothing at all on the
+        // single-pass path, which is the shape acceptance asks for: the existing path stays the
+        // path when no effect wants the target.
         if let (true, Some(offscreen)) = (offscreen, self.offscreen.as_ref()) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("qs-resolve-pass"),
@@ -869,9 +1129,103 @@ impl Renderer {
             pass.set_bind_group(0, offscreen.bind_group(), &[]);
             pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
             pass.draw(0..3, 0..1);
+
+            // The panel and everything above it, drawn onto the surface the resolve just
+            // restored, with the blurred backdrop bound. Empty unless something asked for a
+            // backdrop -- so a forced two-pass frame emits the resolve and stops, exactly as
+            // it did before this chunk.
+            if blurring {
+                self.draw_span(
+                    &mut pass,
+                    list,
+                    backdrop_at..u32::MAX,
+                    // The lighting seam is NOT re-emitted here. It belongs to the surfaces it
+                    // modulates, which are behind the panel and were drawn in the first pass;
+                    // emitting it again would light the panel and everything above it, which
+                    // is lit-contrast rule 1 broken in the loudest possible way -- the glyphs
+                    // on a popover are content, and content is drawn after lighting and never
+                    // lit. A frame whose seam falls after the backdrop cut therefore lights
+                    // nothing beyond it, which is the conservative direction: rule 1 permits
+                    // an unlit surface and forbids a lit glyph.
+                    None,
+                    self.blurred_bind_group(),
+                );
+            }
         }
 
         encoder.finish()
+    }
+
+    /// What group 2 binds: the finished blur when the chain ran this frame, the placeholder
+    /// otherwise.
+    fn blurred_bind_group(&self) -> &wgpu::BindGroup {
+        self.blur
+            .as_ref()
+            .map_or(&self.backdrop_placeholder, BlurChain::pong_bind_group)
+    }
+
+    fn backdrop_placeholder(&self) -> &wgpu::BindGroup {
+        &self.backdrop_placeholder
+    }
+
+    /// Draw `span` of `list`'s batches through the instance pipeline, emitting the lighting
+    /// triangle when `lit_at` falls inside the span.
+    ///
+    /// A span rather than the whole list, because there are now two cuts in the sequence and
+    /// the second one ends a render pass. Passing the lighting index in rather than recomputing
+    /// it is what keeps the seam in one place: a helper that found its own cut would find it
+    /// relative to the span and put the light in the middle of the second half.
+    /// Draw the instances of `list` inside `span`, emitting the lighting triangle at the
+    /// batch boundary `lit_at` when it falls in this pass.
+    ///
+    /// Two indices in two different units, which is not an oversight. The lighting seam is a
+    /// **batch** boundary because lit-contrast rule 1 is about atlas-sampled batches — text is
+    /// drawn after lighting — and a batch is exactly what carries "samples the atlas". The
+    /// backdrop cut is an **instance** index because nothing groups instances by kind, and a
+    /// panel is routinely in the same batch as the rows behind it; see [`backdrop_split`] for
+    /// what cutting it at the batch actually produced.
+    fn draw_span(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        list: &DrawList,
+        span: std::ops::Range<u32>,
+        lit_at: Option<usize>,
+        backdrop: &wgpu::BindGroup,
+    ) {
+        let bind_instances = |pass: &mut wgpu::RenderPass<'_>| {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+            pass.set_bind_group(2, backdrop, &[]);
+            pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        };
+        bind_instances(pass);
+
+        // `split_at`, clamped, rather than two slice expressions: the caller hands in an index
+        // it computed from a *different* batch list in principle, and a seam past the end
+        // should light everything rather than panic mid-frame.
+        let cut = lit_at.unwrap_or(list.batches.len()).min(list.batches.len());
+        let (before_seam, after_seam) = list.batches.split_at(cut);
+        draw_batches_within(pass, list, before_seam, span.clone());
+
+        // The lighting pass, in the seam (US1): it modulates the surfaces just drawn
+        // and is finished before any glyph exists to be lit — lit-contrast rule 1 as
+        // draw order. One fullscreen triangle inside the SAME wgpu pass, so an unlit
+        // frame's command stream is exactly what it always was; with a scene, the only
+        // additions are one pipeline switch each way and one draw.
+        if lit_at.is_some() {
+            pass.set_pipeline(&self.lit_pipeline);
+            pass.set_bind_group(0, &self.lit_bind_group, &[]);
+            pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
+            pass.draw(0..3, 0..1);
+
+            // The instance pipeline back, for the content half: pipeline, all three bind
+            // groups and the vertex buffer, because a render pass forgets nothing but
+            // guarantees nothing across a pipeline switch.
+            bind_instances(pass);
+        }
+
+        draw_batches_within(pass, list, after_seam, span);
     }
 
     /// The lighting target, if one has been allocated.
@@ -953,11 +1307,69 @@ fn surface_content_split(batches: &[Batch]) -> usize {
         .unwrap_or(batches.len())
 }
 
+/// Whether this instance samples what is behind it.
+///
+/// Named rather than inlined because two places ask it — whether the frame needs a target, and
+/// whether it needs a chain — and the two answering differently is a frame that blurs a texture
+/// nothing filled.
+fn instance_needs_backdrop(instance: &Instance) -> bool {
+    PrimKind::from_raw(instance.kind).is_some_and(PrimKind::needs_backdrop)
+}
+
+/// Where the batch sequence stops being **the backdrop**.
+///
+/// The index of the first batch carrying a primitive that samples what is behind it, or the
+/// end of the list when none does. Everything before this index is drawn into the offscreen
+/// target and blurred; everything from it on is drawn afterwards, over the resolved surface,
+/// with that blur bound.
+///
+/// A **cut, not a partition**, for exactly [`surface_content_split`]'s reason and with a
+/// sharper consequence: a later instance that samples nothing stays on the far side of the
+/// cut, because it was authored to sit *above* the panel and moving it under would reorder
+/// composition. The price is that such an instance is not part of any panel's backdrop — which
+/// is correct, since it is drawn after the panel and a backdrop is what is behind.
+///
+/// # An INSTANCE index, and the first version was a batch index
+///
+/// A batch is a run sharing a scissor rect and a texture binding, and **nothing groups
+/// instances by kind** — so a panel is very often in the same batch as the rows behind it. Cut
+/// at the batch, that panel's backdrop is everything before its batch, which for a list drawn
+/// in one batch is *nothing at all*: the target holds the clear colour, the chain blurs a flat
+/// field, and the panel renders as its own tint over a uniform ground.
+///
+/// That is not a hypothetical. The first build cut at the batch, and `blur_panel` — one
+/// `end_batch` at the end, like any small draw list — produced two panels three levels apart
+/// out of 255 and a chain that had allocated, run three passes and been given a blank image to
+/// blur. Every test was green. The failure mode is exactly research R15's: an effect that is
+/// correct, bounded, allocated, executed, and invisible.
+fn backdrop_split(list: &DrawList) -> u32 {
+    list.instances
+        .iter()
+        .position(instance_needs_backdrop)
+        .map_or(u32::MAX, |i| i as u32)
+}
+
 /// One half of the batch loop. Factored so the two halves around the lighting seam cannot
 /// drift apart — the scissor clamping below is exactly the kind of detail a second copy
 /// forgets.
-fn draw_batches(pass: &mut wgpu::RenderPass<'_>, list: &DrawList, batches: &[Batch]) {
+/// Draw `batches`, restricted to the instances inside `span`.
+///
+/// A batch is a run sharing a scissor and a texture binding, and nothing groups it by kind, so
+/// the backdrop cut lands **inside** a batch far more often than between two. Clamping each
+/// batch's instance range is what lets the cut be an instance rather than a batch, and every
+/// batch keeps its own scissor either way — the run is narrowed, never merged or reordered.
+fn draw_batches_within(
+    pass: &mut wgpu::RenderPass<'_>,
+    list: &DrawList,
+    batches: &[Batch],
+    span: std::ops::Range<u32>,
+) {
     for batch in batches {
+        let lo = batch.range.start.max(span.start);
+        let hi = batch.range.end.min(span.end);
+        if lo >= hi {
+            continue;
+        }
         if let Some([x, y, w, h]) = batch.scissor {
             // A scissor rect outside the surface is a validation error, and a
             // resize race can produce one. Clamping is cheaper than the frame it
@@ -974,7 +1386,7 @@ fn draw_batches(pass: &mut wgpu::RenderPass<'_>, list: &DrawList, batches: &[Bat
         } else {
             pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
         }
-        pass.draw(0..4, batch.range.clone());
+        pass.draw(0..4, lo..hi);
     }
 }
 
@@ -1002,6 +1414,77 @@ mod tests {
             scissor: None,
             textured,
         }
+    }
+
+    fn white() -> crate::color::Srgba {
+        crate::color::Srgba::new(1.0, 1.0, 1.0, 1.0)
+    }
+
+    fn glass() -> crate::color::Srgba {
+        crate::color::Srgba::new(0.2, 0.2, 0.2, 0.9)
+    }
+
+    /// A list with `behind` plain instances, then a panel, then `above` more -- all in ONE
+    /// batch, which is what a small draw list actually produces.
+    fn panelled(behind: u32, above: u32) -> DrawList {
+        let mut list = DrawList::default();
+        list.reset([64, 64], crate::color::Srgba::TRANSPARENT, 1);
+        for _ in 0..behind {
+            list.instances
+                .push(Instance::rect(0.0, 0.0, 8.0, 8.0, 0.0, white()));
+        }
+        list.instances
+            .push(Instance::blur(2.0, 2.0, 32.0, 32.0, 4.0, glass(), white()));
+        for _ in 0..above {
+            list.instances
+                .push(Instance::rect(0.0, 0.0, 4.0, 4.0, 0.0, white()));
+        }
+        list.end_batch(None, false);
+        list
+    }
+
+    #[test]
+    fn a_panel_sharing_a_batch_with_its_backdrop_still_has_one() {
+        // THE DEFECT THIS TEST IS NAMED FOR. `backdrop_split` was a BATCH index first, and
+        // every gate in the workspace stayed green while the effect was blank: a list with one
+        // batch cut at index 0, so nothing at all reached the offscreen target, the chain
+        // blurred the clear colour, and `blur_panel` rendered two panels three levels apart out
+        // of 255. Nothing groups instances by kind, so "the panel is in the same batch as the
+        // rows behind it" is the normal case and not the corner one.
+        for (behind, above) in [(5_u32, 0_u32), (5, 3), (1, 1), (40, 40)] {
+            let list = panelled(behind, above);
+            assert_eq!(
+                backdrop_split(&list),
+                behind,
+                "the cut has to land on the panel's own instance, not on its batch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_with_nothing_behind_the_panel_cuts_at_zero_rather_than_reporting_none() {
+        // The panel first in the list: legitimate (a popover over the bare canvas) and the one
+        // case where "no backdrop" and "an empty backdrop" have to stay different. The cut is
+        // 0, so the target is cleared and blurred -- a flat field, which is the truthful answer
+        // -- rather than u32::MAX, which would skip the chain and leave the panel sampling the
+        // placeholder.
+        let list = panelled(0, 4);
+        assert_eq!(backdrop_split(&list), 0);
+    }
+
+    #[test]
+    fn a_frame_with_no_panel_asks_for_no_cut_and_no_target() {
+        // The ordinary frame, and the claim that the whole path is inert without a backdrop
+        // primitive: no cut, and nothing that would allocate 8.3 MB.
+        let mut list = DrawList::default();
+        list.reset([64, 64], crate::color::Srgba::TRANSPARENT, 1);
+        for _ in 0..8 {
+            list.instances
+                .push(Instance::rect(0.0, 0.0, 8.0, 8.0, 0.0, white()));
+        }
+        list.end_batch(None, false);
+        assert_eq!(backdrop_split(&list), u32::MAX);
+        assert!(!list.instances.iter().any(instance_needs_backdrop));
     }
 
     #[test]

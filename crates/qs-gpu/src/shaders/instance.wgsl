@@ -21,6 +21,7 @@ const KIND_PBR:      u32 = 6u;
 const KIND_SWEEP:    u32 = 7u;
 const KIND_FIELD:    u32 = 8u;
 const KIND_IMAGE:    u32 = 9u;
+const KIND_BLUR:     u32 = 10u;
 
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318531;
@@ -69,6 +70,15 @@ struct Globals {
 // Rgba8UnormSrgb, so this sample is already linear. The stored bytes are STRAIGHT alpha --
 // see qs_gpu::atlas::RgbaImage for why premultiplying them would be wrong here specifically.
 @group(1) @binding(2) var colour_texture: texture_2d<f32>;
+
+// The blurred backdrop: everything drawn BEFORE the first batch carrying a KIND_BLUR
+// instance, run through `blur.wgsl`'s chain. A group of its own rather than a third binding
+// beside the atlas pages, because it is the one texture whose contents come from this frame's
+// own earlier passes rather than from a cache the CPU filled -- and because a frame with no
+// blur in it still has to bind SOMETHING here, which is a 1x1 placeholder rather than an
+// optional binding the pipeline layout would have to know about.
+@group(2) @binding(0) var backdrop_texture: texture_2d<f32>;
+@group(2) @binding(1) var backdrop_sampler: sampler;
 
 struct InstanceIn {
     // [x, y, width, height], physical pixels, top-left origin.
@@ -831,6 +841,29 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // colour into both stops and `glow_two_tone` is the form that spends the difference
         // on purpose.
         tint = halo(in.color, in.aux, glow_t(distance, in.param));
+    }
+    else if (in.kind == KIND_BLUR) {
+        // The coverage above is the fill's, untouched, and that is the whole of "clipped to
+        // the panel's rounded-rect coverage rather than to its bounding box": the blur is a
+        // tint like any other, and the shape it lands on is `sd_rounded_box`'s, with the same
+        // one-pixel analytic edge every fill has. Clipping to a bounding box would have needed
+        // an extra step here; getting the rounded shape needed none, because coverage and
+        // colour were already separable.
+        //
+        // `in.clip` is the framebuffer coordinate, so this is where the fragment sits on
+        // SCREEN rather than where it sits in the panel -- which is the point. The backdrop
+        // does not move with the panel; the panel is a window onto it.
+        let screen = in.clip.xy / globals.viewport;
+        let behind = textureSampleLevel(backdrop_texture, backdrop_sampler, screen, 0.0);
+        // `in.aux` is the glass, premultiplied linear; `behind` is opaque, since the backdrop
+        // is a rendered frame over an opaque clear. Source-over in premultiplied form, which
+        // leaves alpha at 1 and lets `tint * alpha` below do the shape's antialiasing exactly
+        // as it does for a plain fill.
+        //
+        // `in.color` -- the opaque floor -- is deliberately unread here. It exists for
+        // `Instance::cpu_floor`, which is the only consumer that needs it, and putting the
+        // glass there instead is the mistake `PrimKind::Blur` documents at length.
+        tint = in.aux + behind * (1.0 - in.aux.a);
     }
     else if (in.kind == KIND_PBR) {
         // The coverage is the fill's, untouched: a lit surface occupies exactly the shape a

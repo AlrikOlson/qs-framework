@@ -88,9 +88,12 @@ pub mod name {
     pub const CHROME_CHIP_HOVER: &str = "chrome/chip-hover";
     /// The status shelf's backing and its hairline.
     pub const CHROME_SHELF: &str = "chrome/shelf";
+    /// A popover, and the inspector's panel: glass over a blurred backdrop, with the opaque
+    /// `surface/raised` UXDD 10.7 chose as its floor.
+    pub const CHROME_POPOVER: &str = "chrome/popover";
 
     /// Every material a call site in this workspace names.
-    pub const ALL: [&str; 8] = [
+    pub const ALL: [&str; 9] = [
         SURFACE_CANVAS,
         ROW_BODY,
         ROW_BODY_ALT,
@@ -99,6 +102,7 @@ pub mod name {
         CHROME_BAR,
         CHROME_CHIP_HOVER,
         CHROME_SHELF,
+        CHROME_POPOVER,
     ];
 }
 
@@ -395,6 +399,36 @@ pub enum LayerDef {
         /// [`PhaseDef::flicker`].
         #[serde(default)]
         phase: PhaseDef,
+        #[serde(flatten)]
+        geometry: GeometryDef,
+    },
+    /// Glass: a tint over a blurred copy of whatever is behind the shape.
+    ///
+    /// The layer that lets a material ask for **depth** rather than a call site assembling a
+    /// blur. What a surface using this is saying is "I am in front of things", and the two
+    /// colours it names are the two answers to that on the two kinds of machine.
+    ///
+    /// [`Fidelity::Enhanced`] with a floor of the plain fill, and the floor is `floor` rather
+    /// than `color` -- which is the opposite of every other layer here and the whole point.
+    /// UXDD 10.7 fixed this effect's fallback as **opaque `surface/raised`** before the effect
+    /// existed, and named a translucent unblurred panel as the wrong answer. `color` is the
+    /// glass, which is translucent by definition; degrading to it is exactly the wrong answer.
+    /// So the two are separate fields with separate names, and [`PrimKind::Blur`] records what
+    /// the tempting single-colour spelling ships instead.
+    Backdrop {
+        /// The glass: what is composited over the blurred backdrop. Translucent, or the blur
+        /// is invisible and this is a fill with extra passes.
+        color: String,
+        #[serde(default)]
+        alpha: Option<f32>,
+        /// The opaque panel a machine that cannot blur shows instead, and the colour the
+        /// contrast gate reads. Required, not defaulted: an effect with no floor cannot ship
+        /// (UXDD 10.7), and defaulting it to `color` would make every backdrop material ship
+        /// the fallback the table forbids.
+        floor: String,
+        /// How this layer responds to the material's drive. See [`SwellDef`].
+        #[serde(default)]
+        swell: SwellDef,
         #[serde(flatten)]
         geometry: GeometryDef,
     },
@@ -875,10 +909,52 @@ impl Layer {
                 }
                 stops
             }
+            // The one layer whose background is not a colour the palette contains, because
+            // what is behind a popover is the rest of the window and the rest of the window is
+            // content. So the stops are the two halves of UXDD 10.7's "contrast is checked
+            // against the floor as well as the effect", made checkable:
+            //
+            // - THE FLOOR, `flat`, opaque: what every machine without the effect shows, and
+            //   the only stop a plain reading of the rule requires.
+            // - THE EFFECT, sampled: the glass composited over a ramp of neutral grounds from
+            //   black to white. Relative luminance cannot see hue (the same fact the canvas
+            //   field's four coloured centres already rest on), so sampling LUMINANCE samples
+            //   every backdrop -- a green window and a grey one of the same lightness put the
+            //   same contrast under the label.
+            //
+            // Sampling rather than taking the extremes, and that is not caution. Contrast
+            // against a fixed ink is NOT monotonic in the background: the worst case is
+            // wherever the composite's luminance passes closest to the ink's, which is in the
+            // interior. Checking black and white alone passes an ink that becomes invisible
+            // against mid-grey, which on a popover over a half-lit list is the common case
+            // rather than the exotic one.
+            //
+            // Nine samples in sRGB code value, not in linear light: the ramp is walked where
+            // perception is, so the grid is even in the space the ink's legibility varies in.
+            // Every stop is opaque -- glass over an opaque ground -- so `composites`'s
+            // cartesian product collapses here rather than multiplying out.
+            PrimKind::Blur => {
+                let mut stops = vec![self.flat];
+                for step in 0..=BACKDROP_SAMPLES {
+                    let level = step as f32 / BACKDROP_SAMPLES as f32;
+                    let ground = Srgba::new(level, level, level, 1.0);
+                    stops.push(self.near.over(ground));
+                }
+                stops
+            }
             _ => vec![self.near, self.near],
         }
     }
 }
+
+/// How many grounds a [`PrimKind::Blur`] layer's glass is checked over, plus one.
+///
+/// Nine samples spanning black to white. The number is a resolution rather than a threshold:
+/// with a glass of opacity `a`, the composites it produces span `(1 - a)` of the full
+/// luminance range, so the grid under the label is `(1 - a) / 8` apart. At the opacities a
+/// legible panel actually ships at -- 0.8 and up -- that is finer than the gate's own margin,
+/// and at opacities below that the gate fails on one of these samples, which is the answer.
+const BACKDROP_SAMPLES: u32 = 8;
 
 /// Which half of a material a call site is painting.
 ///
@@ -1021,6 +1097,7 @@ impl Material {
                 && !matches!(layer.kind.fidelity(), Fidelity::Exact)
                 && layer.kind != PrimKind::Pbr
                 && layer.kind != PrimKind::Field
+                && layer.kind != PrimKind::Blur
             {
                 continue;
             }
@@ -1051,6 +1128,17 @@ impl Material {
                 // also what `Instance::cpu_floor` leaves on the fallback tier, so the two
                 // degraded forms agree instead of being two guesses.
                 PrimKind::Pbr if !effects => {
+                    Instance::rect(x, y, w, h, radius, scaled(layer.flat, alpha))
+                }
+                // Glass flattens to its panel, and UXDD 10.5 asks for this by name: forced
+                // colours "disabl[es] blur and tint". It is also the one case where the
+                // fallback is not a concession -- the OS supplied a fixed palette, and a
+                // window onto arbitrary content is not a colour the OS can have supplied.
+                //
+                // Dropped instead, a popover in forced-colours mode would be its own text over
+                // the list, which is `row/selected`'s three-enhanced-layers failure again with
+                // a worse outcome: not merely invisible, but unreadable.
+                PrimKind::Blur if !effects => {
                     Instance::rect(x, y, w, h, radius, scaled(layer.flat, alpha))
                 }
                 PrimKind::Gradient => {
@@ -1103,6 +1191,13 @@ impl Material {
                     layer.emission,
                     near,
                 ),
+                // The glass and the panel, in that order, into the two fields that decide what
+                // each tier sees. Getting them the other way round is a one-word edit that
+                // compiles, renders correctly on every GPU, and ships UXDD 10.7's stated wrong
+                // answer to everyone else -- which is why `Instance::blur` names its arguments
+                // rather than taking a near/far pair, and why `the_floor_is_the_opaque_panel_
+                // and_not_the_glass` reads the resulting pixels.
+                PrimKind::Blur => Instance::blur(x, y, w, h, radius, near, layer.flat),
                 // A glyph is not a material layer: it samples the atlas, and what it samples
                 // is text, which is content rather than a look. `LayerDef` cannot spell one.
                 //
@@ -1166,6 +1261,12 @@ impl Material {
                     | PrimKind::Sweep
                     | PrimKind::Field
                     | PrimKind::Pbr
+                    // A pane of glass is the body of the thing it belongs to, the same way a
+                    // lit surface is: it fills the whole shape and is opaque once composited.
+                    // Its albedo is `flat`, the opaque panel -- which is the right answer for
+                    // a lit scene as well as for a tier that cannot blur, since what a light
+                    // falls on is the panel and not the window behind it.
+                    | PrimKind::Blur
             ) && layer.edge.is_none()
                 && layer.inset == 0.0
                 && layer.offset == 0.0
@@ -1501,6 +1602,7 @@ pub(crate) fn resolve_all(
                 | LayerDef::Glow { geometry, .. }
                 | LayerDef::Rim { geometry, .. }
                 | LayerDef::Pbr { geometry, .. }
+                | LayerDef::Backdrop { geometry, .. }
                 | LayerDef::Stroke { geometry, .. } => geometry,
             };
             let swell = match layer {
@@ -1511,6 +1613,7 @@ pub(crate) fn resolve_all(
                 | LayerDef::Glow { swell, .. }
                 | LayerDef::Rim { swell, .. }
                 | LayerDef::Pbr { swell, .. }
+                | LayerDef::Backdrop { swell, .. }
                 | LayerDef::Stroke { swell, .. } => *swell,
             };
             let inset = match &geometry.inset {
@@ -1707,6 +1810,34 @@ pub(crate) fn resolve_all(
                         far: tint,
                         flat: tint,
                         width: *width,
+                        ..common
+                    }
+                }
+                LayerDef::Backdrop {
+                    color: name,
+                    alpha,
+                    floor,
+                    ..
+                } => {
+                    let glass = at(color(name, material)?, *alpha);
+                    // The floor takes NO alpha override. UXDD 10.7 requires an opaque panel,
+                    // and a material that could dim its own floor could author the translucent
+                    // unblurred panel the table forbids -- through the field that exists to
+                    // prevent exactly that.
+                    let panel = color(floor, material)?;
+                    Layer {
+                        kind: PrimKind::Blur,
+                        // `near` is the glass on both stops, the way a fill's is: a blur has
+                        // one tint and its variation comes from what is behind it, not from a
+                        // second stop. What `in_shape_stops` does with that is the interesting
+                        // part -- see there.
+                        near: glass,
+                        far: glass,
+                        // And `flat` is the panel, which is what makes forced-colours mode and
+                        // the CPU tier agree: `compile_pass_with` collapses this layer to
+                        // `flat`, and `Instance::cpu_floor` resolves the instance's `color` --
+                        // which `Instance::blur` filled from this same value.
+                        flat: panel,
                         ..common
                     }
                 }
@@ -2001,6 +2132,168 @@ mod tests {
                     .contrast_ratio(ground)
             })
             .fold(0.0_f32, f32::max)
+    }
+
+    /// WCAG 2.2 SC 1.4.3: body text against its background. Cited, like [`STATE_CUE_MIN`].
+    const TEXT_MIN: f32 = 4.5;
+
+    /// Every material carrying a [`PrimKind::Blur`] layer, with the layer.
+    fn glass_materials(tokens: &Tokens) -> Vec<(&'static str, Layer)> {
+        name::ALL
+            .iter()
+            .filter_map(|n| {
+                let material = tokens.material(n)?;
+                let layer = material.layers.iter().find(|l| l.kind == PrimKind::Blur)?;
+                Some((*n, *layer))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_backdrop_degrades_to_the_opaque_panel_and_never_to_its_own_glass() {
+        // UXDD 10.7 names this effect's fallback -- opaque `surface/raised` -- and names the
+        // wrong one in the same row: "a translucent unblurred [panel] is just hard to read".
+        // Both degradations have to land on the first, and they are reached by two different
+        // routes that could disagree: forced colours resolves in `compile_pass_with`, the CPU
+        // tier resolves in `Instance::cpu_floor`. `row/selected` is on record for having had
+        // exactly this pair disagree.
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            let glass = glass_materials(&tokens);
+            assert!(
+                !glass.is_empty(),
+                "no material uses a backdrop layer, so this test checks nothing -- if the \
+                 layer was removed on purpose, remove this test with it"
+            );
+
+            for (name, layer) in glass {
+                // The premise: the glass really is glass. Opaque, and every assertion below
+                // holds trivially under either encoding.
+                assert!(
+                    layer.near.a < 1.0,
+                    "{name} on {theme:?}: the glass is opaque, so this material is a fill \
+                     paying for three render passes"
+                );
+                assert!(
+                    (layer.flat.a - 1.0).abs() < f32::EPSILON,
+                    "{name} on {theme:?}: the floor is {}/1 opaque. UXDD 10.7 requires an \
+                     OPAQUE panel; a translucent one is the answer the table forbids",
+                    layer.flat.a
+                );
+
+                // Route 1, forced colours. UXDD 10.5: "honored by mapping tokens to system
+                // colors, disabling blur and tint".
+                let forced = compile(name, theme, false);
+                let panel = forced
+                    .iter()
+                    .find(|i| i.kind == PrimKind::Rect as u32)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name} on {theme:?} draws no panel with \
+                                               effects off"
+                        )
+                    });
+                assert_eq!(
+                    panel.color,
+                    layer.flat.to_premul_linear_rgba8(),
+                    "{name} on {theme:?}: forced colours drew something other than the floor"
+                );
+
+                // Route 2, the CPU tier. Same colour, reached without consulting the token
+                // file at all.
+                let drawn = compile(name, theme, true);
+                let blurred = drawn
+                    .iter()
+                    .find(|i| i.kind == PrimKind::Blur as u32)
+                    .unwrap_or_else(|| panic!("{name} on {theme:?} compiled no blur"));
+                let floored = blurred.cpu_floor().unwrap_or_else(|| {
+                    panic!("{name} on {theme:?}: a panel must degrade to something")
+                });
+                assert_eq!(floored.kind, PrimKind::Rect as u32);
+                assert_eq!(
+                    floored.color,
+                    layer.flat.to_premul_linear_rgba8(),
+                    "{name} on {theme:?}: the CPU tier drew the GLASS, which is the \
+                     translucent unblurred panel UXDD 10.7 names as wrong. The fields are \
+                     the wrong way round in `Instance::blur` -- see `PrimKind::Blur`."
+                );
+
+                // And the two routes agree, which is the property `row/selected` lost.
+                assert_eq!(panel.color, floored.color, "{name} on {theme:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_glass_is_never_less_legible_than_the_panel_it_degrades_to() {
+        // UXDD 10.7's third consequence, applied where it bites hardest: "contrast is checked
+        // against the floor as well as the effect". For a blur the effect's background is not
+        // a palette colour at all -- it is the rest of the window -- so `Layer::in_shape_stops`
+        // samples it, and this asserts the ink clears 4.5:1 on every one of those samples and
+        // not merely on the floor.
+        //
+        // It is the assertion that decided the shipped opacity. At 0.82 the glass let enough
+        // of a mid-grey backdrop through to put `content/secondary` at 4.02:1, and the panel
+        // read as showier and was less readable; the gate refused it, which is the whole
+        // mechanism working. 0.84 still failed at 4.29:1 and 0.86 was the first value to
+        // pass. What ships is 0.90 rather than 0.86, because `chip-hover-contrast-headroom`
+        // is on the roadmap precisely for a token parked on the threshold with nothing left
+        // for a future layer to spend.
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            for (name, _) in glass_materials(&tokens) {
+                let material = tokens.material(name).unwrap();
+                assert!(
+                    !material.text.is_empty(),
+                    "{name} declares no text, so nothing is being checked against it"
+                );
+                for base in &material.over {
+                    for ground in material.composites(tokens.color(base)) {
+                        for ink in &material.text {
+                            let ratio = tokens.color(ink).contrast_ratio(ground);
+                            assert!(
+                                ratio >= TEXT_MIN,
+                                "{name} on {theme:?}: {ink} is {ratio:.2}:1 against a \
+                                 composite this panel reaches, under the {TEXT_MIN}:1 floor. \
+                                 The glass is letting too much of the backdrop through -- \
+                                 raise its opacity or take the ink off this surface."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_sampled_backdrops_span_the_range_a_window_can_be() {
+        // The guard on the test above. `in_shape_stops` could return the floor alone and
+        // every assertion there would still pass -- which is the vacuous green this repository
+        // has now recorded three times. So: the stops have to reach both ends.
+        let tokens = Tokens::embedded(Theme::Dark).unwrap();
+        for (name, layer) in glass_materials(&tokens) {
+            let stops = layer.in_shape_stops();
+            assert!(
+                stops.len() > 2,
+                "{name}: a blur contributed {} stops, so the backdrop is not being sampled \
+                 and the effect is checked only at its floor",
+                stops.len()
+            );
+            let black = layer.near.over(Srgba::new(0.0, 0.0, 0.0, 1.0));
+            let white = layer.near.over(Srgba::new(1.0, 1.0, 1.0, 1.0));
+            assert!(
+                stops.contains(&black),
+                "{name}: no stop over a black window"
+            );
+            assert!(
+                stops.contains(&white),
+                "{name}: no stop over a white window"
+            );
+            assert!(
+                stops.contains(&layer.flat),
+                "{name}: the floor is not a stop"
+            );
+        }
     }
 
     #[test]

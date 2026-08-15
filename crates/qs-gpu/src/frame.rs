@@ -173,6 +173,33 @@ pub enum PrimKind {
     /// atlas coordinates from the same [`crate::atlas::GlyphAtlas`], so declaring a floor
     /// would be a concession nothing forces -- the same argument [`PrimKind::Sweep`] records.
     Image = 9,
+    /// Pass 0's shape filled with a **blurred copy of what is behind it**, tinted: the glass
+    /// a popover and the inspector sit behind, UXDD 10.2's "depth via real blur".
+    ///
+    /// The first kind whose [`PrimKind::needs_backdrop`] is `true`, and therefore the first
+    /// that cannot be drawn from its own fragment alone. What it samples is the frame's own
+    /// prior output, blurred by [`crate::target::BlurChain`] -- so the renderer cuts the batch
+    /// sequence at the first batch carrying one of these, draws everything before it into the
+    /// offscreen target, blurs *that*, and only then draws this. A blur that sampled a target
+    /// containing the whole frame would be sampling the panel itself.
+    ///
+    /// # Which field carries what, and why it is this way round
+    ///
+    /// [`Instance::color`] is the **opaque floor** -- what the panel is on a tier that cannot
+    /// blur -- and [`Instance::uv`] is the glass tint composited over the blurred backdrop, as
+    /// premultiplied linear RGBA the way [`PrimKind::Gradient`]'s far stop is.
+    /// [`Instance::param`] is unused.
+    ///
+    /// The obvious encoding is the other way round, and it fails UXDD 10.7 in exactly the way
+    /// the table names. [`Instance::cpu_floor`] keeps `color` and drops `uv`, so a translucent
+    /// scrim in `color` degrades to *a translucent unblurred panel* -- the answer 10.7 calls
+    /// out by name as wrong. Inverted, `Floor::Plain(Rect)` resolves to the opaque panel the
+    /// table asks for through machinery that already exists, and the contrast gate reads the
+    /// floor rather than a tint over content nothing can predict.
+    ///
+    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)`, which is the opaque
+    /// `surface/raised` UXDD 10.7 chose before the effect existed.
+    Blur = 10,
 }
 
 impl PrimKind {
@@ -191,7 +218,7 @@ impl PrimKind {
     ///
     /// It exists so the `tier_parity` suite can assert that *every* kind has a parity
     /// fixture, rather than asserting it about whichever kinds someone remembered.
-    pub const ALL: [PrimKind; 10] = [
+    pub const ALL: [PrimKind; 11] = [
         Self::Rect,
         Self::Stroke,
         Self::Glyph,
@@ -202,6 +229,7 @@ impl PrimKind {
         Self::Sweep,
         Self::Field,
         Self::Image,
+        Self::Blur,
     ];
 
     /// This variant's position in [`PrimKind::ALL`].
@@ -221,6 +249,7 @@ impl PrimKind {
             Self::Sweep => 7,
             Self::Field => 8,
             Self::Image => 9,
+            Self::Blur => 10,
         }
     }
 
@@ -242,6 +271,7 @@ impl PrimKind {
             Self::Sweep => "KIND_SWEEP",
             Self::Field => "KIND_FIELD",
             Self::Image => "KIND_IMAGE",
+            Self::Blur => "KIND_BLUR",
         }
     }
 
@@ -312,7 +342,16 @@ impl PrimKind {
             // `Nothing` would have been wrong for a reason the halo's floor makes clear: a
             // halo is decoration around a shape, and this is the ground under everything.
             // Dropping it would leave the window unpainted.
-            Self::Pbr | Self::Field => Fidelity::Enhanced {
+            // The third kind with a primitive for a floor, and the only one whose floor was
+            // written down years before the effect: UXDD 10.7's table says **opaque
+            // `surface/raised`**, and names a translucent unblurred panel as the wrong answer.
+            // `Plain(Rect)` is exactly that, because `Instance::color` on a blur carries the
+            // opaque panel rather than the glass tint -- see [`PrimKind::Blur`] for why the
+            // fields are that way round and what the tempting arrangement ships instead.
+            //
+            // `Nothing` is not available here for the reason it was not available to the PBR
+            // surface: this IS the panel. Dropped, a popover would be its text over the list.
+            Self::Pbr | Self::Field | Self::Blur => Fidelity::Enhanced {
                 floor: Floor::Plain(PrimKind::Rect),
             },
         }
@@ -321,10 +360,10 @@ impl PrimKind {
     /// Whether this primitive is a function of **its neighbours** rather than of its own
     /// fragment, and so needs the frame drawn into an offscreen target it can sample.
     ///
-    /// The fourth exhaustive match, and today every arm is `false` — the target infrastructure
-    /// (`crate::target`) landed before the first effect that uses it, deliberately, so its
-    /// memory cost, resize behaviour and tier answer were decided in the open rather than
-    /// under a visual feature. Blur, bloom and refraction each flip one arm.
+    /// The fourth exhaustive match. The target infrastructure (`crate::target`) landed before
+    /// the first effect that uses it, deliberately, so its memory cost, resize behaviour and
+    /// tier answer were decided in the open rather than under a visual feature.
+    /// [`PrimKind::Blur`] is the first arm to flip; bloom and refraction are the other two.
     ///
     /// A `true` here obliges two things. The renderer takes its two-pass path for the whole
     /// frame, which costs one full-viewport target — 8.3 MB at 1080p, 33.2 MB at 4K. And the
@@ -351,6 +390,9 @@ impl PrimKind {
             // The atlas is content the frame put there itself; a backdrop is the frame's own
             // prior output, and only the second needs the two-pass path.
             | Self::Image => false,
+            // And this is that second thing. A blurred pixel is a weighted sum over its
+            // neighbours, which no amount of closed form reaches from one fragment.
+            Self::Blur => true,
         }
     }
 
@@ -373,6 +415,13 @@ impl PrimKind {
             6 => Some(Self::Pbr),
             7 => Some(Self::Sweep),
             8 => Some(Self::Field),
+            // Absent until `prim-backdrop-blur` added the arm below it and noticed. It cost
+            // nothing while it was missing -- every caller reads this to ask a question whose
+            // answer for a picture is `false` either way -- but "the kind the enum does not
+            // know" is precisely the diagnosis `from_raw` exists to make, and a kind the enum
+            // knows perfectly well answering it is the failure mode `None` is meant to expose.
+            9 => Some(Self::Image),
+            10 => Some(Self::Blur),
             _ => None,
         }
     }
@@ -735,6 +784,34 @@ impl Instance {
         }
     }
 
+    /// A pane of glass: `tint` over a blurred copy of whatever is behind `w x h`.
+    ///
+    /// The argument order is the encoding, and it is deliberately not the one every other
+    /// constructor here has. `floor` comes last but it is what lands in [`Instance::color`],
+    /// because `color` is what [`Instance::cpu_floor`] carries down to `Floor::Plain(Rect)` --
+    /// so `floor` is the opaque panel a machine without the effect sees, and it is the colour
+    /// the contrast gate reads. `tint` is the glass, and it goes to `uv` beside the gradient's
+    /// far stop.
+    ///
+    /// Passing them the other way round compiles, renders correctly on a GPU, and ships the
+    /// exact fallback UXDD 10.7 names as wrong. That is why they are named rather than being a
+    /// `near`/`far` pair, and why `the_floor_is_the_opaque_panel_and_not_the_glass` measures
+    /// which one survives the degradation rather than trusting the argument list.
+    ///
+    /// The blur's radius is **not** here. One blurred copy of the backdrop serves every blur
+    /// instance in the frame -- see [`crate::target::BlurChain`] -- so a per-instance radius
+    /// would be a parameter that silently does nothing to the second panel on screen.
+    pub fn blur(x: f32, y: f32, w: f32, h: f32, radius: f32, tint: Srgba, floor: Srgba) -> Self {
+        Self {
+            rect: [x, y, w, h],
+            uv: tint.to_premul_linear_f32(),
+            color: floor.to_premul_linear_rgba8(),
+            radius,
+            param: 0.0,
+            kind: PrimKind::Blur as u32,
+        }
+    }
+
     /// What the CPU tier draws for this instance. `None` means nothing at all.
     ///
     /// The one route from an enhanced instance to CPU pixels, and the reason
@@ -761,6 +838,14 @@ impl Instance {
             k if k == PrimKind::Pbr as u32 => PrimKind::Pbr,
             k if k == PrimKind::Sweep as u32 => PrimKind::Sweep,
             k if k == PrimKind::Field as u32 => PrimKind::Field,
+            k if k == PrimKind::Image as u32 => PrimKind::Image,
+            // The one arm whose absence would have been a *silent* pass rather than a wrong
+            // one: falling through to `Some(*self)` leaves a blur instance for the rasterizer,
+            // whose unknown-kind fallback fills it with `color` -- which is the floor colour,
+            // so the picture would have been right and `uv` and `param` would have travelled
+            // anyway. A floor that is correct by accident is the thing `cpu_floor` centralises
+            // fidelity to prevent.
+            k if k == PrimKind::Blur as u32 => PrimKind::Blur,
             // A kind the enum does not know. The rasterizer's own fallback treats it as a
             // fill, which is the behaviour that predates this method; deciding it is enhanced
             // would silently drop an instance instead.

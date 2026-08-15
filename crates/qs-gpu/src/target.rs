@@ -287,6 +287,260 @@ impl LightingTarget {
     }
 }
 
+/// How much smaller than the viewport the blur chain works, per axis.
+///
+/// **Four, and the number is derived rather than tuned.** After a Gaussian of standard
+/// deviation `sigma`, the signal carries essentially no energy above `1/(2*sigma)` cycles per
+/// pixel; sampling it on a grid whose own Nyquist limit is above that loses nothing visible.
+/// At [`BLUR_SIGMA_TEXELS`] = 4 quarter-resolution texels the blurred signal's content sits
+/// below 1/32 cycles per full-resolution pixel and a quarter-resolution grid resolves to 1/8,
+/// which is four times the margin needed.
+///
+/// Being a **power of two** is the second half. A factor of four makes the downsample an exact
+/// 4x4 box average, reachable as four bilinear taps at half-texel offsets with every weight
+/// equal; a factor of three would need nine taps with unequal weights and would put a
+/// resampling kernel of somebody's choosing under an effect whose whole claim is that it does
+/// not invent detail.
+///
+/// The saving is the reason it is worth stating at all: blur fragment work falls by sixteen,
+/// which is what moves the effect from "measure before shipping" to "measure and ship".
+pub const BLUR_DOWNSAMPLE: u32 = 4;
+
+/// The Gaussian's standard deviation, in **downsampled** texels.
+///
+/// Four texels, which at [`BLUR_DOWNSAMPLE`] is **16 physical pixels** at 1x scale. That is the
+/// figure to argue with: it is a little over one row height at the comfortable density, so a
+/// popover shows the list behind it as bands of colour with no legible glyph left in them --
+/// which is UXDD 10.2's "legible as context" in the direction that matters, since context that
+/// can still be *read* competes with the panel's own text.
+pub const BLUR_SIGMA_TEXELS: f32 = 4.0;
+
+/// Where the kernel is truncated, in downsampled texels: `2.5 * sigma`, rounded.
+///
+/// A Gaussian has infinite support and a shader does not. The continuous distribution puts
+/// 1.24% of its mass beyond 2.5 sigma; the **discrete** kernel the shader sums -- integer
+/// offsets, sigma 4 -- drops **0.85%**, which is the figure that matters and is measured by
+/// `the_kernel_is_stated_as_a_truncated_gaussian_and_not_as_a_tap_count` rather than quoted.
+/// The two are not the same number and the test is what made the difference visible.
+///
+/// Whatever it is, it is renormalized into what remains rather than dropped: truncating
+/// without renormalizing scales the whole blur down by that fraction, which reads as the panel
+/// being faintly darker than its tint asked for and gets diagnosed as a palette bug.
+///
+/// Ten texels each side is 21 discrete taps, folded to **11 texture samples** by taking each
+/// adjacent pair at its weighted midpoint through a linear sampler. So the chain costs
+/// 1 + 11 + 11 = 23 samples per output texel across its three passes, at one sixteenth of the
+/// viewport's fragment count.
+pub const BLUR_RADIUS_TEXELS: u32 = 10;
+
+/// The blur's reach in physical pixels at scale 1, for anything that needs to know how far
+/// past a panel's edge the effect reads from.
+#[must_use]
+pub const fn blur_reach_pixels() -> u32 {
+    BLUR_RADIUS_TEXELS * BLUR_DOWNSAMPLE
+}
+
+/// The quarter-resolution ping-pong pair the separable blur runs on.
+///
+/// # Why two textures and not one
+///
+/// A separable Gaussian is two passes, and neither can read and write the same texture. The
+/// pair is allocated together and sized together because they are one resource with two
+/// halves; splitting them into two lazily-allocated fields would allow the state where one
+/// exists at the current size and the other does not.
+///
+/// # Cost, stated before it is spent
+///
+/// Each half is `ceil(w/4) x ceil(h/4) x 4` bytes. At 1920x1080 that is 480x270, **518,400
+/// bytes each and 1,036,800 for the pair**; at 3840x2160, 2,073,600 for the pair. Against the
+/// 8.3 MB and 33.2 MB the colour target already costs at those sizes, the chain adds 12.5% --
+/// which is the whole argument for downsampling stated as a number.
+///
+/// Both halves carry the **surface's own format**, for [`OffscreenTarget`]'s reason: the blur
+/// reads an sRGB texture (hardware-decoded to linear), filters in linear, and writes back
+/// through the same encode, so no pass in the chain is a colour conversion.
+pub struct BlurChain {
+    ping: wgpu::TextureView,
+    pong: wgpu::TextureView,
+    /// Reads the [`OffscreenTarget`] this chain was built against: the source of the
+    /// downsample pass.
+    ///
+    /// Held here rather than beside the target because a bind group outlives neither, and
+    /// keeping it as a separate `Option` on the renderer creates the one state that must never
+    /// exist -- a chain pointing at a target that has been replaced. [`BlurChain::fits`] takes
+    /// the target's allocation generation for exactly that reason: a resize recreates the
+    /// target, and this chain has to go with it even when the viewport rounds to the same
+    /// downsampled size.
+    source_bind_group: wgpu::BindGroup,
+    generation: u32,
+    ping_bind_group: wgpu::BindGroup,
+    pong_bind_group: wgpu::BindGroup,
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
+}
+
+impl std::fmt::Debug for BlurChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlurChain")
+            .field("size", &self.size)
+            .field("format", &self.format)
+            .field("bytes", &self.bytes())
+            .finish()
+    }
+}
+
+impl BlurChain {
+    /// Allocate a pair sized for a viewport of `viewport`, reading `source`.
+    ///
+    /// `generation` is the [`OffscreenTarget`] allocation count `source` belongs to; see
+    /// [`BlurChain::fits`].
+    pub fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        format: wgpu::TextureFormat,
+        viewport: [u32; 2],
+        source: &wgpu::TextureView,
+        generation: u32,
+    ) -> Self {
+        let size = Self::size_for(viewport);
+        let make = |label: &str| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size[0],
+                    height: size[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let ping = make("qs-blur-ping");
+        let pong = make("qs-blur-pong");
+        let bind = |label: &str, view: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            })
+        };
+        let ping_bind_group = bind("qs-blur-ping-bind-group", &ping);
+        let pong_bind_group = bind("qs-blur-pong-bind-group", &pong);
+        let source_bind_group = bind("qs-blur-source-bind-group", source);
+        Self {
+            ping,
+            pong,
+            source_bind_group,
+            generation,
+            ping_bind_group,
+            pong_bind_group,
+            size,
+            format,
+        }
+    }
+
+    /// The downsampled size a viewport of `viewport` needs.
+    ///
+    /// Rounded **up**, and clamped to one texel per axis. Rounding down would leave the last
+    /// partial block of the viewport with no texel to blur into, so a panel touching the right
+    /// or bottom edge would sample the clamped edge of a texture that stops short -- a smear
+    /// along exactly the edge a maximised popover sits on.
+    #[must_use]
+    pub fn size_for(viewport: [u32; 2]) -> [u32; 2] {
+        [
+            viewport[0].div_ceil(BLUR_DOWNSAMPLE).max(1),
+            viewport[1].div_ceil(BLUR_DOWNSAMPLE).max(1),
+        ]
+    }
+
+    /// Where the **horizontal** pass writes, and the source of the vertical one.
+    #[must_use]
+    pub fn ping(&self) -> &wgpu::TextureView {
+        &self.ping
+    }
+
+    /// Where the **downsample** writes and where the **vertical** pass writes: the finished
+    /// blur the instance pipeline samples.
+    ///
+    /// The same texture twice, one pass apart, and that is safe rather than lucky: the
+    /// horizontal pass in between reads it and writes `ping`, so nothing ever reads and writes
+    /// this view in one pass. Three passes over two textures is the minimum a separable blur
+    /// with a downsample can use, and the alternative -- a third texture so each pass has a
+    /// fresh target -- costs another 518 KB at 1080p to avoid a comment.
+    #[must_use]
+    pub fn pong(&self) -> &wgpu::TextureView {
+        &self.pong
+    }
+
+    /// Reads `ping`: the source of the vertical pass.
+    #[must_use]
+    pub fn ping_bind_group(&self) -> &wgpu::BindGroup {
+        &self.ping_bind_group
+    }
+
+    /// Reads `pong`: the source of the horizontal pass, and — after the vertical pass has
+    /// written back into it — the finished blur.
+    #[must_use]
+    pub fn pong_bind_group(&self) -> &wgpu::BindGroup {
+        &self.pong_bind_group
+    }
+
+    #[must_use]
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// Reads the offscreen target: the source of the downsample pass.
+    #[must_use]
+    pub fn source_bind_group(&self) -> &wgpu::BindGroup {
+        &self.source_bind_group
+    }
+
+    /// Whether this chain can serve a frame at `viewport` in `format`, reading the target that
+    /// has been allocated `generation` times.
+    ///
+    /// Exact on size and format for [`OffscreenTarget::fits`]'s reasons, and on the generation
+    /// for one this chain adds: the downsample pass reads the target through a bind group
+    /// captured at construction, so a target replaced by a resize leaves this chain pointing at
+    /// a texture nothing renders into any more. Sizes alone would not catch it -- 1920 and 1921
+    /// both round to 480 -- and the symptom would be a panel showing the frame before last.
+    #[must_use]
+    pub fn fits(&self, viewport: [u32; 2], format: wgpu::TextureFormat, generation: u32) -> bool {
+        self.size == Self::size_for(viewport)
+            && self.format == format
+            && self.generation == generation
+    }
+
+    /// GPU memory this chain holds, in bytes: both halves.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        u64::from(self.size[0]) * u64::from(self.size[1]) * BYTES_PER_TEXEL * 2
+    }
+
+    /// What a chain for `viewport` would cost, without allocating one.
+    #[must_use]
+    pub fn bytes_at(viewport: [u32; 2]) -> u64 {
+        let size = Self::size_for(viewport);
+        u64::from(size[0]) * u64::from(size[1]) * BYTES_PER_TEXEL * 2
+    }
+}
+
 /// Whether a tier can hold an offscreen target at all.
 ///
 /// Not a capability probe: a second colour attachment is available on every device that can
@@ -327,6 +581,71 @@ mod tests {
         assert_eq!(LightingTarget::bytes_at([1920, 1080]), 8_294_400);
         assert_eq!(LightingTarget::bytes_at([3840, 2160]), 33_177_600);
         assert_eq!(LightingTarget::FORMAT, wgpu::TextureFormat::Rgba8Unorm);
+    }
+
+    #[test]
+    fn the_blur_chains_cost_is_stated_at_the_resolutions_the_application_runs_at() {
+        // Same discipline as the colour target above, and the same reason: the downsample
+        // factor is the entire argument for the chain being affordable, so the number it buys
+        // is pinned. A change to BLUR_DOWNSAMPLE lands here first.
+        assert_eq!(BlurChain::size_for([1920, 1080]), [480, 270]);
+        assert_eq!(BlurChain::bytes_at([1920, 1080]), 1_036_800);
+        assert_eq!(BlurChain::size_for([3840, 2160]), [960, 540]);
+        assert_eq!(BlurChain::bytes_at([3840, 2160]), 4_147_200);
+
+        // And the ratio that is the point: the chain is a small fraction of the target it
+        // reads, not a second copy of it. Both halves together, against one colour target.
+        let chain = BlurChain::bytes_at([1920, 1080]) as f64;
+        let target = OffscreenTarget::bytes_at([1920, 1080]) as f64;
+        assert!(
+            (chain / target - 0.125).abs() < 1e-9,
+            "two halves at 1/16 the area each is exactly an eighth; got {}",
+            chain / target
+        );
+    }
+
+    #[test]
+    fn the_downsampled_size_rounds_up_so_the_last_partial_block_has_somewhere_to_go() {
+        // Rounding down leaves the right and bottom edges of the viewport with no texel of
+        // their own, so a panel against that edge samples a clamped texture that stops short
+        // -- a smear along exactly the edge a maximised popover sits on. 1921 needs 481.
+        assert_eq!(BlurChain::size_for([1921, 1081]), [481, 271]);
+        assert_eq!(BlurChain::size_for([4, 4]), [1, 1]);
+        assert_eq!(BlurChain::size_for([1, 1]), [1, 1]);
+        // A minimised window, for the same reason the colour target clamps.
+        assert_eq!(BlurChain::size_for([0, 0]), [1, 1]);
+    }
+
+    #[test]
+    fn the_kernel_is_stated_as_a_truncated_gaussian_and_not_as_a_tap_count() {
+        // The three constants have to keep agreeing, because each is derived from the one
+        // above it: the radius is 2.5 sigma rounded, and the reach in physical pixels is the
+        // radius through the downsample. A tap count edited on its own is how a kernel stops
+        // being a Gaussian and becomes whatever fits.
+        let expected_radius = (BLUR_SIGMA_TEXELS * 2.5).round() as u32;
+        assert_eq!(BLUR_RADIUS_TEXELS, expected_radius);
+        assert_eq!(blur_reach_pixels(), 40);
+
+        // What truncation costs, computed rather than asserted from memory -- and it caught
+        // the number that was asserted from memory. 1.24% is the CONTINUOUS Gaussian's mass
+        // beyond 2.5 sigma; what this kernel actually drops, summing integer offsets at
+        // sigma 4, is 0.85%. Either way the shader renormalizes, which is why the exact value
+        // is a fact to record rather than a threshold to meet.
+        let total: f64 = (-60..=60)
+            .map(|i| gaussian(f64::from(i), f64::from(BLUR_SIGMA_TEXELS)))
+            .sum();
+        let kept: f64 = (-(BLUR_RADIUS_TEXELS as i32)..=(BLUR_RADIUS_TEXELS as i32))
+            .map(|i| gaussian(f64::from(i), f64::from(BLUR_SIGMA_TEXELS)))
+            .sum();
+        let dropped = 1.0 - kept / total;
+        assert!(
+            (0.008..0.009).contains(&dropped),
+            "the truncated tail should be about 0.85% of the weight; got {dropped}"
+        );
+    }
+
+    fn gaussian(x: f64, sigma: f64) -> f64 {
+        (-(x * x) / (2.0 * sigma * sigma)).exp()
     }
 
     #[test]
