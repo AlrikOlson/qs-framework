@@ -265,8 +265,63 @@ impl StateIcon {
     }
 }
 
-/// What one rasterization is a picture of: a file kind, a mark drawn over one, or the state of
-/// something that is running.
+/// A chevron, which is the shape two different controls turn out to be.
+///
+/// # Why this is a shape and not two characters
+///
+/// It replaces `preview::DISCLOSURE` (`\u{25aa}`) and `crumbs::SEPARATOR` (`\u{203a}`), and each
+/// of those was a character standing in for a control. See `docs/text-as-layout-audit.md` for
+/// the rule; what is worth recording *here* is the defect the character was hiding.
+///
+/// The disclosure mark was **the same character whether its group was open or closed**. The one
+/// control in the inspector showed none of its own state, and nobody noticed, because a
+/// character has nowhere to put a state — you cannot rotate `\u{25aa}`. Reaching for a glyph did
+/// not merely express the control badly; it made the control's own state unexpressible, and then
+/// the missing half read as a design decision. A shape with a direction cannot fail that way:
+/// [`Chevron::Down`] exists, so a caller that never passes it is visibly not passing it.
+///
+/// The breadcrumb separator is the same geometry at a different size, and sharing it is the
+/// point rather than a saving. A `\u{203a}` is whatever the fallback font makes it — a different
+/// weight and a different vertical position at every type role it appears beside — while this is
+/// one silhouette on the module's own grid, so the mark between two breadcrumbs and the mark in
+/// front of a group read as one vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Chevron {
+    /// Pointing right: a collapsed group, or the boundary between two breadcrumbs.
+    Right,
+    /// Pointing down: an expanded group. **The state a character could not carry.**
+    Down,
+}
+
+impl Chevron {
+    /// Every chevron, in declaration order. The index into this slice is [`Chevron::index`] —
+    /// the same per-frame-cache contract as [`IconKind::ALL`].
+    pub const ALL: [Self; 2] = [Self::Right, Self::Down];
+
+    /// Position in [`Chevron::ALL`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Right => 0,
+            Self::Down => 1,
+        }
+    }
+
+    /// The chevron for a group that is open, or one that is closed.
+    ///
+    /// A named constructor rather than an `if` at each call site, because there are two of them
+    /// and the whole point of the type is that the state reaches the shape.
+    #[must_use]
+    pub fn for_open(open: bool) -> Self {
+        match open {
+            true => Self::Down,
+            false => Self::Right,
+        }
+    }
+}
+
+/// What one rasterization is a picture of: a file kind, a mark drawn over one, the state of
+/// something that is running, or a chevron.
 ///
 /// This is the discriminator that keeps the atlas additive. See [`Emblem`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -274,6 +329,7 @@ pub enum IconShape {
     Kind(IconKind),
     Emblem(Emblem),
     State(StateIcon),
+    Chevron(Chevron),
 }
 
 /// Identity of one rasterized icon. This is the atlas key.
@@ -307,6 +363,15 @@ impl IconKey {
     pub fn state(state: StateIcon, logical_px: f32, scale: f32) -> Self {
         Self {
             shape: IconShape::State(state),
+            px: device_px(logical_px, scale),
+        }
+    }
+
+    /// Build a key for a chevron at a logical box size and a device scale.
+    #[must_use]
+    pub fn chevron(chevron: Chevron, logical_px: f32, scale: f32) -> Self {
+        Self {
+            shape: IconShape::Chevron(chevron),
             px: device_px(logical_px, scale),
         }
     }
@@ -433,7 +498,48 @@ fn path_for(shape: IconShape) -> Option<(Path, Ink)> {
         IconShape::Kind(kind) => kind_path(kind).map(|p| (p, Ink::Stroke(STROKE))),
         IconShape::Emblem(emblem) => emblem_path(emblem),
         IconShape::State(state) => state_path(state),
+        IconShape::Chevron(chevron) => chevron_path(chevron),
     }
+}
+
+/// The chevron, on the module's 20-unit grid.
+///
+/// # Drawn at the state stroke, and inset further than anything else here
+///
+/// It is asked for at the smallest sizes in the module — beside a breadcrumb and in front of a
+/// group header, so around 10 to 12 device pixels — which is [`STATE_STROKE`]'s argument
+/// exactly, so it takes that weight rather than [`STROKE`].
+///
+/// The arms span **7 units across and 13 down** rather than filling the grid, and the ratio is
+/// the one non-obvious part. A chevron sits *between* two pieces of text, or in front of one, so
+/// its box is a gap in a line rather than a column of its own: drawn square at the full grid it
+/// is a mark the size of a capital letter shouldering the words apart, which is what a
+/// `\u{203a}` at `role::MD` already looked like and half the reason the separator read as
+/// clutter. Tall and narrow, it reads as punctuation between two things, which is what it is.
+///
+/// It was narrower still — 5.4 across — until the two orientations came out 0.094 apart at
+/// 10 px, under the 0.10 the pair is held to. That is a small mark's problem rather than this
+/// mark's: two rotations of one shape share their apex, so the difference between them is only
+/// what the *arms* do, and short arms leave little of it. Lengthening them is why the bar is met
+/// at the smallest size a breadcrumb asks for rather than only at a group header's.
+///
+/// One geometry, rotated, rather than two authored paths: a down chevron whose angle differed
+/// from the right one by a degree would be two marks for one idea, and the rotation is what
+/// makes them provably the same silhouette.
+fn chevron_path(chevron: Chevron) -> Option<(Path, Ink)> {
+    let mut b = PathBuilder::new();
+    // Pointing right, from the top arm through the point to the bottom arm.
+    b.move_to(6.9, 3.7);
+    b.line_to(13.7, 10.0);
+    b.line_to(6.9, 16.3);
+    let path = b.finish()?;
+    let path = match chevron {
+        Chevron::Right => path,
+        // A quarter turn about the grid's centre. `from_rotate_at` composes the translation, so
+        // the two shapes are the same path in the same box and cannot drift apart.
+        Chevron::Down => path.transform(Transform::from_rotate_at(90.0, 10.0, 10.0))?,
+    };
+    Some((path, Ink::Stroke(STATE_STROKE)))
 }
 
 /// The state marks, each on its own 20-unit grid.
@@ -813,6 +919,13 @@ mod tests {
         }
     }
 
+    fn chevron_key(chevron: Chevron, px: u16) -> IconKey {
+        IconKey {
+            shape: IconShape::Chevron(chevron),
+            px,
+        }
+    }
+
     /// Mean absolute difference in coverage between two bitmaps of the same size, as a
     /// fraction of full scale. The measure both distinctness tests are written against.
     fn distance(a: &RasterizedGlyph, b: &RasterizedGlyph) -> f32 {
@@ -856,6 +969,37 @@ mod tests {
                 "{kind:?} is nearly solid at 20px (ink {ink:.3})"
             );
         }
+    }
+
+    #[test]
+    fn a_chevron_shows_which_way_it_points_at_the_size_chrome_asks_for() {
+        // **The assertion the character could not have.** `preview::DISCLOSURE` was
+        // `\u{25aa}` for an open group and `\u{25aa}` for a closed one, because a glyph cannot
+        // be rotated and so the control's own state had nowhere to go. Nothing was red; there
+        // was simply no second value to be wrong.
+        //
+        // Ten and twelve device pixels, because a chevron is asked for beside a breadcrumb and
+        // in front of a group header and those are the smallest boxes in the module.
+        for px in [10u16, 12, 16, 20] {
+            let right = rasterize(chevron_key(Chevron::Right, px)).unwrap();
+            let down = rasterize(chevron_key(Chevron::Down, px)).unwrap();
+            let d = distance(&right, &down);
+            assert!(
+                d > 0.10,
+                "a collapsed and an expanded group look the same at {px}px (differ by {d:.3})"
+            );
+            // Both legible, and neither a smudge. The narrow box (see `chevron_path`) makes
+            // this tighter than the general set's floor, so it is checked rather than assumed.
+            for (name, bitmap) in [("right", &right), ("down", &down)] {
+                let ink = ink(bitmap);
+                assert!(ink > 0.03, "the {name} chevron is nearly empty at {px}px");
+                assert!(ink < 0.40, "the {name} chevron is nearly solid at {px}px");
+            }
+        }
+        // And the two are the same shape rather than two authored ones: rotating either by a
+        // quarter turn is the other, so they cannot drift into different weights or angles.
+        assert_eq!(Chevron::for_open(true), Chevron::Down);
+        assert_eq!(Chevron::for_open(false), Chevron::Right);
     }
 
     #[test]
@@ -989,6 +1133,14 @@ mod tests {
                 StateIcon::ALL
                     .iter()
                     .map(|&s| (format!("{s:?}"), rasterize(state_key(s, px)).unwrap())),
+            )
+            // The chevrons are in the union too. A breadcrumb separator sits a few pixels from
+            // a kind icon and a disclosure mark sits in a card beside them, so "is this a
+            // chevron or a tick" is a question a reader actually has to answer.
+            .chain(
+                Chevron::ALL
+                    .iter()
+                    .map(|&c| (format!("{c:?}"), rasterize(chevron_key(c, px)).unwrap())),
             )
             .collect();
 

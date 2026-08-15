@@ -273,20 +273,21 @@ pub enum UploadClass {
 
 /// The structural bound, in entries per frame.
 ///
-/// Nine icon kinds, two emblem shapes and seven state icons is eighteen, so nineteen is one
-/// frame's worst case with a slot to spare. It is a constant rather than tier configuration
+/// Nine icon kinds, two emblems, seven state icons and two chevrons is twenty, so twenty-one is
+/// one frame's worst case with a slot to spare. It is a constant rather than tier configuration
 /// because it is a fact about `crate::icon` and not about the machine: a tier that could
-/// afford more would have nothing to spend it on. Nineteen 20px coverage masks is under 8 KB,
-/// which is why giving structural entries their own bound costs less than taking nineteen
+/// afford more would have nothing to spend it on. Twenty-one 20px coverage masks is under 9 KB,
+/// which is why giving structural entries their own bound costs less than taking twenty-one
 /// uploads away from text would.
 ///
-/// It moved from twelve when `harness-adapters` added [`crate::icon::StateIcon`] and again
-/// when `session-persistence` added [`crate::icon::StateIcon::Remembered`], and the worst case
-/// is real rather than theoretical: the all-sessions overview can put every state on screen at
-/// once, over a file list already drawing every kind. The spare slot is kept deliberately —
-/// a bound that exactly equals the shape count passes its own test on the day it is written
-/// and starts dropping one icon a frame the day a shape is added.
-pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 19;
+/// It moved from twelve when `harness-adapters` added [`crate::icon::StateIcon`], again when
+/// `session-persistence` added [`crate::icon::StateIcon::Remembered`], and again when the
+/// text-as-layout sweep added [`crate::icon::Chevron`] — and the worst case is real rather than
+/// theoretical: the all-sessions overview can put every state on screen at once, over a file
+/// list already drawing every kind, under a breadcrumb bar drawing chevrons. The spare slot is
+/// kept deliberately: a bound that exactly equals the shape count passes its own test on the day
+/// it is written and starts dropping one icon a frame the day a shape is added.
+pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 21;
 
 /// The image bound, in entries per frame.
 ///
@@ -1494,7 +1495,8 @@ mod tests {
         // without raising the constant would silently start dropping one icon per frame.
         let shapes = crate::icon::IconKind::ALL.len()
             + crate::icon::Emblem::ALL.len()
-            + crate::icon::StateIcon::ALL.len();
+            + crate::icon::StateIcon::ALL.len()
+            + crate::icon::Chevron::ALL.len();
         // Strictly under, not at: the constant's own docs claim a spare slot, and a bound
         // that exactly equals the shape count is one that passes on the day it is written
         // and drops an icon a frame on the day a shape is added. Asserting the claim is what

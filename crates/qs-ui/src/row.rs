@@ -862,10 +862,42 @@ impl ListRenderer {
         px: u16,
         color: Srgba,
     ) -> bool {
-        let key = IconKey {
-            shape: IconShape::State(state),
-            px,
-        };
+        self.draw_chrome_icon(list, IconShape::State(state), x, y, px, color)
+    }
+
+    /// Draw one disclosure/separator chevron. See [`ListRenderer::draw_state_icon`].
+    ///
+    /// It exists for the reason that one does, one control further out: the mark it replaces
+    /// was a character — `\u{25aa}` in front of a group header, `\u{203a}` between two
+    /// breadcrumbs — and a character has nowhere to put the state the control is supposed to
+    /// show. See `qs_gpu::icon::Chevron` and `docs/text-as-layout-audit.md`.
+    pub fn draw_chevron(
+        &mut self,
+        list: &mut DrawList,
+        chevron: qs_gpu::icon::Chevron,
+        x: f32,
+        y: f32,
+        px: u16,
+        color: Srgba,
+    ) -> bool {
+        self.draw_chrome_icon(list, IconShape::Chevron(chevron), x, y, px, color)
+    }
+
+    /// The half both chrome icon entry points share.
+    ///
+    /// One function rather than two copies, because the interesting parts — the structural
+    /// upload class, the dropped-icon counter, the rounding — are the same for every shape
+    /// chrome draws, and a second copy is where one of them goes missing.
+    fn draw_chrome_icon(
+        &mut self,
+        list: &mut DrawList,
+        shape: IconShape,
+        x: f32,
+        y: f32,
+        px: u16,
+        color: Srgba,
+    ) -> bool {
+        let key = IconKey { shape, px };
         let Some(entry) =
             self.atlas
                 .get_or_render(key, false, UploadClass::Structural, qs_gpu::icon::rasterize)
