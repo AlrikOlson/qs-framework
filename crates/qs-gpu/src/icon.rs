@@ -227,18 +227,27 @@ pub enum StateIcon {
     /// An adapter that was disbelieved. The session fell back to the floor, and this says so
     /// rather than showing the last thing the adapter claimed.
     Degraded,
+    /// A record of a session a previous run had. **Nothing is running.**
+    ///
+    /// The one state in this set that is not about a process at all, which is why its shape is
+    /// the *trace* of one: [`StateIcon::Running`]'s circle with most of it missing. Every other
+    /// candidate silhouette said something the state does not mean — a clock says "recently",
+    /// an archive box says "put away deliberately", a play triangle says "press me" — and this
+    /// one says the only true thing, which is that a session was here and is not now.
+    Remembered,
 }
 
 impl StateIcon {
     /// Every state icon, in declaration order. The index into this slice is
     /// [`StateIcon::index`] — the same per-frame-cache contract as [`IconKind::ALL`].
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Running,
         Self::Finished,
         Self::Failed,
         Self::Working,
         Self::AwaitingApproval,
         Self::Degraded,
+        Self::Remembered,
     ];
 
     /// Position in [`StateIcon::ALL`].
@@ -251,6 +260,7 @@ impl StateIcon {
             Self::Working => 3,
             Self::AwaitingApproval => 4,
             Self::Degraded => 5,
+            Self::Remembered => 6,
         }
     }
 }
@@ -518,8 +528,75 @@ fn state_path(state: StateIcon) -> Option<(Path, Ink)> {
             b.move_to(10.0, 16.2);
             b.line_to(10.0, 16.2);
         }
+        StateIcon::Remembered => {
+            // `Working`'s circle, broken into four dashes: the trace of a session rather than a
+            // session. Three things about the geometry are load-bearing and none is decoration.
+            //
+            // The radius is `Working`'s, not a smaller one, because the pair a reader has to
+            // separate fastest here is *alive* against *not alive* — a smaller ring reads as a
+            // quieter version of the same thing, and a broken one at the same size reads as the
+            // same thing with pieces missing, which is the claim.
+            //
+            // **Three dashes and 50-degree gaps, and a render decided both numbers.** The first
+            // build was four 60-degree dashes with 30-degree gaps, which reads correctly at 16
+            // and 20 px and closes up completely at 12. The arithmetic says why, and it is the
+            // round line cap rather than the gap: at 12 px this circle is 3.7 device px in
+            // radius, so a 30-degree gap is 1.95 px of arc, and `STATE_STROKE`'s round caps
+            // extend half a stroke — 0.63 px — into it from each side. What is left is 0.7 px of
+            // background, which antialiasing fills in. The shape became `Working` at exactly the
+            // size a tab draws it, and the pairwise test passed anyway because a nearly-closed
+            // ring is still numerically far from a three-quarter one.
+            //
+            // A gap has to be about 3.3 px of arc for 2 px of it to survive the caps, which is
+            // 50 degrees. Three dashes rather than four because at 40 degrees each the set reads
+            // as four ticks that happen to lie on a circle rather than as a circle with pieces
+            // out of it, and "the same ring, interrupted" is the entire claim.
+            //
+            // One dash sits in the upper left, where `Working`'s own gap is. That puts the two
+            // shapes' difference where a scanning reader's eye already is rather than spreading
+            // it evenly around a ring, and it is worth about a third of their pairwise distance.
+            let (cx, cy, r) = (10.0, 10.0, 6.2);
+            for start in [270.0f32, 30.0, 150.0] {
+                arc(&mut b, cx, cy, r, start, 70.0);
+            }
+        }
     }
     b.finish().map(|p| (p, Ink::Stroke(STATE_STROKE)))
+}
+
+/// One arc of a circle, beginning at `start` degrees clockwise from twelve o'clock and sweeping
+/// `sweep` degrees. Callers keep `sweep` at or under 90.
+///
+/// A single cubic, which approximates an arc of up to a quarter turn to well inside the
+/// sub-pixel error the rasterizer can express at [`MAX_PX`]. The control offset is the general
+/// form of [`KAPPA`] — `(4/3)·tan(θ/4)` — rather than a second magic number: at 90 degrees it
+/// *is* `KAPPA`, which is what keeps the dashes on the same circle every other round shape in
+/// this module is drawn on.
+fn arc(b: &mut PathBuilder, cx: f32, cy: f32, r: f32, start: f32, sweep: f32) {
+    let k = r * (4.0 / 3.0) * (sweep.to_radians() / 4.0).tan();
+    // Screen coordinates: y grows downward, and the angle is measured from twelve o'clock, so
+    // the point at angle a is (sin a, -cos a) and its forward tangent is (cos a, sin a).
+    let point = |a: f32| {
+        let a = a.to_radians();
+        (cx + r * a.sin(), cy - r * a.cos())
+    };
+    let tangent = |a: f32| {
+        let a = a.to_radians();
+        (a.cos(), a.sin())
+    };
+    let (x0, y0) = point(start);
+    let (x1, y1) = point(start + sweep);
+    let (tx0, ty0) = tangent(start);
+    let (tx1, ty1) = tangent(start + sweep);
+    b.move_to(x0, y0);
+    b.cubic_to(
+        x0 + k * tx0,
+        y0 + k * ty0,
+        x1 - k * tx1,
+        y1 - k * ty1,
+        x1,
+        y1,
+    );
 }
 
 /// The plate and the marks that sit on it, each on its own 20-unit grid.
@@ -951,6 +1028,106 @@ mod tests {
                 "running and working differ by only {d:.3} at {px}px"
             );
         }
+    }
+
+    #[test]
+    fn a_remembered_session_does_not_read_as_a_live_one() {
+        // The pair `session-persistence` exists to keep apart. Its chunk says in as many words
+        // that a remembered session must never look running, and this set is one of the three
+        // channels that promise carries -- so `Remembered` is held to the same scanning bar
+        // `Running` and `Working` are, against *both* live states rather than against the set's
+        // general 0.05.
+        //
+        // The bar is 0.08 rather than the 0.20 `Running` and `Working` are held to, and the
+        // difference is not a concession: those two are a filled disc against an open ring, so
+        // almost none of their coverage coincides, while `Remembered` is deliberately drawn on
+        // `Working`'s own circle and most of its ink is *supposed* to land where `Working`'s is.
+        // Mean coverage difference is the wrong instrument for the pair — it measures how much
+        // ink moved, and what a reader sees is where the gaps are. The measured margin is 0.098
+        // at 12 px against `Working` and far more against `Running`; the silhouette itself is
+        // held by `the_gaps_in_the_remembered_ring_survive_the_size_a_tab_draws_it_at`, which is
+        // the test that actually catches this pair collapsing.
+        for px in [12u16, 20] {
+            let remembered = rasterize(state_key(StateIcon::Remembered, px)).unwrap();
+            for live in [StateIcon::Running, StateIcon::Working] {
+                let other = rasterize(state_key(live, px)).unwrap();
+                let d = distance(&remembered, &other);
+                assert!(
+                    d > 0.08,
+                    "remembered and {live:?} differ by only {d:.3} at {px}px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gaps_in_the_remembered_ring_survive_the_size_a_tab_draws_it_at() {
+        // **The assertion the distance metric could not make, and a render is why it exists.**
+        // The first `Remembered` was four 60-degree dashes, and at 12 px `STATE_STROKE`'s round
+        // caps ate all but 0.7 px of every gap: the shape came out as a closed ring, which is
+        // the one silhouette in this set that must not appear, because it is `Working` with its
+        // gap filled in. Every numeric test passed — a nearly-closed ring is still far from a
+        // three-quarter one by mean coverage, so `distance` had nothing to say.
+        //
+        // *Ink* is the obvious second instrument and it is also too blunt to use: a round cap
+        // adds back most of the area the gap it sits beside removed, so three 70-degree dashes
+        // ink 0.147 at 12 px against a 270-degree arc's 0.152 — a 4% difference for a shape
+        // that is drawing 60 fewer degrees of circle. A threshold there would be a coin toss.
+        //
+        // So this counts the thing the eye actually reads: walking the circle the dashes lie on
+        // and counting how many separate runs of ink it passes through. A closed ring is one
+        // run whatever its coverage says, `Working` is one run, and this shape's whole claim is
+        // that it is three. Checked at every size chrome asks for, because the failure is a
+        // function of the ratio between the cap and the arc and a future stroke change moves it.
+        for px in [12u16, 16, 20, 32] {
+            assert_eq!(
+                ink_runs_around(
+                    &rasterize(state_key(StateIcon::Remembered, px)).unwrap(),
+                    6.2
+                ),
+                3,
+                "at {px}px the remembered ring is not three dashes: its gaps have closed up \
+                 under the round caps and it is drawing a ring"
+            );
+            // The control. If this ever stops being one run, the instrument has drifted rather
+            // than the shape — a three-quarter arc is one dash by construction.
+            assert_eq!(
+                ink_runs_around(&rasterize(state_key(StateIcon::Working, px)).unwrap(), 6.2),
+                1,
+                "the instrument is wrong: a three-quarter arc is one run at {px}px"
+            );
+        }
+    }
+
+    /// How many separate runs of ink a walk around the circle of radius `grid_r` passes through.
+    ///
+    /// `grid_r` is in the module's 20-unit grid; the walk is done in device pixels at whatever
+    /// size the bitmap is. Nearest-neighbour sampling with a coverage floor rather than
+    /// interpolation: the question is "is there ink here", and a threshold of a third of full
+    /// coverage is well below a stroke's centre and well above the antialiased fringe that a
+    /// closed gap leaves behind.
+    fn ink_runs_around(bitmap: &RasterizedGlyph, grid_r: f32) -> usize {
+        let px = bitmap.width as f32;
+        let (c, r) = (px / 2.0, grid_r * px / GRID);
+        // Four samples per device pixel of circumference, so a one-pixel gap cannot fall
+        // between two samples and be missed.
+        let steps = ((2.0 * std::f32::consts::PI * r) * 4.0).ceil() as usize;
+        let lit: Vec<bool> = (0..steps)
+            .map(|i| {
+                let a = i as f32 / steps as f32 * std::f32::consts::TAU;
+                let (x, y) = ((c + r * a.cos()) as usize, (c + r * a.sin()) as usize);
+                bitmap
+                    .coverage
+                    .get(y * bitmap.width as usize + x)
+                    .is_some_and(|&v| v > 85)
+            })
+            .collect();
+        // Rotations of the same ring must give the same answer, so a run that straddles the
+        // start of the walk is one run and not two: count rising edges against the previous
+        // sample, wrapping.
+        (0..steps)
+            .filter(|&i| lit[i] && !lit[(i + steps - 1) % steps])
+            .count()
     }
 
     #[test]

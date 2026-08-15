@@ -273,17 +273,20 @@ pub enum UploadClass {
 
 /// The structural bound, in entries per frame.
 ///
-/// Nine icon kinds, two emblem shapes and six state icons is seventeen, so eighteen is one
+/// Nine icon kinds, two emblem shapes and seven state icons is eighteen, so nineteen is one
 /// frame's worst case with a slot to spare. It is a constant rather than tier configuration
 /// because it is a fact about `crate::icon` and not about the machine: a tier that could
-/// afford more would have nothing to spend it on. Eighteen 20px coverage masks is under 8 KB,
-/// which is why giving structural entries their own bound costs less than taking eighteen
+/// afford more would have nothing to spend it on. Nineteen 20px coverage masks is under 8 KB,
+/// which is why giving structural entries their own bound costs less than taking nineteen
 /// uploads away from text would.
 ///
-/// It moved from twelve when `harness-adapters` added [`crate::icon::StateIcon`], and the
-/// worst case is real rather than theoretical: the all-sessions overview can put every state
-/// on screen at once, over a file list already drawing every kind.
-pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 18;
+/// It moved from twelve when `harness-adapters` added [`crate::icon::StateIcon`] and again
+/// when `session-persistence` added [`crate::icon::StateIcon::Remembered`], and the worst case
+/// is real rather than theoretical: the all-sessions overview can put every state on screen at
+/// once, over a file list already drawing every kind. The spare slot is kept deliberately —
+/// a bound that exactly equals the shape count passes its own test on the day it is written
+/// and starts dropping one icon a frame the day a shape is added.
+pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 19;
 
 /// The image bound, in entries per frame.
 ///
@@ -1492,10 +1495,14 @@ mod tests {
         let shapes = crate::icon::IconKind::ALL.len()
             + crate::icon::Emblem::ALL.len()
             + crate::icon::StateIcon::ALL.len();
+        // Strictly under, not at: the constant's own docs claim a spare slot, and a bound
+        // that exactly equals the shape count is one that passes on the day it is written
+        // and drops an icon a frame on the day a shape is added. Asserting the claim is what
+        // makes the next person raise the constant deliberately instead of discovering it.
         assert!(
-            shapes as u32 <= STRUCTURAL_UPLOADS_PER_FRAME,
-            "qs_gpu::icon can produce {shapes} distinct shapes in one frame but the \
-             structural bound is {STRUCTURAL_UPLOADS_PER_FRAME}"
+            (shapes as u32) < STRUCTURAL_UPLOADS_PER_FRAME,
+            "qs_gpu::icon can produce {shapes} distinct shapes in one frame and the \
+             structural bound is {STRUCTURAL_UPLOADS_PER_FRAME}, which leaves no spare"
         );
     }
 

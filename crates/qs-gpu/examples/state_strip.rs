@@ -50,6 +50,9 @@ struct Theme {
     accent: [u8; 3],
     /// A file icon, drawn beside the states so the two sets can be compared where they meet.
     file: [u8; 3],
+    /// `content/secondary` — what a record of a session is drawn in, being the one state here
+    /// that is not happening.
+    dim: [u8; 3],
 }
 
 fn tint(state: StateIcon, theme: &Theme) -> [u8; 3] {
@@ -64,6 +67,10 @@ fn tint(state: StateIcon, theme: &Theme) -> [u8; 3] {
         StateIcon::AwaitingApproval => theme.accent,
         // Deliberately quiet: a degraded adapter is a claim withdrawn, not a fault to report.
         StateIcon::Degraded => theme.neutral,
+        // Quieter still, and it is the only state here drawn in the secondary ink: a record of
+        // a session is the one thing in this set that is not happening. `qs::terminal` spends
+        // the same token on it for the same reason.
+        StateIcon::Remembered => theme.dim,
     }
 }
 
@@ -76,6 +83,7 @@ fn main() {
             bad: [0xe0, 0x6c, 0x6c],
             accent: [0x6e, 0xa8, 0xff],
             file: [0x6a, 0x70, 0x80],
+            dim: [0x7a, 0x80, 0x90],
         },
         Theme {
             bg: [0xff, 0xff, 0xff],
@@ -84,6 +92,7 @@ fn main() {
             bad: [0xa8, 0x2a, 0x2a],
             accent: [0x1e, 0x54, 0xb7],
             file: [0x8a, 0x90, 0x9e],
+            dim: [0x6c, 0x72, 0x82],
         },
     ];
 
