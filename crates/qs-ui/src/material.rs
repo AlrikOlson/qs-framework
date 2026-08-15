@@ -371,6 +371,27 @@ pub enum LayerDef {
         /// A surface with no bevel does not emit, because it has no edge to emit from.
         #[serde(default)]
         emission: f32,
+        /// How strongly the bevel **refracts** what is behind the surface, `0..=1`.
+        ///
+        /// A separate field rather than a separate layer, because a refracting surface is this
+        /// surface: same albedo, same bevel, same roughness, metalness and sky, with the edge
+        /// made of glass instead of plastic. A `LayerDef::Glass` variant would have restated
+        /// nine fields so that one could differ, and a material moving between them would be a
+        /// rewrite rather than a word.
+        ///
+        /// Non-zero selects [`PrimKind::Refract`]; zero leaves [`PrimKind::Pbr`], and the two
+        /// are the same pixels — `refraction_at_zero_strength_is_the_pbr_surface` in `qs-gpu`
+        /// asserts that byte for byte across the one-pass/two-pass boundary, which is what
+        /// makes selecting the kind from a float safe rather than a cliff.
+        ///
+        /// It shares `emission`'s confinement and therefore `emission`'s licence: identically
+        /// zero deeper than `bevel` inward, so a material may turn it up without moving a
+        /// composite the contrast gate checks. `refraction_never_reaches_the_middle_of_a_surface`
+        /// measures that rather than trusting it. A surface that transmitted across its whole
+        /// face would show the list through the inspector under a green gate, which is the
+        /// encoding [`crate::substance`] refused three times.
+        #[serde(default)]
+        refraction: f32,
         /// What colour this surface emits **into the scene**, when the lit mode is on.
         ///
         /// Two things emit and they are deliberately different. The `emission` above is what
@@ -739,6 +760,12 @@ pub struct Layer {
     pub env: f32,
     /// Edge emission, for [`PrimKind::Pbr`]. See [`LayerDef::Pbr::emission`].
     pub emission: f32,
+    /// How strongly the bevel refracts what is behind it, `0..=1`. See
+    /// [`LayerDef::Pbr::refraction`].
+    ///
+    /// Non-zero is what turns this layer's kind from [`PrimKind::Pbr`] into
+    /// [`PrimKind::Refract`], and zero is bit-identical to the surface it started as.
+    pub refraction: f32,
     /// Emission shimmer amplitude. See [`PhaseDef::flicker`].
     pub flicker: f32,
     /// What this surface contributes to the scene around it, and how brightly. See
@@ -1189,6 +1216,30 @@ impl Material {
                     // harder on a denser display. The *extent* of the emission scales, because
                     // it is the bevel's, and the bevel is a length.
                     layer.emission,
+                    near,
+                ),
+                // The same surface with its bevel made of glass. Every argument is the PBR
+                // arm's, in the same order, up to the last scalar -- `Instance::refract` takes
+                // a refraction strength where `Instance::pbr` takes an emission, and the two
+                // cannot share the field because a surface that glowed in proportion to how
+                // much it refracted would be a lamp whose brightness is a property of the
+                // glass. This arm is reachable only when `refraction` is non-zero; see where
+                // the kind is chosen.
+                PrimKind::Refract => Instance::refract(
+                    x,
+                    y,
+                    w,
+                    h,
+                    radius,
+                    layer.bevel * surface.scale,
+                    layer.roughness,
+                    layer.metallic,
+                    layer.env,
+                    // Dimensionless, like roughness and the emission above: a bevel does not
+                    // refract harder on a denser display. What scales is the bevel, because a
+                    // bevel is a length, and the glass slab's depth is derived from it in the
+                    // shader.
+                    layer.refraction,
                     near,
                 ),
                 // The glass and the panel, in that order, into the two fields that decide what
@@ -1654,6 +1705,7 @@ pub(crate) fn resolve_all(
                 field: FieldWash::default(),
                 amplitude: 0.0,
                 emission: 0.0,
+                refraction: 0.0,
                 offset: geometry.offset,
             };
             let resolved = match layer {
@@ -1849,6 +1901,7 @@ pub(crate) fn resolve_all(
                     metallic,
                     env,
                     emission,
+                    refraction,
                     emits,
                     emits_strength,
                     phase,
@@ -1859,8 +1912,20 @@ pub(crate) fn resolve_all(
                         Some(token) => color(token, material)?,
                         None => Srgba::TRANSPARENT,
                     };
+                    let refraction = refraction.clamp(0.0, 1.0);
                     Layer {
-                        kind: PrimKind::Pbr,
+                        // The kind is chosen here rather than authored, because the two are one
+                        // surface and the difference is a number. Selecting a *kind* from a
+                        // float is normally a smell -- it hides a discontinuity behind a
+                        // continuum -- and it is safe in this one case for a reason that was
+                        // measured rather than assumed: at zero strength the two kinds render
+                        // byte-identical frames, so the boundary this crosses has nothing on
+                        // either side of it.
+                        kind: if refraction > 0.0 {
+                            PrimKind::Refract
+                        } else {
+                            PrimKind::Pbr
+                        },
                         near: tint,
                         far: tint,
                         // Unlit, a surface is its albedo -- the same answer its CPU floor
@@ -1871,6 +1936,7 @@ pub(crate) fn resolve_all(
                         metallic: *metallic,
                         env: *env,
                         emission: emission.max(0.0),
+                        refraction,
                         flicker: phase.flicker.max(0.0),
                         emits,
                         emits_strength: emits_strength.max(0.0),

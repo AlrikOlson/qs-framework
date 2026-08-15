@@ -200,6 +200,80 @@ pub enum PrimKind {
     /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)`, which is the opaque
     /// `surface/raised` UXDD 10.7 chose before the effect existed.
     Blur = 10,
+    /// [`PrimKind::Pbr`]'s surface with its **bevel made of glass**: the view ray is bent
+    /// through the same analytic normal and marched into a sharp copy of what is behind the
+    /// panel, so the edge magnifies and displaces the content beyond it.
+    ///
+    /// The second kind whose [`PrimKind::needs_backdrop`] is `true`, and the one that made
+    /// "the backdrop" two things rather than one. A blur wants the *blurred* copy, at a
+    /// quarter resolution, because destroying the high frequencies is the effect; refraction
+    /// wants the **sharp** one at full resolution, because displacing the high frequencies is
+    /// the effect. Both are bound -- the blurred chain at group 2, the offscreen target itself
+    /// at group 3 -- and they hold the same content, cut at the same place.
+    ///
+    /// # The fields are [`PrimKind::Pbr`]'s, field for field
+    ///
+    /// [`Instance::color`] is the albedo, [`Instance::uv`] is `[bevel, roughness, metallic,
+    /// environment]`, and [`Instance::param`] is the **refraction strength** in `0..=1` where
+    /// the PBR surface's carries emission. That is not economy, it is the floor: at a strength
+    /// of zero this kind is bit-identical to a non-emissive [`PrimKind::Pbr`], which is what
+    /// makes "the surface without the glass is the surface" a measurement rather than a claim.
+    ///
+    /// The index of refraction, the slab's depth and the dispersion spread are **not here**.
+    /// They are constants in `shaders/instance.wgsl`, for the reason `LIGHT_DIR` is: glass is
+    /// glass, and a per-instance IOR lets one panel author a physically fine surface that
+    /// disagrees with the panel beside it. It is also what keeps [`Instance`] at 48 bytes,
+    /// which four more scalars would not.
+    ///
+    /// # Why it stops at the bevel
+    ///
+    /// The transmitted term is weighted by the rim's profile -- full at the boundary,
+    /// identically zero `bevel` pixels inward -- and that single decision answers three
+    /// separate questions at once.
+    ///
+    /// *Contrast.* `qs_ui::substance` records the rule three refused encodings established:
+    /// only **edge-localised** material properties are free against the contrast budget,
+    /// because the gate checks the albedo and cannot see what the shader does to the middle of
+    /// a surface. A panel that transmitted across its whole face would show the file list
+    /// through the inspector, with the inspector's own labels on top of it, under a green
+    /// `cargo xtask contrast`. Stopped at the bevel, the ground under every label is
+    /// bit-identical to the PBR surface's, and
+    /// `refraction_never_reaches_the_middle_of_a_surface` measures that rather than asserting
+    /// it -- the same shape `emission_never_reaches_the_middle_of_a_surface` already has.
+    ///
+    /// *Cost.* The march early-outs where the profile is zero, so the fragments that march are
+    /// the bevel band -- roughly perimeter times bevel -- and never the panel's interior. That
+    /// much is structural: `share` is exactly zero there and the branch is not taken.
+    ///
+    /// **What it buys in milliseconds was measured and is smaller than the claim this
+    /// paragraph originally made.** `examples/refract_cost` runs a full-width panel and then
+    /// three grids of twenty-four, arranged so that area and band move independently. A
+    /// full-width refracting panel costs **+0.015 ms/frame** on Vulkan and **+0.005 ms** on GL
+    /// against the two-pass control -- 0.18% and 0.06% of the 8.33 ms budget -- and
+    /// twenty-four panels carrying **4.4x** the band cost +0.014 ms, which is the same number.
+    /// So the frame-time cliff the chunk's acceptance was written against does not appear in
+    /// any configuration measured, and the early-out is not why: the march is simply cheap
+    /// where it runs.
+    ///
+    /// Whether the remaining cost is the band or the panel's own shading is **unresolved**, and
+    /// the harness says so rather than guessing. Ratios of 1.28 and 1.66 came back as 1.81 and
+    /// 1.99 from the identical run immediately afterwards; with five interleaved repeats the
+    /// per-configuration spread (0.004 ms) is the same size as the difference being attributed
+    /// (0.004 ms). `specs/001-gpu-list-spike/findings.md` records the same shape of mistake at
+    /// the other end of the repository. See `docs/refraction/cost.md`.
+    ///
+    /// *Physics.* It is also simply what a bevelled slab looks like. The deviation is where the
+    /// surface is turned away from the viewer; the flat middle of a pane refracts a ray
+    /// straight through and displaces nothing.
+    ///
+    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)` -- **[`PrimKind::Pbr`]'s own
+    /// floor, reused verbatim**. `Plain(Pbr)` is the tempting answer and is refused by
+    /// `a_floor_is_always_a_primitive_the_cpu_tier_actually_draws`: a floor names a kind the
+    /// CPU tier really draws, and [`Instance::cpu_floor`] resolves exactly one level on
+    /// purpose. The two degradations the chunk asks for are therefore two mechanisms, not one
+    /// chain -- the CPU tier gets the albedo through `Floor`, and a frame with no backdrop
+    /// bound gets the PBR shading path in the shader, which already exists.
+    Refract = 11,
 }
 
 impl PrimKind {
@@ -218,7 +292,7 @@ impl PrimKind {
     ///
     /// It exists so the `tier_parity` suite can assert that *every* kind has a parity
     /// fixture, rather than asserting it about whichever kinds someone remembered.
-    pub const ALL: [PrimKind; 11] = [
+    pub const ALL: [PrimKind; 12] = [
         Self::Rect,
         Self::Stroke,
         Self::Glyph,
@@ -230,6 +304,7 @@ impl PrimKind {
         Self::Field,
         Self::Image,
         Self::Blur,
+        Self::Refract,
     ];
 
     /// This variant's position in [`PrimKind::ALL`].
@@ -250,6 +325,7 @@ impl PrimKind {
             Self::Field => 8,
             Self::Image => 9,
             Self::Blur => 10,
+            Self::Refract => 11,
         }
     }
 
@@ -272,6 +348,7 @@ impl PrimKind {
             Self::Field => "KIND_FIELD",
             Self::Image => "KIND_IMAGE",
             Self::Blur => "KIND_BLUR",
+            Self::Refract => "KIND_REFRACT",
         }
     }
 
@@ -351,7 +428,18 @@ impl PrimKind {
             //
             // `Nothing` is not available here for the reason it was not available to the PBR
             // surface: this IS the panel. Dropped, a popover would be its text over the list.
-            Self::Pbr | Self::Field | Self::Blur => Fidelity::Enhanced {
+            // The fourth, and the one whose floor is a *reuse* rather than a decision. A
+            // refracting surface is a PBR surface plus a transmitted term, so what it becomes
+            // without the light and without the backdrop is what the PBR surface becomes:
+            // its albedo. Naming `Plain(Pbr)` instead -- "the surface keeps its shading and
+            // loses only the glass" -- is the reading the chunk's own acceptance suggests, and
+            // it is refused two ways. `a_floor_is_always_a_primitive_the_cpu_tier_actually_draws`
+            // rejects a floor that is itself enhanced, because `cpu_floor` resolves exactly one
+            // level and a chain is a design nobody can picture. And `cpu_floor` drops `uv` on
+            // the way down, so the Pbr instance that arrived would have a zero bevel, a zero
+            // roughness clamped to a mirror and no sky -- not "its PBR form" but an accident
+            // wearing its name.
+            Self::Pbr | Self::Field | Self::Blur | Self::Refract => Fidelity::Enhanced {
                 floor: Floor::Plain(PrimKind::Rect),
             },
         }
@@ -392,7 +480,12 @@ impl PrimKind {
             | Self::Image => false,
             // And this is that second thing. A blurred pixel is a weighted sum over its
             // neighbours, which no amount of closed form reaches from one fragment.
-            Self::Blur => true,
+            Self::Blur
+            // A refracted pixel is a *displaced* one, which is the same obligation for the
+            // opposite reason: a blur needs many neighbours and a refraction needs one
+            // neighbour it cannot name in advance. Either way the fragment's own position is
+            // not enough, and only the two-pass path can answer.
+            | Self::Refract => true,
         }
     }
 
@@ -422,6 +515,7 @@ impl PrimKind {
             // knows perfectly well answering it is the failure mode `None` is meant to expose.
             9 => Some(Self::Image),
             10 => Some(Self::Blur),
+            11 => Some(Self::Refract),
             _ => None,
         }
     }
@@ -752,6 +846,55 @@ impl Instance {
         }
     }
 
+    /// The same bevelled surface, with the bevel made of glass.
+    ///
+    /// Every argument up to `albedo` is [`Instance::pbr`]'s, in the same order and with the
+    /// same meaning, and that is deliberate: a refracting panel and a lit one are the same
+    /// surface, so a caller moving between them changes one word.
+    ///
+    /// `refraction` is the strength in `0..=1`, and it is spent where the PBR surface spends
+    /// its emission. **Zero is not "off with rounding" -- it is the PBR surface exactly**,
+    /// which `refraction_at_zero_strength_is_the_pbr_surface` holds byte for byte. That is what
+    /// makes the degradation on a machine with no backdrop bound a property of the shader's
+    /// arithmetic rather than a second code path.
+    ///
+    /// The index of refraction is **not** an argument. One blurred copy of the backdrop serves
+    /// every blur in the frame for a structural reason; one IOR serves every glass surface for
+    /// a design one -- see [`PrimKind::Refract`]. If two panels in one window are made of
+    /// different glass, the window has a bigger problem than a missing parameter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn refract(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        bevel: f32,
+        roughness: f32,
+        metallic: f32,
+        environment: f32,
+        refraction: f32,
+        albedo: Srgba,
+    ) -> Self {
+        Self {
+            rect: [x, y, w, h],
+            uv: [
+                bevel.max(0.0),
+                roughness.clamp(0.0, 1.0),
+                metallic.clamp(0.0, 1.0),
+                environment.max(0.0),
+            ],
+            color: albedo.to_premul_linear_rgba8(),
+            radius,
+            // Clamped at both ends, unlike the PBR surface's emission which is only clamped
+            // below. Emission above one is a brighter light and means something; refraction
+            // above one is a fraction of a ray larger than the ray, and the shader would spend
+            // it as a transmitted term brighter than what is behind the panel.
+            param: refraction.clamp(0.0, 1.0),
+            kind: PrimKind::Refract as u32,
+        }
+    }
+
     pub fn glyph(x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], color: Srgba) -> Self {
         Self {
             rect: [x, y, w, h],
@@ -846,6 +989,11 @@ impl Instance {
             // anyway. A floor that is correct by accident is the thing `cpu_floor` centralises
             // fidelity to prevent.
             k if k == PrimKind::Blur as u32 => PrimKind::Blur,
+            // Whose absence would fail the same silent way, and worse: the rasterizer's
+            // unknown-kind fallback fills with `color`, which for this kind IS the albedo, so
+            // a missing arm would render the correct picture while `uv` and `param` travelled
+            // to a rasterizer that reads them as something else entirely.
+            k if k == PrimKind::Refract as u32 => PrimKind::Refract,
             // A kind the enum does not know. The rasterizer's own fallback treats it as a
             // fill, which is the behaviour that predates this method; deciding it is enhanced
             // would silently drop an instance instead.

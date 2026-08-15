@@ -336,6 +336,10 @@ impl Renderer {
                 Some(&globals_layout),
                 Some(&atlas_layout),
                 Some(&backdrop_layout),
+                // Group 3: the SHARP backdrop, for `KIND_REFRACT`. The same layout as group 2
+                // and deliberately not the same binding — see the shader, where the two are
+                // declared side by side with the reason they cannot be one.
+                Some(&backdrop_layout),
             ],
             immediate_size: 0,
         });
@@ -850,7 +854,12 @@ impl Renderer {
     /// downsampled size. Like the target, an existing chain is **not** freed on a frame that
     /// happens to draw no panel — that would reallocate once per popover open.
     fn ensure_blur(&mut self, ctx: &GpuContext, list: &DrawList, offscreen: bool) {
-        if !offscreen || !list.instances.iter().any(instance_needs_backdrop) {
+        // Keyed on a **blur** instance, not on any backdrop-sampling one. `KIND_REFRACT` also
+        // needs the two-pass path, and reads the sharp target rather than the chain -- so a
+        // frame whose only glass is refracting would otherwise allocate 3.1 MB and run three
+        // full-screen passes that nothing samples. The cut below is still general; only the
+        // chain is specific, because only the chain is the blur's.
+        if !offscreen || !list.instances.iter().any(instance_is_blur) {
             return;
         }
         let Some(target) = self.offscreen.as_ref() else {
@@ -995,7 +1004,12 @@ impl Renderer {
         } else {
             u32::MAX
         };
-        let blurring = backdrop_at != u32::MAX;
+        // Two questions, because they became different ones when a second backdrop-sampling
+        // primitive arrived. `sampling_backdrop` is whether anything at all is drawn after the
+        // cut -- the surface span exists for a refracting panel exactly as it does for a
+        // blurring one. `blurring` is whether the chain has to run, which only a blur asks for.
+        let sampling_backdrop = backdrop_at != u32::MAX;
+        let blurring = sampling_backdrop && list.instances.iter().any(instance_is_blur);
 
         {
             let clear = list.clear;
@@ -1031,6 +1045,11 @@ impl Renderer {
                 list,
                 0..backdrop_at,
                 lit.is_some().then_some(lit_at),
+                self.backdrop_placeholder(),
+                // The placeholder at group 3 as well, and here it is not merely unread: this
+                // pass is rendering INTO the offscreen target, and binding a texture one is
+                // writing is the one thing the sharp backdrop cannot do. Nothing in this span
+                // samples it -- the cut is defined as the first instance that would.
                 self.backdrop_placeholder(),
             );
             // The panel and everything above it are NOT here; they are drawn in the resolve
@@ -1134,7 +1153,7 @@ impl Renderer {
             // restored, with the blurred backdrop bound. Empty unless something asked for a
             // backdrop -- so a forced two-pass frame emits the resolve and stops, exactly as
             // it did before this chunk.
-            if blurring {
+            if sampling_backdrop {
                 self.draw_span(
                     &mut pass,
                     list,
@@ -1149,6 +1168,11 @@ impl Renderer {
                     // an unlit surface and forbids a lit glyph.
                     None,
                     self.blurred_bind_group(),
+                    // The offscreen target itself, at full resolution: what is behind the
+                    // panel, cut at the same instance as the blurred copy beside it, with
+                    // nothing done to it. The resolve above has already copied it to the
+                    // surface, so it is finished being written and is safe to sample.
+                    offscreen.bind_group(),
                 );
             }
         }
@@ -1191,12 +1215,14 @@ impl Renderer {
         span: std::ops::Range<u32>,
         lit_at: Option<usize>,
         backdrop: &wgpu::BindGroup,
+        sharp: &wgpu::BindGroup,
     ) {
         let bind_instances = |pass: &mut wgpu::RenderPass<'_>| {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.globals_bind_group, &[]);
             pass.set_bind_group(1, &self.atlas_bind_group, &[]);
             pass.set_bind_group(2, backdrop, &[]);
+            pass.set_bind_group(3, sharp, &[]);
             pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         };
         bind_instances(pass);
@@ -1314,6 +1340,16 @@ fn surface_content_split(batches: &[Batch]) -> usize {
 /// nothing filled.
 fn instance_needs_backdrop(instance: &Instance) -> bool {
     PrimKind::from_raw(instance.kind).is_some_and(PrimKind::needs_backdrop)
+}
+
+/// Whether this instance is the one kind that reads the blur chain.
+///
+/// Spelled against the kind rather than against `needs_backdrop`, because those stopped being
+/// the same question when `KIND_REFRACT` landed: it needs the target and does not need the
+/// chain. Asking `needs_backdrop` here is the mistake that runs three blur passes for a panel
+/// that never samples their output.
+fn instance_is_blur(instance: &Instance) -> bool {
+    instance.kind == PrimKind::Blur as u32
 }
 
 /// Where the batch sequence stops being **the backdrop**.

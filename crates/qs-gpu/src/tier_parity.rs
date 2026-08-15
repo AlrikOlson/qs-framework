@@ -2341,6 +2341,76 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 ink_area: 0.0,
             },
         ],
+        // The fifth `Enhanced` kind, and the one whose floor is a **reuse**: `Plain(Rect)`, the
+        // same one the PBR surface declares, resolving to the same albedo. So what these
+        // fixtures hold is that a refracting panel and a lit one degrade to the same picture,
+        // which is what makes "the glass is the only thing lost" checkable at all.
+        //
+        // The tolerance fields are unread while the declaration says `Enhanced`, and are set
+        // tightest-in-file for the glow's reason: relaxing this kind to `Exact` should fail
+        // loudly rather than pass on numbers nobody chose.
+        PrimKind::Refract => vec![
+            Case {
+                // The dielectric panel, at full strength. Deliberately the same geometry and
+                // the same four surface parameters as `pbr/dielectric` above, with only the
+                // last argument differing -- so the pair is a controlled comparison and the
+                // floor is provably the same picture rather than merely the same shape.
+                name: "refract/glass-panel",
+                instance: Instance::refract(
+                    20.0, 22.0, 24.0, 20.0, 6.0, 5.0, 0.35, 0.0, 1.0, 1.0, white,
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Strength zero, and this fixture is the floor's sharpest case rather than a
+                // redundant one. On the GPU it is the PBR surface exactly; on the CPU tier it
+                // must still be the albedo, NOT the PBR surface -- `cpu_floor` reads the kind
+                // and never the strength. A `cpu_floor` that shortcut a zero-strength refract
+                // to `Plain(Pbr)` "because it is one anyway" would pass every GPU check in this
+                // file and hand `tiny-skia` an enhanced primitive.
+                name: "refract/zero-strength",
+                instance: Instance::refract(
+                    12.0, 10.0, 40.0, 28.0, 6.0, 5.0, 0.35, 0.0, 1.0, 0.0, white,
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // Metal, translucent, square-cornered and flush against the origin: the same
+                // three traps the blur and PBR fixtures each cover one of. A radius of zero
+                // takes a different branch of `rounded_rect`, and a rect at (0,0) is where an
+                // off-by-one in the floor's geometry is not swallowed by an antialiased edge.
+                name: "refract/metal-square-at-origin",
+                instance: Instance::refract(
+                    0.0,
+                    0.0,
+                    30.0,
+                    30.0,
+                    0.0,
+                    8.0,
+                    0.18,
+                    1.0,
+                    0.8,
+                    0.75,
+                    Srgba::new(0.90, 0.72, 0.36, 0.6),
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
     }
 }
 

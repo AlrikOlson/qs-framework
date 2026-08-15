@@ -22,6 +22,7 @@ const KIND_SWEEP:    u32 = 7u;
 const KIND_FIELD:    u32 = 8u;
 const KIND_IMAGE:    u32 = 9u;
 const KIND_BLUR:     u32 = 10u;
+const KIND_REFRACT:  u32 = 11u;
 
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318531;
@@ -79,6 +80,24 @@ struct Globals {
 // optional binding the pipeline layout would have to know about.
 @group(2) @binding(0) var backdrop_texture: texture_2d<f32>;
 @group(2) @binding(1) var backdrop_sampler: sampler;
+
+// The SHARP backdrop: the same content as group 2, cut at the same instance, at full
+// resolution and unfiltered by anything. This is the offscreen target itself rather than the
+// chain's output.
+//
+// Two bindings for one idea, and the duplication is the design. A blur wants the high
+// frequencies gone -- that IS the effect -- and can afford a quarter-resolution source. A
+// refraction wants them displaced, and reading them from a blurred quarter-resolution copy
+// would smear away the magnification that is the only reason to bend a ray at all. Sharing one
+// binding would have forced the two effects to agree about something they disagree about
+// exactly.
+//
+// Same layout as group 2, so the placeholder, the chain's halves and the target itself are all
+// interchangeable at the set_bind_group call site. A frame drawing nothing that refracts binds
+// the same 1x1 placeholder here, and the pass that renders INTO the target binds it too --
+// sampling a texture one is writing is the one thing this cannot do.
+@group(3) @binding(0) var sharp_texture: texture_2d<f32>;
+@group(3) @binding(1) var sharp_sampler: sampler;
 
 struct InstanceIn {
     // [x, y, width, height], physical pixels, top-left origin.
@@ -747,6 +766,143 @@ fn shade_pbr(
     return direct + ambient + emission;
 }
 
+// -- glass ---------------------------------------------------------------------------------
+//
+// The one place in this file where a ray is actually MARCHED. Every other effect here is a
+// closed form in the fragment's own position -- that is what `PrimKind::needs_backdrop` names,
+// and it is why all of them fit one pass. A refracted ray lands somewhere this fragment cannot
+// compute, so it has to go and look, and what it looks at is `sharp_texture`.
+
+// Crown glass, and the number is the material rather than a knob that was turned until it
+// looked right. Above 1.0 by construction, which is also what makes the total-internal-
+// reflection guard below unreachable -- see there.
+const GLASS_IOR: f32 = 1.52;
+
+// How deep the slab is, as a multiple of the bevel's own width.
+//
+// Tied to the bevel rather than authored separately because the bevel is already the surface's
+// statement about how thick it is: a chunkier edge is a chunkier pane, and two numbers that
+// disagree would let a material author a 2 px lip on a 40 px slab, which reads as a bug in the
+// normal rather than as glass.
+const GLASS_DEPTH: f32 = 2.4;
+
+// The march's step count, and this constant IS the bound.
+//
+// Fixed, small, and independent of the panel's size -- an unbounded march (step until the ray
+// leaves the slab, refine until the sample stops moving) is the frame-time cliff a wide panel
+// would fall off, because a UI panel is enormous in fragments compared with anything a renderer
+// normally marches.
+//
+// **What the extra steps buy is filtering, not depth.** The backdrop is content at one depth,
+// so the physically correct sample is a single tap where the ray meets the back face, and every
+// step beyond the first is arguably modelling a medium that scatters -- which is a blur, and
+// there is already a primitive for that. What makes the march earn its keep instead is the
+// footprint: the displacement changes fast across the bevel, so a magnifying fragment covers a
+// stretched region of the backdrop, and one point tap into it aliases into shimmer that moves
+// when the panel does. Sampling along the ray is a cheap anisotropic filter oriented the way
+// the stretch actually runs, which no isotropic mip could be.
+//
+// Four is where that shimmer is gone at the bevels this design authors. The honest reason it is
+// not eight is that eight costs twice as much and nothing on screen could tell.
+const REFRACT_STEPS: i32 = 4;
+
+// The furthest a ray may be displaced, in physical pixels, at any step.
+//
+// The second half of the bound, and it bounds a different thing: the step count bounds the
+// arithmetic, this bounds the *texture access pattern*. A grazing ray at the very boundary has
+// a lateral displacement that grows without limit as its z component approaches zero, and a tap
+// that scattered across the viewport would cost cache misses rather than instructions.
+const REFRACT_MAX_PX: f32 = 24.0;
+
+// Chromatic dispersion: how far the red and blue indices sit either side of green's.
+//
+// **Deliberately present**, which is the decision the chunk asks to be made rather than
+// stumbled into. It is what makes the edge read as glass rather than as a displaced smear, and
+// it is affordable for exactly one reason: the march is edge-localised, so three taps per step
+// happen only in a band of roughly perimeter x bevel and not over the panel. Refusing it was
+// the other defensible answer and would have been the right one had the transmitted term
+// covered the whole face -- there, tripling the taps triples the panel.
+//
+// Red bends least and blue bends most, which is the direction real glass disperses in. Getting
+// it backwards produces a fringe that is just as colourful and subtly, permanently wrong.
+const DISPERSION: f32 = 0.045;
+
+// Snell's law in vector form, for an orthographic viewer.
+//
+// The incident ray is (0, 0, -1) for every fragment, for the same reason `shade_pbr`'s view
+// vector is (0, 0, 1): a UI has no perspective, so there is no per-fragment ray to build.
+//
+// `k < 0` is total internal reflection, and it is answered rather than left to produce a NaN
+// out of `sqrt` -- the same way `glow_t` answers a zero falloff rather than dividing by it.
+// Being honest about it: at any value this shader can be handed it is **unreachable**. The ray
+// travels from air into a denser medium, so `eta = 1 / ior <= 1` while `GLASS_IOR >= 1`, and
+// `k` is then a sum of non-negative terms. The guard is therefore on the constant above rather
+// than on the physics -- an `ior` edited below 1.0 (a bubble rather than a pane) makes it live
+// immediately, and the failure it would otherwise produce is a NaN that propagates through the
+// blend into a black hole in the panel.
+fn refract_ray(normal: vec3<f32>, eta: f32) -> vec3<f32> {
+    let i = vec3<f32>(0.0, 0.0, -1.0);
+    let n_dot_i = dot(normal, i);
+    let k = 1.0 - eta * eta * (1.0 - n_dot_i * n_dot_i);
+    if (k < 0.0) {
+        // Undeviated. The transmitted term becomes the backdrop straight behind the fragment,
+        // which is what a surface that cannot transmit through its edge shows anyway.
+        return i;
+    }
+    return eta * i - (eta * n_dot_i + sqrt(k)) * normal;
+}
+
+// Where one ray lands on the backdrop after travelling `depth` pixels into the slab.
+//
+// The slab is flat and its back face is `depth` below the front, so the intersection is closed
+// form: travel until z has fallen by `depth`, and the lateral offset is the ray's xy scaled by
+// how long that took. What is marched is therefore the ray's path THROUGH the glass, sampled at
+// several depths -- not a search for an intersection, which a 2D backdrop with no depth of its
+// own could not answer anyway.
+fn refract_offset(ray: vec3<f32>, depth: f32) -> vec2<f32> {
+    // Away from the viewer is -z. A ray turned parallel to the surface never reaches the back
+    // face at all, which is the divergence REFRACT_MAX_PX exists to catch.
+    let travel = depth / max(-ray.z, 1e-3);
+    let offset = ray.xy * travel;
+    let reach = length(offset);
+    if (reach > REFRACT_MAX_PX) {
+        return offset * (REFRACT_MAX_PX / reach);
+    }
+    return offset;
+}
+
+// The transmitted colour: the backdrop as seen through the slab, dispersed.
+//
+// Three etas walked in one loop rather than three marches, so the cost is three taps per step
+// and not three times everything. The channels are taken one at a time from three different
+// samples, which is what a prism does -- the same scene, sampled at three slightly different
+// places, recombined.
+fn refracted_backdrop(screen_px: vec2<f32>, normal: vec3<f32>, depth: f32) -> vec3<f32> {
+    let inv_viewport = vec2<f32>(1.0, 1.0) / max(globals.viewport, vec2<f32>(1.0, 1.0));
+    let eta = 1.0 / GLASS_IOR;
+    let ray_r = refract_ray(normal, eta * (1.0 + DISPERSION));
+    let ray_g = refract_ray(normal, eta);
+    let ray_b = refract_ray(normal, eta * (1.0 - DISPERSION));
+
+    var acc = vec3<f32>(0.0, 0.0, 0.0);
+    for (var s: i32 = 0; s < REFRACT_STEPS; s = s + 1) {
+        // The midpoint of the s-th slice, so the samples are spread evenly through the slab
+        // rather than piling up on its two faces. With one step this is the middle of the
+        // glass, which is the single most representative depth a single tap could pick.
+        let t = (f32(s) + 0.5) / f32(REFRACT_STEPS);
+        let d = depth * t;
+        let uv_r = clamp((screen_px + refract_offset(ray_r, d)) * inv_viewport, vec2<f32>(0.0), vec2<f32>(1.0));
+        let uv_g = clamp((screen_px + refract_offset(ray_g, d)) * inv_viewport, vec2<f32>(0.0), vec2<f32>(1.0));
+        let uv_b = clamp((screen_px + refract_offset(ray_b, d)) * inv_viewport, vec2<f32>(0.0), vec2<f32>(1.0));
+        acc = acc + vec3<f32>(
+            textureSampleLevel(sharp_texture, sharp_sampler, uv_r, 0.0).r,
+            textureSampleLevel(sharp_texture, sharp_sampler, uv_g, 0.0).g,
+            textureSampleLevel(sharp_texture, sharp_sampler, uv_b, 0.0).b,
+        );
+    }
+    return acc / f32(REFRACT_STEPS);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.kind == KIND_GLYPH) {
@@ -878,6 +1034,55 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let lit = shade_pbr(normal, straight, in.aux.y, in.aux.z, in.aux.w, emissive);
         // Back to premultiplied, which is the one form this pipeline's blend state accepts.
         tint = vec4<f32>(lit * in.color.a, in.color.a);
+    }
+    else if (in.kind == KIND_REFRACT) {
+        // The same shape, the same coverage and — this is acceptance criterion 1 — the same
+        // normal. `sd_rounded_box_grad` and `bevel_normal` are called here exactly as the PBR
+        // arm calls them, with the same arguments, rather than a second normal derived for the
+        // refraction. A refracting surface that disagreed with the lit one about which way it
+        // faces would put its highlight and its distortion in different places, which reads as
+        // two surfaces occupying one rectangle.
+        let bevel = in.aux.x;
+        let grad = sd_rounded_box_grad(in.local, in.half_size, radius);
+        let normal = bevel_normal(distance, grad, bevel);
+        let straight = unpremultiply(in.color);
+        let rough = clamp(in.aux.y, 0.045, 1.0);
+        let metal = clamp(in.aux.z, 0.0, 1.0);
+        // Emission is zero, not `in.param`: on this kind that field is the refraction strength.
+        // The two cannot share it — a surface that glowed in proportion to how much it
+        // refracted would be a lamp whose brightness is a property of the glass.
+        let lit = shade_pbr(normal, straight, in.aux.y, in.aux.z, in.aux.w, 0.0);
+
+        // The rim's profile, reused rather than re-derived — the same reason `edge_emission`
+        // reuses it. Full at the boundary, identically zero `bevel` pixels inward, squared
+        // because a linear ramp has a visible line where its slope stops and glass does not.
+        //
+        // This product is the whole contrast argument: deeper than the bevel `share` is exactly
+        // zero, so the branch below is not taken, `tint` is `lit`, and the ground under a label
+        // on this panel is bit-identical to the PBR surface's. It is also the cost argument —
+        // the march runs in a band, not over a panel — and the two are the same line of code
+        // because they are the same fact.
+        let edge = 1.0 - rim_t(distance, bevel);
+        let share = clamp(in.param, 0.0, 1.0) * edge * edge;
+
+        var surface = lit;
+        if (share > 0.0) {
+            // What is not reflected is transmitted. Fresnel is the split, and it is the
+            // roughness-weakened form for the reason `shade_pbr` uses it on the environment: a
+            // rough surface cannot show a sharp grazing reflection, and the unmodified Schlick
+            // term would give it one.
+            //
+            // At the boundary the normal is horizontal, `n_dot_v` goes to zero and `f` goes to
+            // one — so the very edge is a bright specular lip and the glass begins just inside
+            // it. That is not a special case anyone wrote; it is what the same Fresnel term
+            // that makes an edge catch light says about what an edge lets through.
+            let n_dot_v = max(normal.z, 1e-4);
+            let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), straight, metal);
+            let f = fresnel_roughness(n_dot_v, f0, rough);
+            let behind = refracted_backdrop(in.clip.xy, normal, bevel * GLASS_DEPTH);
+            surface = mix(lit, lit * f + behind * (vec3<f32>(1.0, 1.0, 1.0) - f), share);
+        }
+        tint = vec4<f32>(surface * in.color.a, in.color.a);
     }
     // KIND_RIM has no arm here on purpose, and the absence is the design rather than an
     // omission. Its ramp runs from one colour to nothing, so the whole of it lives in the
