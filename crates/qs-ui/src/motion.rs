@@ -1378,6 +1378,7 @@ mod tests {
             focused: Some(4),
             selection: &selection,
             pressed: None,
+            ..Interaction::default()
         };
         let mut motion = InteractionMotion::new(MotionPreference::Full);
         motion.sync(interaction);

@@ -9,6 +9,8 @@
 pub mod a11y;
 pub mod density;
 pub mod fenwick;
+/// What the application knows about a row that the row source does not.
+pub mod mark;
 pub mod material;
 pub mod motion;
 pub mod recycler;
@@ -25,6 +27,7 @@ pub mod tokens;
 pub use a11y::{SemanticNode, SemanticTree, audit};
 pub use density::{Density, DensityTransition};
 pub use fenwick::{Fenwick, Heights};
+pub use mark::{NO_MARKS, SessionMark, SessionMarks};
 pub use material::{Material, Surface};
 pub use motion::{Animation, MotionKind, MotionPlan, MotionPreference};
 pub use recycler::{Recycler, ViewportLayout};

@@ -355,7 +355,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Which row the pointer and keyboard are on.
+/// What the **view** knows about this frame's rows, over and above what the source said.
 ///
 /// Deliberately *not* carried on [`RowView`]. Hover, focus and selection are properties of
 /// the **view**, not of the data: two panes showing the same directory have different
@@ -363,6 +363,16 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// source stays pure data and the view supplies interaction state at draw time.
 /// Borrowed rather than owned, and that is what keeps this `Copy`: a selection is a set
 /// with an allocation behind it, and the renderer takes this by value once per row.
+///
+/// # Why [`SessionMarks`] is in here with the pointer and the keyboard
+///
+/// It is not interaction, and the name is now slightly wider than it reads. It is here
+/// because this is the one per-frame value that reaches **both**
+/// [`ListRenderer::render`] and [`crate::a11y::SemanticTree::for_frame`], and a session mark
+/// has to appear in both: rendered in ink and missing from the accessible name, the folder's
+/// confidence would be a claim made to sighted users only. Every alternative transport — a
+/// field on the renderer, another argument to `render` — reaches exactly one of the two, and
+/// the other then grows a second answer to the same question. See [`crate::mark`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Interaction<'a> {
     /// Logical corpus index under the pointer.
@@ -380,6 +390,11 @@ pub struct Interaction<'a> {
     /// boolean but its animated intensity, which comes from
     /// [`InteractionMotion`](crate::motion::InteractionMotion) rather than from here.
     pub pressed: Option<u64>,
+    /// The agent sessions filed under the directories on screen, by corpus index.
+    ///
+    /// Empty for every caller that has never heard of a session, which is all of them except
+    /// `qs`'s frame. See the type's docs for why this rides here.
+    pub marks: &'a crate::mark::SessionMarks,
 }
 
 impl Default for Interaction<'_> {
@@ -389,6 +404,7 @@ impl Default for Interaction<'_> {
             focused: None,
             selection: &crate::selection::NOTHING,
             pressed: None,
+            marks: &crate::mark::NO_MARKS,
         }
     }
 }
@@ -1342,6 +1358,59 @@ impl ListRenderer {
                 tabular,
                 secondary,
             );
+        } else if columns.metadata {
+            // The session indicator lives in the slot a **folder leaves empty**, which is the
+            // whole reason it costs no reflow: `format_size` is drawn only for non-directories,
+            // so a directory row's size column is already laid out, already right-aligned, and
+            // already a pair the contrast gate checks on all four row grounds. Nothing labels
+            // this column — there is no header row — so a count here is not filed under a
+            // heading that says "Size".
+            //
+            // Reached only past the `LoadState::Stub` return above, which is acceptance 4 with
+            // no code in it: a stub knows only its name and `IS_DIR`, draws its placeholder
+            // bars, and never asks for a mark. `rows()` is untouched and still cannot block.
+            if let Some(mark) = interaction.marks.get(index) {
+                self.draw_text_right_aligned(
+                    list,
+                    &mark.words(),
+                    columns.size_x() + columns.size,
+                    top + baseline,
+                    columns.size,
+                    type_roles.secondary_px,
+                    self.face_for(type_roles.secondary),
+                    tabular,
+                    // **The confidence is the ink**, and it is the same two levels the tab
+                    // strip uses one surface up: ordinary secondary when a shell vouched for
+                    // being here, muted when every session merely launched here and may have
+                    // `cd`'d away. A reader who learns the distinction on a tab reads it the
+                    // same way on a row. The words say it too, for a reader who hears the row
+                    // rather than seeing it — see `SessionMark::spoken`.
+                    if mark.vouched() { secondary } else { tertiary },
+                );
+                // The state rail, in the slot `Columns` has reserved and nothing has drawn
+                // since the pretend selection indicator was deleted (see `draw_selection`).
+                //
+                // Present only for an outcome. A folder whose shells are all alive gets the
+                // count and no rail, because the neutral token for a live shell is
+                // `border/subtle`, which `design/tokens.json` states is deliberately outside
+                // the contrast gate — WCAG 1.4.11 scopes non-text contrast to boundaries that
+                // *identify* a component, and a rail meaning "something is alive in here"
+                // would be claiming exemption while carrying meaning. Presence is the count's
+                // job; this is reserved for the two outcomes worth interrupting for.
+                if let Some(token) = mark.rail() {
+                    let inset = region.h * 0.22;
+                    let rail_h = (region.h - inset * 2.0).max(1.0);
+                    let rail_w = columns.rail.max(1.0);
+                    list.instances.push(Instance::rect(
+                        columns.rail_x(),
+                        region.y + inset,
+                        rail_w,
+                        rail_h,
+                        rail_w * 0.5,
+                        fade(self.tokens.color(token), hidden),
+                    ));
+                }
+            }
         }
 
         if !columns.metadata {
@@ -4325,6 +4394,297 @@ mod tests {
             linked * 2,
             "the grid draws a different number of emblem quads than the list would"
         );
+    }
+
+    // -- the session indicator (chunk `directory-session-indicators`) ---------------------
+
+    /// Two folders and a file, all loaded, so a mark has somewhere to land and somewhere it
+    /// must not.
+    fn folders_and_a_file() -> RowBuf {
+        let mut buf = RowBuf::new();
+        for (name, is_dir) in [("src", true), ("docs", true), ("main.rs", false)] {
+            buf.push(
+                RowView {
+                    flags: if is_dir {
+                        RowFlags::IS_DIR
+                    } else {
+                        RowFlags::EMPTY
+                    },
+                    state: LoadState::Basic,
+                    ..RowView::default()
+                },
+                name.as_bytes(),
+            );
+        }
+        buf
+    }
+
+    /// The instances a frame draws for `marks`, at scale 1.
+    fn frame_with_marks(
+        renderer: &mut ListRenderer,
+        buf: &RowBuf,
+        marks: &crate::mark::SessionMarks,
+    ) -> DrawList {
+        let layout = layout_for(buf.len() as u64, 1.0);
+        let mut list = DrawList::default();
+        renderer.render(
+            &mut list,
+            buf,
+            &layout,
+            Interaction {
+                marks,
+                ..Interaction::default()
+            },
+            &settled(),
+        );
+        list
+    }
+
+    /// Every rect this frame drew in `token`, at the reserved rail slot's `x`.
+    fn rails_of(renderer: &ListRenderer, list: &DrawList, token: &str) -> usize {
+        let columns = Columns::for_width(1200.0, 1.0, &renderer.tokens);
+        let colour = renderer.tokens.color(token).to_premul_linear_rgba8();
+        list.instances
+            .iter()
+            .filter(|i| {
+                i.kind == qs_gpu::frame::PrimKind::Rect as u32
+                    && i.color == colour
+                    && (i.rect[0] - columns.rail_x()).abs() < 0.5
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_folder_with_no_sessions_draws_nothing_extra_at_all() {
+        // Acceptance 1's second half. Asserted as byte-identical draw lists rather than as
+        // "no rail was found", because the failure worth catching is an indicator that draws
+        // something invisible -- a zero-alpha glyph, an empty-string label, a rect of zero
+        // width -- and every one of those passes a search for a colour and fails this.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let without = frame_with_marks(&mut renderer, &buf, &crate::mark::NO_MARKS);
+        let empty = crate::mark::SessionMarks::new();
+        let also_without = frame_with_marks(&mut renderer, &buf, &empty);
+        assert_eq!(
+            without.instances.len(),
+            also_without.instances.len(),
+            "an empty mark set is not the same as no mark set"
+        );
+    }
+
+    #[test]
+    fn a_marked_folder_draws_its_count_and_an_unmarked_one_beside_it_does_not() {
+        // Acceptance 1. The count is text, so it is counted as glyphs rather than looked for
+        // by colour -- and it is compared against the SAME frame with the mark removed, so
+        // what is measured is the indicator and not the two folder names beside it.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let bare = frame_with_marks(&mut renderer, &buf, &crate::mark::NO_MARKS);
+
+        let mut marks = crate::mark::SessionMarks::new();
+        marks.insert(0, crate::mark::SessionMark::new(2, true, None).unwrap());
+        let marked = frame_with_marks(&mut renderer, &buf, &marks);
+
+        let glyphs = |list: &DrawList| {
+            list.instances
+                .iter()
+                .filter(|i| i.kind == qs_gpu::frame::PrimKind::Glyph as u32)
+                .count()
+        };
+        assert!(
+            glyphs(&marked) > glyphs(&bare),
+            "the marked folder drew no more text than the unmarked one"
+        );
+    }
+
+    #[test]
+    fn a_file_row_keeps_its_size_column_even_when_something_marks_its_index() {
+        // Acceptance 5's neighbour: the indicator takes the slot a FOLDER leaves empty, and
+        // must never displace a file's size. Index 2 is `main.rs`, and marking it is exactly
+        // the mistake a join keyed on the wrong thing would make.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let bare = frame_with_marks(&mut renderer, &buf, &crate::mark::NO_MARKS);
+
+        let mut marks = crate::mark::SessionMarks::new();
+        marks.insert(2, crate::mark::SessionMark::new(9, true, None).unwrap());
+        let marked = frame_with_marks(&mut renderer, &buf, &marks);
+
+        assert_eq!(
+            bare.instances.len(),
+            marked.instances.len(),
+            "a mark on a file row changed what the row drew"
+        );
+    }
+
+    #[test]
+    fn the_count_is_muted_when_no_shell_vouched_for_being_there() {
+        // Acceptance 2, the INK half -- the half `mark.rs` cannot assert, because it holds the
+        // words and this holds the colours. Both channels have to be asserted separately: a
+        // confidence carried in one and quietly dropped from the other is exactly the state
+        // this chunk exists to make impossible, and it is invisible from either side alone.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let secondary = renderer
+            .tokens
+            .color("content/secondary")
+            .to_premul_linear_rgba8();
+        let tertiary = renderer
+            .tokens
+            .color("content/tertiary")
+            .to_premul_linear_rgba8();
+        assert_ne!(secondary, tertiary, "the two ink levels are one colour");
+
+        let buf = folders_and_a_file();
+        let count_glyphs = |list: &DrawList, colour: u32| {
+            list.instances
+                .iter()
+                .filter(|i| i.kind == qs_gpu::frame::PrimKind::Glyph as u32 && i.color == colour)
+                .count()
+        };
+
+        let mut vouched = crate::mark::SessionMarks::new();
+        vouched.insert(0, crate::mark::SessionMark::new(2, true, None).unwrap());
+        let vouched = frame_with_marks(&mut renderer, &buf, &vouched);
+
+        let mut inherited = crate::mark::SessionMarks::new();
+        inherited.insert(0, crate::mark::SessionMark::new(2, false, None).unwrap());
+        let inherited = frame_with_marks(&mut renderer, &buf, &inherited);
+
+        assert!(
+            count_glyphs(&vouched, secondary) > count_glyphs(&inherited, secondary),
+            "the vouched count is not drawn in ordinary ink"
+        );
+        assert!(
+            count_glyphs(&inherited, tertiary) > count_glyphs(&vouched, tertiary),
+            "the inherited count is not muted"
+        );
+    }
+
+    #[test]
+    fn only_an_outcome_draws_a_rail_and_a_live_shell_draws_none() {
+        // Acceptance 3, and the constraint that shapes it: `border/subtle` is declared outside
+        // the contrast gate in `design/tokens.json`, so a running-only folder draws no rail
+        // rather than an ungated one. A rail that appeared for every marked folder would be an
+        // undeclared pair on four row grounds -- which is not a failing check, it is an
+        // UNCHECKED one, and the token file's own comment says so.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+
+        let mut alive = crate::mark::SessionMarks::new();
+        alive.insert(0, crate::mark::SessionMark::new(3, true, None).unwrap());
+        let alive = frame_with_marks(&mut renderer, &buf, &alive);
+        assert_eq!(rails_of(&renderer, &alive, "rail/conflict"), 0);
+        assert_eq!(rails_of(&renderer, &alive, "rail/added"), 0);
+        assert_eq!(
+            rails_of(&renderer, &alive, "border/subtle"),
+            0,
+            "a live shell drew an ungated rail"
+        );
+
+        for token in ["rail/added", "rail/conflict"] {
+            let mut marks = crate::mark::SessionMarks::new();
+            marks.insert(
+                1,
+                crate::mark::SessionMark::new(1, true, Some(token)).unwrap(),
+            );
+            let list = frame_with_marks(&mut renderer, &buf, &marks);
+            assert_eq!(
+                rails_of(&renderer, &list, token),
+                1,
+                "{token} did not reach the reserved rail slot"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stub_directory_is_never_marked_however_it_is_asked() {
+        // Acceptance 4, asserted at the renderer as well as at the join in `qs`. The join is
+        // what decides not to mark a stub; this is what makes the decision safe to get wrong
+        // -- a stub returns before the metadata block, so a mark filed against one by some
+        // future caller still draws no count beside two placeholder bars.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let mut buf = RowBuf::new();
+        buf.push(
+            RowView {
+                flags: RowFlags::IS_DIR,
+                state: LoadState::Stub,
+                ..RowView::default()
+            },
+            b"src",
+        );
+        let bare = frame_with_marks(&mut renderer, &buf, &crate::mark::NO_MARKS);
+
+        let mut marks = crate::mark::SessionMarks::new();
+        marks.insert(
+            0,
+            crate::mark::SessionMark::new(4, true, Some("rail/conflict")).unwrap(),
+        );
+        let marked = frame_with_marks(&mut renderer, &buf, &marks);
+        assert_eq!(
+            bare.instances.len(),
+            marked.instances.len(),
+            "a stub drew an indicator"
+        );
+        assert_eq!(rails_of(&renderer, &marked, "rail/conflict"), 0);
+    }
+
+    #[test]
+    fn the_indicator_does_not_touch_the_folder_icon() {
+        // Acceptance 5. `kind_of` still decides the icon, and the icon is drawn in the same
+        // tint at the same size whether or not the row is marked -- which is what "beside it,
+        // and does not replace or recolour it" means, asserted rather than asserted-by-comment.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let icon_px = qs_gpu::icon::device_px(qs_gpu::icon::GRID, 1.0) as f32;
+        let folder = renderer
+            .tokens
+            .color("icon/folder")
+            .to_premul_linear_rgba8();
+        let icons = |list: &DrawList| {
+            list.instances
+                .iter()
+                .filter(|i| {
+                    i.kind == qs_gpu::frame::PrimKind::Glyph as u32
+                        && i.color == folder
+                        && (i.rect[2] - icon_px).abs() < 0.5
+                })
+                .count()
+        };
+
+        let bare = frame_with_marks(&mut renderer, &buf, &crate::mark::NO_MARKS);
+        let mut marks = crate::mark::SessionMarks::new();
+        marks.insert(
+            0,
+            crate::mark::SessionMark::new(2, true, Some("rail/conflict")).unwrap(),
+        );
+        let marked = frame_with_marks(&mut renderer, &buf, &marks);
+        assert_eq!(
+            icons(&bare),
+            icons(&marked),
+            "the indicator changed the folder icon"
+        );
+        assert!(icons(&bare) > 0, "no folder icon was drawn to compare");
     }
 
     #[test]

@@ -156,7 +156,7 @@ impl SemanticTree {
             nodes.push(SemanticNode {
                 id: row_node_id(logical),
                 role: Role::ListItem,
-                label: describe(buf, row),
+                label: describe(buf, row, interaction.marks.get(logical)),
                 // 1-based: assistive technology announces "item 4,312", not "item 4,311".
                 index_in_set: Some(logical as usize + 1),
                 set_size: Some(layout.row_count as usize),
@@ -270,7 +270,13 @@ impl SemanticTree {
             self.nodes.push(SemanticNode {
                 id: column_row_node_id(column, logical),
                 role: Role::ListItem,
-                label: describe(buf, row),
+                // No mark, and that is deliberate rather than an omission: a Miller column
+                // draws no metadata (`Columns::for_column`), so `ListRenderer::render_column`
+                // has no slot to put a session count in and draws none. Speaking one here
+                // would make the two channels disagree about the same row — which is the
+                // defect the mark rides on `Interaction` to prevent, so it must not be
+                // reintroduced by the one caller that cannot draw it.
+                label: describe(buf, row, None),
                 index_in_set: Some(logical as usize + 1),
                 set_size: Some(layout.row_count as usize),
                 bounds: Some((
@@ -375,7 +381,8 @@ fn selection_announcement(count: u64) -> String {
 /// Never empty for a focusable node (FR-028). A row whose name is empty -- which happens
 /// for a stub that has not yet learned its name -- announces "Loading" rather than nothing,
 /// because a focusable node with no name is a node the user cannot identify.
-fn describe(buf: &RowBuf, row: &RowView) -> String {
+/// `mark` is the row's session indicator, when it has one — see [`crate::mark`].
+fn describe(buf: &RowBuf, row: &RowView, mark: Option<&crate::mark::SessionMark>) -> String {
     let name = buf.name(row);
     let name = name.trim();
     if name.is_empty() {
@@ -391,6 +398,17 @@ fn describe(buf: &RowBuf, row: &RowView) -> String {
     }
     if row.flags.contains(RowFlags::IS_HIDDEN) {
         description.push_str(", hidden");
+    }
+
+    // The session count, and — the part that is not optional — the confidence behind it.
+    //
+    // The drawn row carries the same distinction in ink, which a reader who hears this row
+    // cannot see. `SessionMark::spoken` is where the words are decided, so the two channels
+    // are one sentence and one colour derived from one value rather than two descriptions of
+    // a folder that could disagree about whether a shell vouched for being in it.
+    if let Some(mark) = mark {
+        description.push_str(", ");
+        description.push_str(&mark.spoken());
     }
 
     // Everything `crate::substance` puts into the surface is said here too, and that is what
@@ -463,7 +481,7 @@ mod describe_tests {
         // this is the route that does not require eyes. If an encoding is ever added there
         // without a clause here, the surface is carrying something alone.
         let (buf, row) = buf_with(file(LoadState::Basic, RowFlags::IS_READONLY), b"notes.txt");
-        let said = describe(&buf, &row);
+        let said = describe(&buf, &row, None);
 
         assert!(said.starts_with("notes.txt"), "{said}");
         assert!(said.contains("4.0 MB"), "size must be announced: {said}");
@@ -483,7 +501,7 @@ mod describe_tests {
         // 1970-01-01" is a confident wrong answer where silence was available, and a screen
         // reader user has no way to tell it from a real answer.
         let (buf, row) = buf_with(file(LoadState::Stub, RowFlags::EMPTY), b"waiting.bin");
-        let said = describe(&buf, &row);
+        let said = describe(&buf, &row, None);
 
         assert_eq!(said, "waiting.bin");
         assert!(!said.contains("1970"), "{said}");
@@ -497,7 +515,7 @@ mod describe_tests {
         // folder". Announcing it would be announcing an implementation detail as a fact.
         // `recursive-size-rollup` is the chunk that would make this answerable.
         let (buf, row) = buf_with(file(LoadState::Basic, RowFlags::IS_DIR), b"src");
-        let said = describe(&buf, &row);
+        let said = describe(&buf, &row, None);
 
         assert!(said.contains("folder"), "{said}");
         assert!(!said.contains("MB"), "{said}");
@@ -505,6 +523,38 @@ mod describe_tests {
             said.contains("modified"),
             "a folder still has a date: {said}"
         );
+    }
+
+    #[test]
+    fn a_marked_folder_announces_its_sessions_and_the_confidence_behind_them() {
+        // Acceptance 2, the half a reader who cannot see the ink depends on entirely. The
+        // drawn row carries the same distinction as two levels of grey; if this ever stops
+        // saying which it is, the folder's confidence becomes a claim made to sighted users
+        // only, and every test about the *colours* goes on passing.
+        let (buf, row) = buf_with(file(LoadState::Basic, RowFlags::IS_DIR), b"src");
+
+        let vouched = crate::mark::SessionMark::new(2, true, None).unwrap();
+        let inherited = crate::mark::SessionMark::new(2, false, None).unwrap();
+        let said_vouched = describe(&buf, &row, Some(&vouched));
+        let said_inherited = describe(&buf, &row, Some(&inherited));
+
+        assert!(said_vouched.contains("2 sessions"), "{said_vouched}");
+        assert!(said_inherited.contains("2 sessions"), "{said_inherited}");
+        assert_ne!(
+            said_vouched, said_inherited,
+            "a reader cannot tell a vouched folder from an inherited one"
+        );
+
+        // And the mark is added to the row's own facts rather than replacing them: a folder
+        // with sessions is still a folder, and still has a date.
+        for said in [&said_vouched, &said_inherited] {
+            assert!(said.starts_with("src"), "{said}");
+            assert!(said.contains("folder"), "{said}");
+            assert!(said.contains("modified"), "{said}");
+        }
+
+        // Unmarked is silent, not "0 sessions".
+        assert!(!describe(&buf, &row, None).contains("session"));
     }
 }
 
@@ -795,6 +845,9 @@ mod tests {
             },
             b".config",
         );
-        assert_eq!(describe(&buf, &buf.rows()[0]), ".config, folder, hidden");
+        assert_eq!(
+            describe(&buf, &buf.rows()[0], None),
+            ".config, folder, hidden"
+        );
     }
 }
