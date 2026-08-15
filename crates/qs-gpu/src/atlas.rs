@@ -273,13 +273,17 @@ pub enum UploadClass {
 
 /// The structural bound, in entries per frame.
 ///
-/// Nine icon kinds plus two emblem shapes is eleven, so twelve is one frame's worst case
-/// with a slot to spare. It is a constant rather than tier configuration because it is a
-/// fact about `crate::icon` and not about the machine: a tier that could afford more would
-/// have nothing to spend it on. Twelve 20px coverage masks is under 5 KB, which is why
-/// giving structural entries their own bound costs less than taking twelve uploads away
-/// from text would.
-pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 12;
+/// Nine icon kinds, two emblem shapes and six state icons is seventeen, so eighteen is one
+/// frame's worst case with a slot to spare. It is a constant rather than tier configuration
+/// because it is a fact about `crate::icon` and not about the machine: a tier that could
+/// afford more would have nothing to spend it on. Eighteen 20px coverage masks is under 8 KB,
+/// which is why giving structural entries their own bound costs less than taking eighteen
+/// uploads away from text would.
+///
+/// It moved from twelve when `harness-adapters` added [`crate::icon::StateIcon`], and the
+/// worst case is real rather than theoretical: the all-sessions overview can put every state
+/// on screen at once, over a file list already drawing every kind.
+pub const STRUCTURAL_UPLOADS_PER_FRAME: u32 = 18;
 
 /// The image bound, in entries per frame.
 ///
@@ -1485,7 +1489,9 @@ mod tests {
         // `STRUCTURAL_UPLOADS_PER_FRAME` is a claim about `crate::icon`, not about the
         // machine, so it is only correct as long as that claim is. A tenth icon kind added
         // without raising the constant would silently start dropping one icon per frame.
-        let shapes = crate::icon::IconKind::ALL.len() + crate::icon::Emblem::ALL.len();
+        let shapes = crate::icon::IconKind::ALL.len()
+            + crate::icon::Emblem::ALL.len()
+            + crate::icon::StateIcon::ALL.len();
         assert!(
             shapes as u32 <= STRUCTURAL_UPLOADS_PER_FRAME,
             "qs_gpu::icon can produce {shapes} distinct shapes in one frame but the \

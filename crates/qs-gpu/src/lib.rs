@@ -41,7 +41,7 @@ pub use frame::{
     draw_list_channel,
 };
 pub use gl_tier::{TierConfig, config_for};
-pub use icon::{Emblem, IconKey, IconKind, IconShape};
+pub use icon::{Emblem, IconKey, IconKind, IconShape, StateIcon};
 pub use lighting::{SceneEffect, SceneFloor};
 pub use path::{CrashCounter, PathReason, RenderPath, RenderPathSelector, Resolution};
 pub use scene::{Environment, FocusLamp, Light, MAX_SLABS, SceneList, Slab};

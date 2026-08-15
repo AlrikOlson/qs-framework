@@ -826,6 +826,64 @@ impl ListRenderer {
         );
     }
 
+    /// Draw one state icon with its top-left corner at `(x, y)`, in a box of `px` device
+    /// pixels. Returns whether anything was drawn.
+    ///
+    /// # Why this is the entry point rather than a mark in a string
+    ///
+    /// A session's state used to reach the screen as a codepoint inside a label —
+    /// `qs::terminal::Status::mark`, one of U+25CF, U+25CB, U+25B2 — and that channel is only
+    /// as reliable as the machine's font stack. Its own history says so: the first build of it
+    /// used U+26A0 and drew a notdef box. A [`StateIcon`] is a path this workspace rasterizes,
+    /// so it resolves everywhere, and this is how a surface that is not a row reaches it.
+    ///
+    /// The words stay in the label. A reader using the accessible name needs text, and an icon
+    /// is silent to them — so the two channels carry the same state by different means rather
+    /// than one replacing the other.
+    ///
+    /// # Why it asks the atlas directly and holds no per-frame slot
+    ///
+    /// [`ListRenderer::icon_entry`] caches into [`IconCache`] because the row loop asks for
+    /// the same nine kinds a thousand times a frame. Chrome does not: a tab strip draws one of
+    /// these per tab and the overview one per session, so the handful of atlas lookups cost
+    /// less than a second cache keyed by `(state, px)` would — and that cache would have to be
+    /// keyed by size, because these are drawn at a tab's size, a row's size and the overview's
+    /// size in the same frame.
+    ///
+    /// A refusal is counted in `icons_dropped` exactly as a kind's is, for the same reason: on
+    /// the CPU tier that counter is the upload-budget failure, and a state icon competes for
+    /// the same [`UploadClass::Structural`] bound.
+    pub fn draw_state_icon(
+        &mut self,
+        list: &mut DrawList,
+        state: qs_gpu::icon::StateIcon,
+        x: f32,
+        y: f32,
+        px: u16,
+        color: Srgba,
+    ) -> bool {
+        let key = IconKey {
+            shape: IconShape::State(state),
+            px,
+        };
+        let Some(entry) =
+            self.atlas
+                .get_or_render(key, false, UploadClass::Structural, qs_gpu::icon::rasterize)
+        else {
+            self.icons_dropped += 1;
+            return false;
+        };
+        list.instances.push(Instance::glyph(
+            x.round(),
+            y.round(),
+            entry.width as f32,
+            entry.height as f32,
+            entry.uv,
+            color,
+        ));
+        true
+    }
+
     /// Advance width of `text` in a resolved role, in physical pixels.
     ///
     /// Goes through the same shaped-run cache [`ListRenderer::draw_label`] does, so a
