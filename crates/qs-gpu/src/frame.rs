@@ -152,6 +152,27 @@ pub enum PrimKind {
     /// alone — a flat ground, which is the plainer version of the same window that UXDD 10.7
     /// asks for and is what the field converges to anyway where no centre reaches.
     Field = 8,
+    /// A picture: an RGBA sub-rectangle of the atlas's colour page, blitted into the
+    /// instance's rectangle.
+    ///
+    /// [`Instance::uv`] is `[u0, v0, u1, v1]` in normalized colour-page coordinates, the same
+    /// way [`PrimKind::Glyph`]'s is for the coverage page. [`Instance::color`] is a **tint**,
+    /// multiplied through: opaque white leaves the picture alone, and a lower alpha is how a
+    /// thumbnail fades in without a second primitive. [`Instance::radius`] and
+    /// [`Instance::param`] are unused -- a rounded picture wants the shape's coverage
+    /// multiplied into the sample, which is a second thing this does not do yet and would be
+    /// a change to the fragment stage rather than to the instance.
+    ///
+    /// **The second primitive that samples a texture, and it needed a second one.** A glyph
+    /// samples one channel and multiplies by a colour, which is why the tempting version of
+    /// this chunk was a greyscale thumbnail through `KIND_GLYPH` and no renderer change at
+    /// all. That was refused deliberately: it lets the texture's format decide what the
+    /// product is allowed to show. See `colour-atlas-for-images`.
+    ///
+    /// [`Fidelity::Exact`]. `tiny-skia` blits an RGBA pixmap, and both tiers read the same
+    /// atlas coordinates from the same [`crate::atlas::GlyphAtlas`], so declaring a floor
+    /// would be a concession nothing forces -- the same argument [`PrimKind::Sweep`] records.
+    Image = 9,
 }
 
 impl PrimKind {
@@ -170,7 +191,7 @@ impl PrimKind {
     ///
     /// It exists so the `tier_parity` suite can assert that *every* kind has a parity
     /// fixture, rather than asserting it about whichever kinds someone remembered.
-    pub const ALL: [PrimKind; 9] = [
+    pub const ALL: [PrimKind; 10] = [
         Self::Rect,
         Self::Stroke,
         Self::Glyph,
@@ -180,6 +201,7 @@ impl PrimKind {
         Self::Pbr,
         Self::Sweep,
         Self::Field,
+        Self::Image,
     ];
 
     /// This variant's position in [`PrimKind::ALL`].
@@ -198,6 +220,7 @@ impl PrimKind {
             Self::Pbr => 6,
             Self::Sweep => 7,
             Self::Field => 8,
+            Self::Image => 9,
         }
     }
 
@@ -218,6 +241,7 @@ impl PrimKind {
             Self::Pbr => "KIND_PBR",
             Self::Sweep => "KIND_SWEEP",
             Self::Field => "KIND_FIELD",
+            Self::Image => "KIND_IMAGE",
         }
     }
 
@@ -256,9 +280,18 @@ impl PrimKind {
     #[must_use]
     pub const fn fidelity(self) -> Fidelity {
         match self {
-            Self::Rect | Self::Stroke | Self::Glyph | Self::Gradient | Self::Sweep => {
-                Fidelity::Exact
-            }
+            // [`PrimKind::Image`] is `Exact` for the reason the glyph is, one page over.
+            // `tiny-skia` blits an RGBA pixmap, and both tiers read the same atlas
+            // coordinates out of the same `GlyphAtlas`, so what the CPU tier draws is the
+            // same picture in the same place. A floor here would be a concession nothing
+            // forces -- and the concession worth refusing is specifically a greyscale one,
+            // which is where this chunk started.
+            Self::Rect
+            | Self::Stroke
+            | Self::Glyph
+            | Self::Gradient
+            | Self::Sweep
+            | Self::Image => Fidelity::Exact,
             Self::Glow | Self::Rim => Fidelity::Enhanced {
                 floor: Floor::Nothing,
             },
@@ -313,7 +346,11 @@ impl PrimKind {
             | Self::Sweep
             // A field is a function of that same position against a handful of uniforms.
             // Covering the window is a different question from sampling it.
-            | Self::Field => false,
+            | Self::Field
+            // A picture samples a texture, which is not the same as sampling the backdrop.
+            // The atlas is content the frame put there itself; a backdrop is the frame's own
+            // prior output, and only the second needs the two-pass path.
+            | Self::Image => false,
         }
     }
 
@@ -674,6 +711,27 @@ impl Instance {
             radius: 0.0,
             param: 0.0,
             kind: PrimKind::Glyph as u32,
+        }
+    }
+
+    /// A picture from the atlas's colour page, blitted into `w x h`.
+    ///
+    /// `uv` is the entry's normalized rectangle on the **colour** page -- which is a
+    /// different texture from the glyph page and usually a different size, so a `uv`
+    /// computed against `GlyphAtlas::size()` addresses the wrong texels. Take it from the
+    /// [`crate::atlas::AtlasEntry`] and the arithmetic is already done.
+    ///
+    /// `tint` multiplies the sample. [`crate::color::Srgba::WHITE`] leaves the picture as it
+    /// was decoded; a lower alpha fades it, which is how a thumbnail arrives without a
+    /// second primitive to cross-fade with.
+    pub fn image(x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], tint: Srgba) -> Self {
+        Self {
+            rect: [x, y, w, h],
+            uv,
+            color: tint.to_premul_linear_rgba8(),
+            radius: 0.0,
+            param: 0.0,
+            kind: PrimKind::Image as u32,
         }
     }
 

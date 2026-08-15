@@ -272,7 +272,9 @@ mod tests {
         let tokens = Tokens::embedded(Theme::Dark).unwrap();
         let material = tokens.material(name::ROW_SELECTED).unwrap();
         let slab = material
-            .slab(crate::material::Surface::new(0.0, 0.0, 100.0, 30.0, 6.0, 2.0))
+            .slab(crate::material::Surface::new(
+                0.0, 0.0, 100.0, 30.0, 6.0, 2.0,
+            ))
             .unwrap();
         assert_eq!(slab.elevation, material.elevation * 2.0);
     }
@@ -289,7 +291,10 @@ mod tests {
 
         let at = |x: f32| crate::material::Surface::new(x, 100.0, 100.0, 28.0, 6.0, 1.0);
         builder.add(material, at(820.0)); // inside the margin: casts into view
-        assert!(builder.last().is_some(), "a caster inside the margin was culled");
+        assert!(
+            builder.last().is_some(),
+            "a caster inside the margin was culled"
+        );
 
         let before = builder.finish().slabs.len();
         let mut builder = SceneBuilder::new(1, [800.0, 600.0], margin, Environment::default());
@@ -338,7 +343,10 @@ mod tests {
                 2.0,
                 1.0,
             )));
-            builder.finish().focus_light.expect("the lamp was not published")
+            builder
+                .finish()
+                .focus_light
+                .expect("the lamp was not published")
         };
 
         let first = published(100.0);

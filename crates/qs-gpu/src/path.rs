@@ -530,7 +530,10 @@ mod tests {
         assert!(counter.begin_attempt()); // died
         assert!(counter.begin_attempt()); // died again
         assert!(counter.pinned_off(), "two faults must pin the mode off");
-        assert!(!counter.begin_attempt(), "a pinned mode must not be retried");
+        assert!(
+            !counter.begin_attempt(),
+            "a pinned mode must not be retried"
+        );
 
         counter.reset();
         assert!(counter.begin_attempt());

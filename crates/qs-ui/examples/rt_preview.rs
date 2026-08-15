@@ -124,12 +124,25 @@ fn build(tokens: &Tokens) -> Vec<Slab> {
     };
 
     // The same arrangement the spike drew, painted with the shipped materials.
-    admit(name::SURFACE_CANVAS, Surface::new(0.0, 0.0, w, h, 0.0, SCALE));
+    admit(
+        name::SURFACE_CANVAS,
+        Surface::new(0.0, 0.0, w, h, 0.0, SCALE),
+    );
     let bar_h = px(44.0);
-    admit(name::CHROME_BAR, Surface::new(0.0, 0.0, w, bar_h, 0.0, SCALE));
+    admit(
+        name::CHROME_BAR,
+        Surface::new(0.0, 0.0, w, bar_h, 0.0, SCALE),
+    );
     admit(
         name::CHROME_CHIP_HOVER,
-        Surface::new(px(70.0), bar_h * 0.5 - px(13.0), px(78.0), px(26.0), px(6.0), SCALE),
+        Surface::new(
+            px(70.0),
+            bar_h * 0.5 - px(13.0),
+            px(78.0),
+            px(26.0),
+            px(6.0),
+            SCALE,
+        ),
     );
 
     let row_x = px(14.0);

@@ -111,7 +111,7 @@
 
 use tiny_skia::Pixmap;
 
-use crate::atlas::PendingUpload;
+use crate::atlas::{PendingImage, PendingUpload};
 use crate::color::Srgba;
 use crate::cpu_raster::CpuRasterizer;
 use crate::frame::{DrawList, Fidelity, Floor, Instance, PrimKind};
@@ -143,6 +143,8 @@ pub(crate) mod shader {
     pub const KIND_SWEEP: u32 = 7;
     /// `const KIND_FIELD: u32 = 8u;` -- shader line 22.
     pub const KIND_FIELD: u32 = 8;
+    /// `const KIND_IMAGE: u32 = 9u;` -- shader line 23.
+    pub const KIND_IMAGE: u32 = 9;
 
     pub const PI: f32 = std::f32::consts::PI;
     pub const TAU: f32 = std::f32::consts::TAU;
@@ -278,7 +280,8 @@ pub(crate) mod shader {
         // tiers, which is precisely what this module exists to prevent.
         #[allow(clippy::excessive_precision)]
         const SCATTER: f32 = 43758.5453;
-        let grain = 0.93 + 0.07 * ((local[0] * 12.9898 + local[1] * 78.233).sin() * SCATTER).fract();
+        let grain =
+            0.93 + 0.07 * ((local[0] * 12.9898 + local[1] * 78.233).sin() * SCATTER).fract();
         (body + lip) * ribs * grain
     }
 
@@ -392,7 +395,7 @@ pub(crate) mod shader {
     /// alone any more. A rim is deliberately not a fourth case: it lives entirely inside its
     /// shape, so the one-pixel margin every other fill gets is exactly what it needs.
     pub fn quad_pad(kind: u32, param: f32) -> f32 {
-        if kind == KIND_GLYPH {
+        if kind == KIND_GLYPH || kind == KIND_IMAGE {
             0.0
         } else if kind == KIND_GLOW {
             param.max(0.0) + 1.0
@@ -669,6 +672,53 @@ pub(crate) mod shader {
         top * (1.0 - fy) + bottom * fy
     }
 
+    /// `textureSample(colour_texture, atlas_sampler, uv)` -- the colour page.
+    ///
+    /// [`texture_sample_r`]'s filter, one channel count over, with the one thing that is
+    /// genuinely different: the texture is `Rgba8UnormSrgb`, so the hardware converts RGB
+    /// out of sRGB **at fetch, before filtering**, and leaves alpha alone. Decoding after
+    /// the blend instead would be a different answer wherever two neighbouring texels
+    /// differ, which is every edge in a photograph -- so the order is transcribed rather
+    /// than simplified.
+    ///
+    /// Returns **straight** alpha, exactly as the sample does. The premultiply is the
+    /// caller's, because that is where the shader does it.
+    pub fn texture_sample_rgba(colour: &[u8], size: u32, uv: [f32; 2]) -> [f32; 4] {
+        let last = i64::from(size) - 1;
+        let x = uv[0] * size as f32 - 0.5;
+        let y = uv[1] * size as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+
+        let texel = |ix: f32, iy: f32| -> [f32; 4] {
+            let cx = (ix as i64).clamp(0, last) as usize;
+            let cy = (iy as i64).clamp(0, last) as usize;
+            let base = (cy * size as usize + cx) * 4;
+            let Some(bytes) = colour.get(base..base + 4) else {
+                return [0.0; 4];
+            };
+            [
+                crate::color::srgb_to_linear(f32::from(bytes[0]) / 255.0),
+                crate::color::srgb_to_linear(f32::from(bytes[1]) / 255.0),
+                crate::color::srgb_to_linear(f32::from(bytes[2]) / 255.0),
+                f32::from(bytes[3]) / 255.0,
+            ]
+        };
+
+        let mix = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] {
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+                a[3] + (b[3] - a[3]) * t,
+            ]
+        };
+
+        let top = mix(texel(x0, y0), texel(x0 + 1.0, y0), fx);
+        let bottom = mix(texel(x0, y0 + 1.0), texel(x0 + 1.0, y0 + 1.0), fx);
+        mix(top, bottom, fy)
+    }
+
     // -- the lighting pass (T039), transcribed from `shaders/lighting.wgsl` -----------
     //
     // Function for function, constant for constant. If `lighting.wgsl` changes, this must
@@ -896,9 +946,9 @@ pub(crate) mod shader {
                 q[1] - origin[1],
                 slab.elevation - origin[2],
             ];
-            let d = (to_light[0] * to_light[0] + to_light[1] * to_light[1]
-                + to_light[2] * to_light[2])
-                .sqrt();
+            let d =
+                (to_light[0] * to_light[0] + to_light[1] * to_light[1] + to_light[2] * to_light[2])
+                    .sqrt();
             if d > BOUNCE_REACH * 2.0 {
                 continue;
             }
@@ -1018,7 +1068,7 @@ impl Surface {
 /// function pipeline the shader's output actually depends on -- the quad the vertex stage
 /// generates, which fragments that quad covers, the interpolation of `local` and `uv`
 /// across it, and the `One / OneMinusSrcAlpha` blend -- and nothing else.
-fn render_reference(list: &DrawList, atlas: &[u8], atlas_size: u32) -> Surface {
+fn render_reference(list: &DrawList, pages: Pages<'_>) -> Surface {
     let (width, height) = (list.viewport[0], list.viewport[1]);
     let clear = {
         let (r, g, b, a) = (
@@ -1040,24 +1090,31 @@ fn render_reference(list: &DrawList, atlas: &[u8], atlas_size: u32) -> Surface {
     for batch in &list.batches {
         let range = batch.range.start as usize..batch.range.end as usize;
         for instance in &list.instances[range] {
-            draw_reference_instance(
-                &mut surface,
-                instance,
-                atlas,
-                atlas_size,
-                list.environment,
-                list.field,
-            );
+            draw_reference_instance(&mut surface, instance, pages, list.environment, list.field);
         }
     }
     surface
 }
 
+/// The two atlas pages a reference render reads, in the shape the shader's bind group has
+/// them.
+///
+/// A struct rather than four positional arguments, and the reason is the failure mode:
+/// `(coverage, size, colour, size)` is two interchangeable-looking pairs, and transposing
+/// them at a call site produces a picture sampled out of the glyph page -- a wrong image
+/// rather than a compile error.
+#[derive(Clone, Copy, Default)]
+struct Pages<'a> {
+    coverage: &'a [u8],
+    coverage_size: u32,
+    colour: &'a [u8],
+    colour_size: u32,
+}
+
 fn draw_reference_instance(
     surface: &mut Surface,
     instance: &Instance,
-    atlas: &[u8],
-    atlas_size: u32,
+    pages: Pages<'_>,
     environment: crate::frame::Environment,
     field: crate::frame::FieldWash,
 ) {
@@ -1110,17 +1167,26 @@ fn draw_reference_instance(
                 continue;
             }
 
-            let alpha = if instance.kind == shader::KIND_GLYPH {
-                // `out.uv = mix(inst.uv.xy, inst.uv.zw, corner)`, interpolated: the
-                // fragment's fraction across the quad picks the same fraction across the
-                // atlas sub-rectangle.
+            // `out.uv = mix(inst.uv.xy, inst.uv.zw, corner)`, interpolated: the fragment's
+            // fraction across the quad picks the same fraction across the atlas
+            // sub-rectangle. Both textured kinds read it the same way; only which page
+            // they read it from differs.
+            let sampled_uv = || {
                 let fx = (p[0] - x) / w;
                 let fy = (p[1] - y) / h;
-                let uv = [
+                [
                     instance.uv[0] + (instance.uv[2] - instance.uv[0]) * fx,
                     instance.uv[1] + (instance.uv[3] - instance.uv[1]) * fy,
-                ];
-                shader::texture_sample_r(atlas, atlas_size, uv)
+                ]
+            };
+
+            let alpha = if instance.kind == shader::KIND_GLYPH {
+                shader::texture_sample_r(pages.coverage, pages.coverage_size, sampled_uv())
+            } else if instance.kind == shader::KIND_IMAGE {
+                // The picture's own straight alpha. The colour half is folded into `tint`
+                // below, so that `tint * alpha` reproduces
+                // `vec4(texel.rgb * texel.a, texel.a) * in.color` term for term.
+                shader::texture_sample_rgba(pages.colour, pages.colour_size, sampled_uv())[3]
             } else {
                 shader::fs_alpha(
                     instance.kind,
@@ -1133,7 +1199,19 @@ fn draw_reference_instance(
 
             // Coverage and colour are separable in `fs_main`: a gradient takes the fill's
             // coverage and replaces only the tint being covered.
-            let tint = if instance.kind == shader::KIND_GRADIENT {
+            let tint = if instance.kind == shader::KIND_IMAGE {
+                // The sample's linear RGB times the premultiplied tint's RGB, with the
+                // tint's alpha carried straight through. Multiplied by `alpha` below --
+                // the picture's own -- this is exactly `picture * in.color`.
+                let texel =
+                    shader::texture_sample_rgba(pages.colour, pages.colour_size, sampled_uv());
+                [
+                    texel[0] * color[0],
+                    texel[1] * color[1],
+                    texel[2] * color[2],
+                    color[3],
+                ]
+            } else if instance.kind == shader::KIND_GRADIENT {
                 shader::ramp(
                     color,
                     instance.uv,
@@ -1384,6 +1462,15 @@ fn compare(cpu: &Pixmap, gpu: &Surface) -> Divergence {
 const SURFACE: u32 = 64;
 const ATLAS: u32 = 32;
 
+/// The colour page's edge in these fixtures.
+///
+/// A **different number from [`ATLAS`] on purpose.** In the shipped renderer the two pages
+/// are different sizes, so a `uv` computed against the wrong one addresses the wrong
+/// texels -- and if both fixtures used one constant, that whole class of mistake would be
+/// untestable here and would first appear on screen. 64 is the smallest edge that holds
+/// every image fixture below.
+const COLOUR_ATLAS: u32 = 64;
+
 /// How finely the CPU tier can place an edge, in pixels.
 ///
 /// `tiny-skia`'s antialiased fill resolves an edge to the nearest quarter pixel: a shape
@@ -1413,8 +1500,10 @@ const QUANTISATION_CHANNEL_BUDGET: u8 = (MAX_EDGE_ERROR * 255.0) as u8;
 struct Case {
     name: &'static str,
     instance: Instance,
-    /// Atlas content the case needs. Empty for everything but glyphs.
+    /// Coverage-page content the case needs. Empty for everything but glyphs.
     uploads: Vec<PendingUpload>,
+    /// Colour-page content the case needs. Empty for everything but images.
+    images: Vec<PendingImage>,
     /// Largest tolerated single-channel difference, in 0..=255 units.
     max_channel: u8,
     /// Largest tolerated mean channel difference over the surface.
@@ -1448,9 +1537,22 @@ fn glyph_coverage(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// Normalised atlas coordinates for a sub-rectangle of the atlas.
+/// Normalised coordinates for a sub-rectangle of the **coverage** page.
 fn uv_for(x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
-    let s = ATLAS as f32;
+    normalised(x, y, w, h, ATLAS)
+}
+
+/// Normalised coordinates for a sub-rectangle of the **colour** page.
+///
+/// Separate from [`uv_for`] rather than a size argument on it, because the failure this
+/// prevents is calling the wrong one, and a call site that reads `uv_for_colour` says
+/// which page it means.
+fn uv_for_colour(x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
+    normalised(x, y, w, h, COLOUR_ATLAS)
+}
+
+fn normalised(x: u32, y: u32, w: u32, h: u32, size: u32) -> [f32; 4] {
+    let s = size as f32;
     [
         x as f32 / s,
         y as f32 / s,
@@ -1486,6 +1588,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/sharp",
                 instance: Instance::rect(16.0, 20.0, 32.0, 24.0, 0.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 1,
                 mean_channel: 0.01,
                 centroid_shift: 0.01,
@@ -1497,6 +1600,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/rounded",
                 instance: Instance::rect(12.0, 10.0, 40.0, 28.0, 6.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: CURVATURE,
                 mean_channel: 0.10,
                 centroid_shift: 0.01,
@@ -1510,6 +1614,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/fractional-scale",
                 instance: Instance::rect(15.0, 12.5, 37.5, 27.5, 7.5, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: CURVATURE,
                 mean_channel: 0.12,
                 centroid_shift: 0.01,
@@ -1524,6 +1629,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/eighth-grid",
                 instance: Instance::rect(9.375, 11.0, 30.375, 24.0, 9.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: ROUNDED_AND_OFF_GRID,
                 mean_channel: 0.20,
                 centroid_shift: MAX_EDGE_ERROR * 0.5,
@@ -1548,6 +1654,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/over-large-radius",
                 instance: Instance::rect(16.0, 20.0, 32.0, 24.0, 1000.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 32,
                 mean_channel: 0.25,
                 centroid_shift: 0.01,
@@ -1561,6 +1668,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rect/translucent",
                 instance: Instance::rect(8.0, 8.0, 30.0, 30.0, 4.0, Srgba::new(0.2, 0.6, 0.9, 0.5)),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: CURVATURE,
                 mean_channel: 0.05,
                 centroid_shift: 0.01,
@@ -1574,6 +1682,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "stroke/sharp",
                 instance: Instance::stroke(10.0, 10.0, 20.0, 20.0, 0.0, 2.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 1,
                 mean_channel: 0.01,
                 centroid_shift: 0.01,
@@ -1588,6 +1697,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "stroke/rounded",
                 instance: Instance::stroke(8.0, 8.0, 32.0, 24.0, 6.0, 1.5, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: CURVATURE,
                 mean_channel: 0.25,
                 centroid_shift: 0.01,
@@ -1606,6 +1716,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "stroke/fractional-scale",
                 instance: Instance::stroke(10.5, 9.5, 33.75, 25.0, 7.5, 1.875, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: ROUNDED_AND_OFF_GRID,
                 mean_channel: 1.00,
                 centroid_shift: 0.40,
@@ -1627,6 +1738,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "stroke/over-large-radius",
                 instance: Instance::stroke(12.0, 14.0, 32.0, 24.0, 1000.0, 2.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 56,
                 mean_channel: 0.65,
                 centroid_shift: 0.01,
@@ -1668,6 +1780,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.01,
@@ -1691,6 +1804,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.01,
@@ -1713,6 +1827,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: CURVATURE,
                     mean_channel: 0.10,
                     centroid_shift: 0.01,
@@ -1737,6 +1852,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         12.0, 16.0, 36.0, 28.0, 0.0, 0.0, cyan, clear_cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.02,
@@ -1750,6 +1866,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         12.0, 16.0, 36.0, 28.0, 4.0, 0.0, cyan, clear_cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: CURVATURE,
                     mean_channel: 0.10,
                     centroid_shift: 0.02,
@@ -1772,6 +1889,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     height: 11,
                     coverage: glyph_coverage(9, 11),
                 }],
+                images: Vec::new(),
                 max_channel: 1,
                 mean_channel: 0.01,
                 centroid_shift: 0.01,
@@ -1793,6 +1911,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     height: 14,
                     coverage: glyph_coverage(11, 14),
                 }],
+                images: Vec::new(),
                 max_channel: 1,
                 mean_channel: 0.01,
                 centroid_shift: 0.01,
@@ -1815,6 +1934,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "glow/rounded",
                 instance: Instance::glow(20.0, 22.0, 24.0, 20.0, 6.0, 8.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1838,6 +1958,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     Srgba::new(0.60, 0.30, 1.0, 0.10),
                 ),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1854,6 +1975,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     20.0, 22.0, 24.0, 20.0, 6.0, 5.0, 0.35, 0.0, 1.0, 0.0, white,
                 ),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1878,6 +2000,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     Srgba::new(0.90, 0.72, 0.36, 0.6),
                 ),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1897,6 +2020,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "rim/rounded",
                 instance: Instance::rim(20.0, 22.0, 24.0, 20.0, 6.0, RIM_WIDTH, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1919,6 +2043,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     Srgba::new(0.85, 0.92, 1.0, 0.30),
                 ),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -1948,6 +2073,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     name: "sweep/square-sharp",
                     instance: Instance::sweep(16.0, 16.0, 32.0, 32.0, 0.0, 0.0, steel, cyan),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.01,
@@ -1970,6 +2096,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.01,
@@ -1998,6 +2125,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                         cyan,
                     ),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: CURVATURE,
                     mean_channel: 0.10,
                     centroid_shift: 0.01,
@@ -2011,6 +2139,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     name: "sweep/fade-out-sharp",
                     instance: Instance::sweep(14.0, 18.0, 36.0, 28.0, 0.0, 0.0, cyan, clear_cyan),
                     uploads: Vec::new(),
+                    images: Vec::new(),
                     max_channel: 0,
                     mean_channel: 0.0001,
                     centroid_shift: 0.02,
@@ -2038,6 +2167,7 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                 name: "field/full-viewport",
                 instance: Instance::field(0.0, 0.0, 64.0, 64.0, 0.6, 0.0, white),
                 uploads: Vec::new(),
+                images: Vec::new(),
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -2058,6 +2188,98 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
                     Srgba::new(0.10, 0.11, 0.14, 1.0),
                 ),
                 uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+        ],
+        // A picture is the glyph's question one page over, and the fixtures ask the two
+        // halves the glyph's cannot: does the *colour* survive the trip, and does the
+        // straight-alpha-then-premultiply order agree between the tiers.
+        //
+        // Both are integer-aligned, for the reason `glyph/integer-origin` is: that is the
+        // only geometry the pipeline emits, since a thumbnail is blitted into a rect the
+        // layout chose in whole pixels. `an_image_quad_at_a_fractional_origin_does_not_agree_across_tiers`
+        // pins the case that is not, the same way the glyph's is pinned.
+        PrimKind::Image => vec![
+            Case {
+                // Opaque, so alpha is out of the question and this is purely about whether
+                // the same texels reach the same pixels with the same sRGB decode. Zero
+                // tolerance on every measure: nothing here is antialiased, nothing is
+                // filtered off-centre, and a bilinear tap collapses to nearest.
+                name: "image/opaque-integer-origin",
+                instance: Instance::image(8.0, 8.0, 12.0, 12.0, uv_for_colour(2, 2, 12, 12), white),
+                uploads: Vec::new(),
+                images: vec![PendingImage {
+                    x: 2,
+                    y: 2,
+                    width: 12,
+                    height: 12,
+                    rgba: image_pixels(12, 12, 255),
+                }],
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // The same picture with a per-texel alpha ramp, which is the case where
+                // premultiplying in the wrong colour space shows up. If either tier
+                // multiplied before linearizing, the two would part company across the
+                // whole ramp rather than at its ends -- so a non-zero max_channel here
+                // would be that defect and not a rounding step.
+                name: "image/alpha-ramp",
+                instance: Instance::image(
+                    6.0,
+                    14.0,
+                    16.0,
+                    10.0,
+                    uv_for_colour(20, 4, 16, 10),
+                    white,
+                ),
+                uploads: Vec::new(),
+                images: vec![PendingImage {
+                    x: 20,
+                    y: 4,
+                    width: 16,
+                    height: 10,
+                    rgba: image_pixels(16, 10, 0),
+                }],
+                max_channel: 0,
+                mean_channel: 0.0,
+                centroid_shift: 0.0,
+                ink_area: 0.0,
+            },
+            Case {
+                // A tint at half alpha, which is how a thumbnail fades in. The tint is
+                // premultiplied on the way into the instance and applied after the
+                // picture's own premultiply, so this measures the order of two
+                // multiplications rather than either one alone.
+                name: "image/tinted-fade",
+                instance: Instance::image(
+                    10.0,
+                    6.0,
+                    14.0,
+                    14.0,
+                    uv_for_colour(2, 20, 14, 14),
+                    Srgba::new(1.0, 1.0, 1.0, 0.5),
+                ),
+                uploads: Vec::new(),
+                images: vec![PendingImage {
+                    x: 2,
+                    y: 20,
+                    width: 14,
+                    height: 14,
+                    rgba: image_pixels(14, 14, 255),
+                }],
+                // Zero, measured. The bound was opened to 1 while this was being written,
+                // on the assumption that two multiplications would round apart somewhere.
+                // They do not: both tiers do the same arithmetic in the same order on the
+                // same bytes, which is the same finding `gradient/fade-out-sharp` records.
+                // Left at what it measures, so a change that introduces a rounding step has
+                // something to fail against.
                 max_channel: 0,
                 mean_channel: 0.0,
                 centroid_shift: 0.0,
@@ -2067,9 +2289,40 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
     }
 }
 
+/// A blob of colour standing in for a decoded thumbnail.
+///
+/// Not uniform, for [`glyph_coverage`]'s reason and one more: the three channels are given
+/// *different* patterns, so a renderer that swizzled them -- read BGRA where the format is
+/// RGBA, say -- produces a different picture rather than the same one. A grey ramp would
+/// hide exactly that.
+///
+/// `alpha` of 255 makes the picture opaque; anything else is used as the *floor* of a ramp
+/// across the image, which is what puts soft edges in the fixture.
+fn image_pixels(w: u32, h: u32, alpha: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let a = if alpha == 255 {
+                255
+            } else {
+                let span = (w + h).max(1);
+                (u32::from(alpha) + (x + y) * (255 - u32::from(alpha)) / span).min(255) as u8
+            };
+            out.extend_from_slice(&[
+                ((x * 21) % 256) as u8,
+                ((y * 33) % 256) as u8,
+                ((x * 7 + y * 11) % 256) as u8,
+                a,
+            ]);
+        }
+    }
+    out
+}
+
 fn run_case(case: &Case) -> Divergence {
-    let mut cpu = CpuRasterizer::new(SURFACE, SURFACE, ATLAS).unwrap();
+    let mut cpu = CpuRasterizer::with_colour_page(SURFACE, SURFACE, ATLAS, COLOUR_ATLAS).unwrap();
     cpu.upload_glyphs(&case.uploads);
+    cpu.upload_images(&case.images);
 
     // The reference's atlas mirror, filled by the same uploads. Both tiers read the same
     // bytes at the same coordinates, which is what makes the comparison about
@@ -2084,6 +2337,24 @@ fn run_case(case: &Case) -> Divergence {
         }
     }
 
+    // The colour mirror, filled the same way. Allocated only when the case has pictures,
+    // so a fixture with none is byte-for-byte the run it was before this page existed.
+    let colour_size = COLOUR_ATLAS;
+    let mut colour = if case.images.is_empty() {
+        Vec::new()
+    } else {
+        vec![0u8; (colour_size as usize) * (colour_size as usize) * 4]
+    };
+    for upload in &case.images {
+        let row_bytes = (upload.width as usize) * 4;
+        for row in 0..upload.height {
+            let src = (row as usize) * row_bytes;
+            let dst =
+                ((upload.y + row) as usize) * (colour_size as usize) * 4 + (upload.x as usize) * 4;
+            colour[dst..dst + row_bytes].copy_from_slice(&upload.rgba[src..src + row_bytes]);
+        }
+    }
+
     let mut list = DrawList::default();
     // Transparent clear: with nothing behind it, every non-zero pixel is the primitive's
     // own contribution and a difference cannot be diluted by a shared background.
@@ -2093,7 +2364,15 @@ fn run_case(case: &Case) -> Divergence {
     // one, so a scissored fixture would be measuring that known gap instead of parity.
     list.end_batch(None, !case.uploads.is_empty());
 
-    let reference = render_reference(&list, &atlas, ATLAS);
+    let reference = render_reference(
+        &list,
+        Pages {
+            coverage: &atlas,
+            coverage_size: ATLAS,
+            colour: &colour,
+            colour_size,
+        },
+    );
     let pixmap = cpu.render(&list);
     compare(pixmap, &reference)
 }
@@ -2299,15 +2578,10 @@ fn lit_contribution(effect: SceneEffect, tier: RenderPath) -> Surface {
 /// The shipped key light, normalized — the direction every lighting fixture marches along.
 fn normalized_light() -> [f32; 3] {
     use crate::frame::LIGHT_DIR;
-    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
-        + LIGHT_DIR[1] * LIGHT_DIR[1]
-        + LIGHT_DIR[2] * LIGHT_DIR[2])
-        .sqrt();
-    [
-        LIGHT_DIR[0] / len,
-        LIGHT_DIR[1] / len,
-        LIGHT_DIR[2] / len,
-    ]
+    let len =
+        (LIGHT_DIR[0] * LIGHT_DIR[0] + LIGHT_DIR[1] * LIGHT_DIR[1] + LIGHT_DIR[2] * LIGHT_DIR[2])
+            .sqrt();
+    [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len]
 }
 
 /// A scene that genuinely produces `effect`, sized to the `SURFACE` x `SURFACE` fixture.
@@ -2426,10 +2700,9 @@ fn a_caster_at_two_elevations_produces_penumbras_that_scale_with_height() {
     use crate::frame::LIGHT_DIR;
 
     let k = crate::lighting::hardness(20.0);
-    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
-        + LIGHT_DIR[1] * LIGHT_DIR[1]
-        + LIGHT_DIR[2] * LIGHT_DIR[2])
-        .sqrt();
+    let len =
+        (LIGHT_DIR[0] * LIGHT_DIR[0] + LIGHT_DIR[1] * LIGHT_DIR[1] + LIGHT_DIR[2] * LIGHT_DIR[2])
+            .sqrt();
     let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
 
     // The shadow profile marching down-screen from under the caster's bottom edge
@@ -2444,9 +2717,8 @@ fn a_caster_at_two_elevations_produces_penumbras_that_scale_with_height() {
             })
             .collect()
     };
-    let width = |profile: &[f32]| -> usize {
-        profile.iter().filter(|&&a| a > 0.02 && a < 0.98).count()
-    };
+    let width =
+        |profile: &[f32]| -> usize { profile.iter().filter(|&&a| a > 0.02 && a < 0.98).count() };
 
     let near = width(&profile(8.0));
     let far = width(&profile(24.0));
@@ -2470,10 +2742,9 @@ fn the_shadow_lands_where_the_contact_shadow_offset_already_points() {
     use crate::frame::{LIGHT_DIR, shadow_direction};
 
     let k = crate::lighting::hardness(5.0);
-    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
-        + LIGHT_DIR[1] * LIGHT_DIR[1]
-        + LIGHT_DIR[2] * LIGHT_DIR[2])
-        .sqrt();
+    let len =
+        (LIGHT_DIR[0] * LIGHT_DIR[0] + LIGHT_DIR[1] * LIGHT_DIR[1] + LIGHT_DIR[2] * LIGHT_DIR[2])
+            .sqrt();
     let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
     let slabs = lit_fixture(16.0);
 
@@ -2502,10 +2773,9 @@ fn the_allowance_floor_bounds_the_attenuation_per_slab() {
     // geometry shadows it.
     use crate::frame::LIGHT_DIR;
     let k = crate::lighting::hardness(5.0);
-    let len = (LIGHT_DIR[0] * LIGHT_DIR[0]
-        + LIGHT_DIR[1] * LIGHT_DIR[1]
-        + LIGHT_DIR[2] * LIGHT_DIR[2])
-        .sqrt();
+    let len =
+        (LIGHT_DIR[0] * LIGHT_DIR[0] + LIGHT_DIR[1] * LIGHT_DIR[1] + LIGHT_DIR[2] * LIGHT_DIR[2])
+            .sqrt();
     let toward = [LIGHT_DIR[0] / len, LIGHT_DIR[1] / len, LIGHT_DIR[2] / len];
     let mut slabs = lit_fixture(24.0);
     slabs[0].attenuation_floor = 0.87;
@@ -2700,6 +2970,102 @@ fn glyph_agrees_across_tiers() {
 }
 
 #[test]
+fn image_agrees_across_tiers() {
+    run_kind(PrimKind::Image);
+}
+
+/// The image fixtures put ink on the surface, so agreeing about them means something.
+///
+/// **This test exists because the first version of those fixtures did not.** They passed
+/// every bound at zero tolerance while drawing nothing at all: `uv_for` normalises against
+/// [`ATLAS`], the colour page is [`COLOUR_ATLAS`], and the resulting coordinates addressed
+/// empty texels. Both tiers agreed perfectly about a blank rectangle, and every assertion
+/// in [`assert_parity`] is a comparison -- so all of them held.
+///
+/// A tolerance of zero is the strongest bound in the file and the easiest one to satisfy by
+/// accident. What separates the two is whether anything was drawn, and nothing else in the
+/// harness asks.
+#[test]
+fn the_image_fixtures_lay_down_ink_so_a_pass_means_something() {
+    for case in &cases_for(PrimKind::Image) {
+        let d = run_case(case);
+        assert!(
+            d.cpu_ink.is_some(),
+            "{}: the fixture drew no ink at all, so its zero tolerances hold vacuously",
+            case.name
+        );
+        assert!(
+            d.cpu_ink_area > 1.0,
+            "{}: the fixture laid down {:.3} of ink, which is not a picture",
+            case.name,
+            d.cpu_ink_area
+        );
+    }
+}
+
+/// A `uv` taken from the coverage page's size addresses the wrong texels on the colour
+/// page, and the fixtures can see it.
+///
+/// The inverse of the test above: that one asserts the fixtures are not vacuous, this one
+/// asserts they are *sensitive* -- that the specific mistake which made them vacuous
+/// produces a measurable failure rather than a quieter one. Without it, "the fixtures draw
+/// something" and "the fixtures would notice if the something were wrong" are two different
+/// claims and only the first is checked.
+///
+/// **The expected answer here was wrong, and the real one is better.** The guess was that
+/// both tiers would read the same wrong texels and agree about a wrong picture -- silently.
+/// They do not: a wrong-page `uv` stretches the sampled rectangle across twice as many
+/// texels, and at that point the CPU tier's rounded-nearest addressing and the shader's
+/// bilinear filter stop collapsing to the same thing. The measured disagreement is a full
+/// channel, 255 of 255. So the harness *does* catch this mistake whenever the bad
+/// coordinates land on content at all, and the vacuous case it could not catch is the one
+/// the test above now covers. Between them the gap is closed from both sides.
+#[test]
+fn an_image_uv_from_the_wrong_page_draws_the_wrong_texels() {
+    let case = Case {
+        name: "image/wrong-page-uv",
+        // The same rectangle as `image/opaque-integer-origin`, normalised against the
+        // coverage page instead of the colour one. Every other field is identical.
+        instance: Instance::image(
+            8.0,
+            8.0,
+            12.0,
+            12.0,
+            uv_for(2, 2, 12, 12),
+            Srgba::new(1.0, 1.0, 1.0, 1.0),
+        ),
+        uploads: Vec::new(),
+        images: vec![PendingImage {
+            x: 2,
+            y: 2,
+            width: 12,
+            height: 12,
+            rgba: image_pixels(12, 12, 255),
+        }],
+        max_channel: 0,
+        mean_channel: 0.0,
+        centroid_shift: 0.0,
+        ink_area: 0.0,
+    };
+
+    let d = run_case(&case);
+    assert!(
+        d.cpu_ink.is_some(),
+        "the wrong-page uv landed on empty texels, so this test is measuring the vacuous \
+         case rather than the sensitive one -- ATLAS and COLOUR_ATLAS have drifted such \
+         that the mis-normalised rectangle no longer overlaps the uploaded picture"
+    );
+    assert!(
+        d.max_channel > 64,
+        "a uv normalised against the wrong page produced a divergence of only {}, so the \
+         image fixtures would let this mistake through. Measured at 255 when written; the \
+         bound is deliberately far below that, because what is being asserted is that the \
+         harness NOTICES, not the exact size of the noise",
+        d.max_channel
+    );
+}
+
+#[test]
 fn gradient_agrees_across_tiers() {
     run_kind(PrimKind::Gradient);
 }
@@ -2734,8 +3100,11 @@ fn field_pixels(instance: Instance, field: crate::frame::FieldWash) -> Surface {
     list.end_batch(None, false);
     render_reference(
         &list,
-        &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
-        ATLAS,
+        Pages {
+            coverage: &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
+            coverage_size: ATLAS,
+            ..Pages::default()
+        },
     )
 }
 
@@ -3313,8 +3682,11 @@ fn reference_pixels(instance: Instance) -> Surface {
     list.end_batch(None, false);
     render_reference(
         &list,
-        &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
-        ATLAS,
+        Pages {
+            coverage: &vec![0u8; (ATLAS as usize) * (ATLAS as usize)],
+            coverage_size: ATLAS,
+            ..Pages::default()
+        },
     )
 }
 
@@ -4203,6 +4575,7 @@ fn a_glyph_quad_at_a_fractional_origin_does_not_agree_across_tiers() {
             height: 11,
             coverage: glyph_coverage(9, 11),
         }],
+        images: Vec::new(),
         max_channel: 255,
         mean_channel: 255.0,
         centroid_shift: 255.0,
@@ -4241,7 +4614,7 @@ fn the_reference_reproduces_the_stroke_alignment_the_cpu_tier_was_fixed_to_match
     ));
     list.end_batch(None, false);
 
-    let reference = render_reference(&list, &[], 0);
+    let reference = render_reference(&list, Pages::default());
     let row: Vec<u32> = (0..40)
         .filter(|x| quantise(reference.at(*x, 20)[3]) > INK_FLOOR)
         .collect();

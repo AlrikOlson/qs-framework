@@ -12,7 +12,7 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::atlas::PendingUpload;
+use crate::atlas::{PendingImage, PendingUpload};
 use crate::device::GpuContext;
 use crate::frame::{Batch, DrawList, FIELD_CENTRES, Instance, PrimKind};
 use crate::scene::SceneList;
@@ -67,6 +67,9 @@ pub struct Renderer {
     globals_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
     atlas_texture: wgpu::Texture,
+    /// The colour page. Bound in the same group as the coverage page, so a batch mixing
+    /// text and pictures is still one draw.
+    colour_texture: wgpu::Texture,
     instance_buffer: wgpu::Buffer,
     instance_capacity: u64,
     format: wgpu::TextureFormat,
@@ -171,6 +174,19 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // The colour page, beside the coverage page in the same group. One
+                // set_bind_group serves both, which is what keeps a batch that mixes text
+                // and thumbnails a single draw rather than two.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -207,6 +223,28 @@ impl Renderer {
         });
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let colour_size = crate::atlas::DEFAULT_COLOUR_PAGE;
+        let colour_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("qs-colour-atlas"),
+            size: wgpu::Extent3d {
+                width: colour_size,
+                height: colour_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Srgb, not plain Unorm: a decoder hands over sRGB bytes and the whole pipeline
+            // downstream is linear, so the conversion has to happen somewhere. In the
+            // texture format it is free and exact; in the shader it is three `pow`s per
+            // fragment; at admission it would bake a lossy 8-bit linear encoding into the
+            // cache. See qs_gpu::atlas::RgbaImage.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let colour_view = colour_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("qs-atlas-sampler"),
             // Clamp, not repeat: a glyph sampled slightly outside its rect must read the
@@ -234,6 +272,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&colour_view),
                 },
             ],
         });
@@ -479,6 +521,7 @@ impl Renderer {
             globals_bind_group,
             atlas_bind_group,
             atlas_texture,
+            colour_texture,
             instance_buffer,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             format,
@@ -520,6 +563,45 @@ impl Renderer {
                     // R8 is one byte per texel and the rasterizer emits unpadded rows, so
                     // the source stride is exactly the width.
                     bytes_per_row: Some(upload.width),
+                    rows_per_image: Some(upload.height),
+                },
+                wgpu::Extent3d {
+                    width: upload.width,
+                    height: upload.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// Copy newly admitted pictures into the colour texture.
+    ///
+    /// A separate call from [`Renderer::upload_glyphs`] rather than a branch inside it, for
+    /// the reason [`PendingImage`] is a separate type from [`PendingUpload`]: a frame with
+    /// no images passes an empty slice, and this loop does not run at all.
+    pub fn upload_images(&self, ctx: &GpuContext, uploads: &[PendingImage]) {
+        for upload in uploads {
+            if upload.width == 0 || upload.height == 0 {
+                continue;
+            }
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.colour_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: upload.x,
+                        y: upload.y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    // Four bytes per texel, unpadded rows -- the atlas emits exactly
+                    // `width * height * 4` and `RgbaImage::is_malformed` refuses anything
+                    // that does not, which is what makes this stride safe to assert.
+                    bytes_per_row: Some(upload.width * 4),
                     rows_per_image: Some(upload.height),
                 },
                 wgpu::Extent3d {

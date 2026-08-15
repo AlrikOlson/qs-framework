@@ -1105,7 +1105,15 @@ impl Material {
                 ),
                 // A glyph is not a material layer: it samples the atlas, and what it samples
                 // is text, which is content rather than a look. `LayerDef` cannot spell one.
-                PrimKind::Glyph => continue,
+                //
+                // A picture is the same refusal one page over, and the stronger case of it.
+                // A material is what a surface is *made of*, and it is what the contrast gate
+                // reads; a thumbnail's colours come from a file, so a material that could
+                // carry one would be a material whose contrast nothing can check. That is the
+                // rule `Substance` already states for roughness and metalness -- only what
+                // the gate can see may be encoded in a material -- reaching its limiting
+                // case.
+                PrimKind::Glyph | PrimKind::Image => continue,
             };
             out.push(instance);
         }
@@ -1761,15 +1769,12 @@ pub(crate) fn resolve_all(
         // material that silently lay on the canvas would cast no shadow, and a missing
         // shadow looks like a lighting bug rather than a typo in this file.
         let elevation = match &def.elevation {
-            Some(step) => {
-                elevation
-                    .get(step)
-                    .copied()
-                    .ok_or_else(|| TokenError::MaterialUnknownElevation {
-                        material: material.clone(),
-                        step: step.clone(),
-                    })?
-            }
+            Some(step) => elevation.get(step).copied().ok_or_else(|| {
+                TokenError::MaterialUnknownElevation {
+                    material: material.clone(),
+                    step: step.clone(),
+                }
+            })?,
             None => 0.0,
         };
         out.insert(
@@ -1990,7 +1995,11 @@ mod tests {
         material.compile(surface(), 1.0, Drive::REST, true, &mut out);
         out.iter()
             .filter_map(Instance::cpu_floor)
-            .map(|i| unpack_premul_linear(i.color).over(ground).contrast_ratio(ground))
+            .map(|i| {
+                unpack_premul_linear(i.color)
+                    .over(ground)
+                    .contrast_ratio(ground)
+            })
             .fold(0.0_f32, f32::max)
     }
 

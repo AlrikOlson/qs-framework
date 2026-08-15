@@ -356,7 +356,9 @@ fn the_semantic_tree_is_identical_with_the_mode_on_and_off() {
 
     let tokens = Tokens::embedded(Theme::Dark).unwrap();
     let mut builder = SceneBuilder::new(1, [1920.0, 1080.0], 40.0, Default::default());
-    let canvas = tokens.material(qs_ui::material::name::SURFACE_CANVAS).unwrap();
+    let canvas = tokens
+        .material(qs_ui::material::name::SURFACE_CANVAS)
+        .unwrap();
     builder.add(canvas, Surface::new(0.0, 0.0, 1920.0, 1080.0, 0.0, 1.0));
     let scene = builder.finish();
     assert!(!scene.slabs.is_empty(), "the mode-on half built no scene");

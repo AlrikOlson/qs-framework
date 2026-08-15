@@ -30,7 +30,7 @@ use tiny_skia::{
     Rect, SpreadMode, Stroke, Transform,
 };
 
-use crate::atlas::PendingUpload;
+use crate::atlas::{PendingImage, PendingUpload};
 use crate::color::{dithered, linear_rgb_to_oklab, linear_to_srgb, oklab_to_linear_rgb};
 use crate::frame::{DrawList, Instance, PrimKind};
 
@@ -54,6 +54,14 @@ pub struct CpuRasterizer {
     /// rather than coincidental.
     atlas: Vec<u8>,
     atlas_size: u32,
+    /// CPU-side mirror of the colour page, RGBA with straight alpha -- the same bytes the
+    /// GPU texture gets, so both tiers linearize and premultiply from the same source.
+    ///
+    /// Allocated lazily. A tier that never draws a picture pays nothing for the ability to,
+    /// which matters more here than on the GPU: this is the fallback tier, and it is the
+    /// machine least able to afford four megabytes it is not using.
+    colour: Vec<u8>,
+    colour_size: u32,
 }
 
 impl std::fmt::Debug for CpuRasterizer {
@@ -68,12 +76,37 @@ impl std::fmt::Debug for CpuRasterizer {
 
 impl CpuRasterizer {
     pub fn new(width: u32, height: u32, atlas_size: u32) -> Option<Self> {
+        Self::with_colour_page(width, height, atlas_size, crate::atlas::DEFAULT_COLOUR_PAGE)
+    }
+
+    /// Both mirrors sized explicitly.
+    ///
+    /// `colour_size` **must** be the colour-page edge of the [`crate::atlas::GlyphAtlas`]
+    /// driving this rasterizer, for the same reason `atlas_size` must be its coverage edge:
+    /// a `uv` is normalized against the page it came from, so a mismatch reads the right
+    /// texture at the wrong coordinates and draws a picture that is quietly the wrong part
+    /// of the atlas. [`crate::atlas::GlyphAtlas::colour_size`] is where the answer is.
+    pub fn with_colour_page(
+        width: u32,
+        height: u32,
+        atlas_size: u32,
+        colour_size: u32,
+    ) -> Option<Self> {
         let pixmap = Pixmap::new(width.max(1), height.max(1))?;
         Some(Self {
             pixmap,
             atlas: vec![0; (atlas_size as usize).saturating_mul(atlas_size as usize)],
             atlas_size,
+            colour: Vec::new(),
+            colour_size: colour_size.max(1),
         })
+    }
+
+    /// The colour page's edge, in texels. What a `uv` on a [`PrimKind::Image`] instance is
+    /// normalized against, which is a different number from [`CpuRasterizer::new`]'s
+    /// `atlas_size`.
+    pub fn colour_size(&self) -> u32 {
+        self.colour_size
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
@@ -105,6 +138,38 @@ impl CpuRasterizer {
                     .atlas
                     .get_mut(dst_start..dst_start + upload.width as usize)
                 else {
+                    continue;
+                };
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+
+    /// Copy newly admitted pictures into the colour mirror.
+    ///
+    /// The mirror is allocated on the first call and not before: `Vec::new` costs nothing,
+    /// and a CPU-tier session that never opens a preview never pays the four megabytes.
+    pub fn upload_images(&mut self, uploads: &[PendingImage]) {
+        if uploads.is_empty() {
+            return;
+        }
+        let stride = (self.colour_size as usize) * 4;
+        if self.colour.is_empty() {
+            self.colour = vec![0; stride.saturating_mul(self.colour_size as usize)];
+        }
+        for upload in uploads {
+            let row_bytes = (upload.width as usize) * 4;
+            for row in 0..upload.height {
+                let src_start = (row as usize) * row_bytes;
+                let Some(src) = upload.rgba.get(src_start..src_start + row_bytes) else {
+                    continue;
+                };
+                let y = upload.y + row;
+                if y >= self.colour_size {
+                    continue;
+                }
+                let dst_start = (y as usize) * stride + (upload.x as usize) * 4;
+                let Some(dst) = self.colour.get_mut(dst_start..dst_start + row_bytes) else {
                     continue;
                 };
                 dst.copy_from_slice(src);
@@ -172,6 +237,7 @@ impl CpuRasterizer {
 
         match instance.kind {
             k if k == PrimKind::Glyph as u32 => self.draw_glyph(instance, r, g, b, a, clip),
+            k if k == PrimKind::Image as u32 => self.draw_image(instance, r, g, b, a, clip),
             // One arm for both ramps. The conic sweep is the linear gradient with a different
             // parameter -- same stops, same Oklab walk, same dither, same coverage -- so it
             // takes the same per-pixel pattern and the same `tiny-skia` fill, and `ramp_pixmap`
@@ -354,6 +420,119 @@ impl CpuRasterizer {
                     out(g, dg),
                     out(b, db),
                     ((sa + da * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                ) {
+                    *dst = px;
+                }
+            }
+        }
+    }
+
+    /// The colour page's half of [`CpuRasterizer::draw_glyph`].
+    ///
+    /// The addressing is identical -- the same rounded nearest sample, out of a mirror the
+    /// same `GlyphAtlas` filled -- and that is what makes the two tiers land a picture on
+    /// the same pixels. What differs is what a texel *is*: four sRGB bytes with straight
+    /// alpha instead of one coverage byte, so this linearizes and premultiplies in the same
+    /// order the shader does. Doing it in the other order would put the two tiers a
+    /// gamma-curve apart at every soft edge, which is exactly the silent difference
+    /// `tier_parity` exists to refuse.
+    fn draw_image(
+        &mut self,
+        instance: &Instance,
+        tr: f32,
+        tg: f32,
+        tb: f32,
+        ta: f32,
+        clip: Option<Rect>,
+    ) {
+        let [x, y, w, h] = instance.rect;
+        let size = self.colour_size as f32;
+        let u0 = (instance.uv[0] * size).round() as i64;
+        let v0 = (instance.uv[1] * size).round() as i64;
+
+        let dst_x0 = x.round() as i64;
+        let dst_y0 = y.round() as i64;
+        let width = w.round() as i64;
+        let height = h.round() as i64;
+
+        let pw = self.pixmap.width() as i64;
+        let ph = self.pixmap.height() as i64;
+
+        let (cx0, cy0, cx1, cy1) = match clip {
+            Some(rect) => (
+                rect.left() as i64,
+                rect.top() as i64,
+                rect.right() as i64,
+                rect.bottom() as i64,
+            ),
+            None => (0, 0, pw, ph),
+        };
+
+        for row in 0..height {
+            let dy = dst_y0 + row;
+            if dy < cy0.max(0) || dy >= cy1.min(ph) {
+                continue;
+            }
+            let sy = v0 + row;
+            if sy < 0 || sy >= self.colour_size as i64 {
+                continue;
+            }
+            for col in 0..width {
+                let dx = dst_x0 + col;
+                if dx < cx0.max(0) || dx >= cx1.min(pw) {
+                    continue;
+                }
+                let sx = u0 + col;
+                if sx < 0 || sx >= self.colour_size as i64 {
+                    continue;
+                }
+
+                let texel = ((sy as usize) * (self.colour_size as usize) + sx as usize) * 4;
+                let Some(&[br, bg, bb, ba]) = self
+                    .colour
+                    .get(texel..texel + 4)
+                    .and_then(|bytes| <&[u8; 4]>::try_from(bytes).ok())
+                else {
+                    continue;
+                };
+                // sRGB decode on colour only, alpha left alone -- what Rgba8UnormSrgb does
+                // in hardware on the GPU tier.
+                let sr = crate::color::srgb_to_linear(f32::from(br) / 255.0);
+                let sg = crate::color::srgb_to_linear(f32::from(bg) / 255.0);
+                let sb = crate::color::srgb_to_linear(f32::from(bb) / 255.0);
+                let sa = f32::from(ba) / 255.0;
+                if sa == 0.0 && ta == 0.0 {
+                    continue;
+                }
+
+                // Premultiply after linearizing, then apply the premultiplied tint. Both
+                // multiplications in the same order as the shader's.
+                let src_r = sr * sa * tr;
+                let src_g = sg * sa * tg;
+                let src_b = sb * sa * tb;
+                let src_a = sa * ta;
+                if src_a == 0.0 && src_r == 0.0 && src_g == 0.0 && src_b == 0.0 {
+                    continue;
+                }
+
+                let index = (dy as usize) * (self.pixmap.width() as usize) + dx as usize;
+                let Some(dst) = self.pixmap.pixels_mut().get_mut(index) else {
+                    continue;
+                };
+
+                let inv = 1.0 - src_a;
+                let dr = f32::from(dst.red()) / 255.0;
+                let dg = f32::from(dst.green()) / 255.0;
+                let db = f32::from(dst.blue()) / 255.0;
+                let da = f32::from(dst.alpha()) / 255.0;
+
+                let out =
+                    |s: f32, d: f32| -> u8 { ((s + d * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8 };
+                if let Some(px) = PremultipliedColorU8::from_rgba(
+                    out(src_r, dr),
+                    out(src_g, dg),
+                    out(src_b, db),
+                    ((src_a + da * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
                 ) {
                     *dst = px;
                 }

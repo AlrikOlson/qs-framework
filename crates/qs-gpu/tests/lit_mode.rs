@@ -90,7 +90,12 @@ fn scene(slabs: Vec<Slab>) -> SceneList {
     scene
 }
 
-fn draw(ctx: &GpuContext, renderer: &mut Renderer, list: &DrawList, s: Option<&SceneList>) -> Vec<u8> {
+fn draw(
+    ctx: &GpuContext,
+    renderer: &mut Renderer,
+    list: &DrawList,
+    s: Option<&SceneList>,
+) -> Vec<u8> {
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("lit_mode test surface"),
         size: wgpu::Extent3d {
@@ -227,7 +232,10 @@ fn an_elevated_caster_darkens_the_frame_it_stands_over() {
     // additive term), and at least one got darker.
     let mut darker = 0usize;
     for (a, b) in unlit.iter().zip(&lit) {
-        assert!(b <= a, "US1's pass may only attenuate, but a byte increased");
+        assert!(
+            b <= a,
+            "US1's pass may only attenuate, but a byte increased"
+        );
         if b < a {
             darker += 1;
         }
@@ -371,7 +379,11 @@ fn the_exact_window_scene_replayed() {
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
             mip_level: 0,
-            origin: wgpu::Origin3d { x: 500, y: 500, z: 0 },
+            origin: wgpu::Origin3d {
+                x: 500,
+                y: 500,
+                z: 0,
+            },
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {

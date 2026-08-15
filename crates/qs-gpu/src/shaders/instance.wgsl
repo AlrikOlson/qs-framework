@@ -20,6 +20,7 @@ const KIND_RIM:      u32 = 5u;
 const KIND_PBR:      u32 = 6u;
 const KIND_SWEEP:    u32 = 7u;
 const KIND_FIELD:    u32 = 8u;
+const KIND_IMAGE:    u32 = 9u;
 
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318531;
@@ -61,6 +62,13 @@ struct Globals {
 
 @group(1) @binding(0) var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
+// The colour page. A second texture rather than a second bind group: it is the same cache
+// with the same eviction and the same budget, and binding it beside the coverage page costs
+// one descriptor rather than a second set_bind_group per batch.
+//
+// Rgba8UnormSrgb, so this sample is already linear. The stored bytes are STRAIGHT alpha --
+// see qs_gpu::atlas::RgbaImage for why premultiplying them would be wrong here specifically.
+@group(1) @binding(2) var colour_texture: texture_2d<f32>;
 
 struct InstanceIn {
     // [x, y, width, height], physical pixels, top-left origin.
@@ -115,7 +123,9 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: InstanceIn) -> VsOut 
     // all until somebody asks for a larger radius. The +1 on top is the same antialiasing
     // margin every other shape gets; the profile has already reached zero by then.
     var pad = 1.0;
-    if (inst.kind == KIND_GLYPH) {
+    if (inst.kind == KIND_GLYPH || inst.kind == KIND_IMAGE) {
+        // Same reason as the glyph: the quad IS the sampled rectangle, so padding it would
+        // shear the UV mapping and read a neighbour's texels through the gutter.
         pad = 0.0;
     } else if (inst.kind == KIND_GLOW) {
         pad = max(inst.param, 0.0) + 1.0;
@@ -735,6 +745,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // state expects.
         let coverage = textureSample(atlas_texture, atlas_sampler, in.uv).r;
         return in.color * coverage;
+    }
+
+    if (in.kind == KIND_IMAGE) {
+        // Rgba8UnormSrgb: rgb arrives linear, a arrives untouched, and both are STRAIGHT.
+        // Premultiply here, after the hardware's sRGB decode -- doing it before would
+        // compute srgb_to_linear(c * a) where premultiplied blending needs
+        // srgb_to_linear(c) * a, and the two part company worst at a soft edge.
+        let texel = textureSample(colour_texture, atlas_sampler, in.uv);
+        let picture = vec4<f32>(texel.rgb * texel.a, texel.a);
+        // in.color is a premultiplied tint. White at full alpha is the identity, and a
+        // lower alpha scales colour and coverage together, which is what a fade is.
+        return picture * in.color;
     }
 
     // Clamp the radius to what the rectangle can actually hold. An unclamped radius larger

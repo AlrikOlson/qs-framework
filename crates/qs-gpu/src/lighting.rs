@@ -295,7 +295,6 @@ mod tests {
 
     use super::*;
 
-
     #[test]
     fn a_frame_is_a_complete_picture() {
         // T033 / FR-023 / SC-011: the pass is a pure function of the scene — no
@@ -365,9 +364,15 @@ mod tests {
         let (uniform, dropped) = LitSceneUniform::pack(&scene, [800.0, 600.0]);
         assert_eq!(dropped, 5, "the overflow was not counted");
         assert_eq!(uniform.count as usize, LIT_SLABS);
-        assert!((uniform.light[2] - 1.0).abs() < 1e-6, "the light was not normalized");
+        assert!(
+            (uniform.light[2] - 1.0).abs() < 1e-6,
+            "the light was not normalized"
+        );
         assert!((uniform.light[3] - hardness(10.0)).abs() < 1e-3);
-        assert!((uniform.shape[0][3] - 0.25).abs() < f32::EPSILON, "the floor was dropped");
+        assert!(
+            (uniform.shape[0][3] - 0.25).abs() < f32::EPSILON,
+            "the floor was dropped"
+        );
     }
 
     /// Capability rank, ascending. Stated here because `RenderPath`'s derived `Ord` is

@@ -651,7 +651,9 @@ mod tests {
             40.0,
             qs_gpu::scene::Environment::default(),
         );
-        let canvas = tokens.material(crate::material::name::SURFACE_CANVAS).unwrap();
+        let canvas = tokens
+            .material(crate::material::name::SURFACE_CANVAS)
+            .unwrap();
         builder.add(
             canvas,
             crate::material::Surface::new(0.0, 0.0, 1000.0, 1080.0, 0.0, 1.0),
@@ -660,7 +662,10 @@ mod tests {
         assert!(!scene.slabs.is_empty());
 
         let on: Vec<Option<u64>> = (0..1080).map(|y| layout.row_at(y as f32)).collect();
-        assert_eq!(off, on, "hit testing changed when the lit mode's scene existed");
+        assert_eq!(
+            off, on,
+            "hit testing changed when the lit mode's scene existed"
+        );
     }
 
     #[test]

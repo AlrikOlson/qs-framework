@@ -2003,7 +2003,10 @@ mod tests {
             qs_gpu::frame::LIGHT_DIR,
             "design/tokens.json's rig.key.direction diverged from qs_gpu::frame::LIGHT_DIR"
         );
-        assert_eq!(KeyLightTokens::default().direction, qs_gpu::frame::LIGHT_DIR);
+        assert_eq!(
+            KeyLightTokens::default().direction,
+            qs_gpu::frame::LIGHT_DIR
+        );
     }
 
     #[test]
@@ -2034,7 +2037,10 @@ mod tests {
         // accent-bright at the other — measured at 1.04:1 before the floor moved. 0.55 is
         // the value that lets one ink cover the whole range. See `lighting.$allowance_note`
         // in design/tokens.json.
-        assert!((expected - 0.55).abs() < 1e-6, "dark text-ground floor is {expected}");
+        assert!(
+            (expected - 0.55).abs() < 1e-6,
+            "dark text-ground floor is {expected}"
+        );
 
         // And the light theme's is 0.87 — the per-theme half of rule 3a, on the slab.
         let light = Tokens::embedded(Theme::Light).unwrap();

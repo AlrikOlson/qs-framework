@@ -845,10 +845,10 @@ impl InteractionMotion {
     #[must_use]
     pub fn focus_light_draw(&self) -> Option<FocusLightDraw> {
         if !self.focused.is_animating() {
-            return self
-                .focused
-                .to()
-                .map(|row| FocusLightDraw { row, offset_rows: 0.0 });
+            return self.focused.to().map(|row| FocusLightDraw {
+                row,
+                offset_rows: 0.0,
+            });
         }
 
         let progress = self.focused.progress();

@@ -1065,14 +1065,7 @@ impl ListRenderer {
         }
 
         // Layer 2: the selection regions, hoisted -- see this function's doc comment.
-        self.draw_selection(
-            list,
-            layout,
-            &region,
-            interaction.selection,
-            motion,
-            scene,
-        );
+        self.draw_selection(list, layout, &region, interaction.selection, motion, scene);
 
         // The surface/content seam, recorded where it actually is (specs/002 T019). Layers
         // 1 and 2 — the canvas painted before this call, the row bodies, the washes and the
@@ -1630,8 +1623,7 @@ impl ListRenderer {
             }
         }
 
-        if pass == Pass::Bleed {
-        }
+        if pass == Pass::Bleed {}
 
         // The status rail is NOT drawn here any more, and the deletion is the point.
         //
@@ -2021,7 +2013,12 @@ impl ListRenderer {
             // Icons are `UploadClass::Structural` and never go through `want`, so they
             // cannot appear in content demand. Refusing rather than rasterizing keeps that
             // true instead of merely likely.
-            AtlasKey::Icon(_) => None,
+            //
+            // Images are `UploadClass::Image` and reach the atlas through
+            // `GlyphAtlas::get_or_decode_image`, which takes a decoder rather than a glyph
+            // rasterizer. Same refusal, same reason: this closure could not produce one if
+            // it wanted to, and saying so keeps the demand path glyph-only by construction.
+            AtlasKey::Icon(_) | AtlasKey::Image(_) => None,
         });
 
         for parked in deferred.drain(..) {
@@ -5490,5 +5487,4 @@ mod tests {
             "the lit arm published no focus lamp, so `render_lit` is not exercising US3"
         );
     }
-
 }
