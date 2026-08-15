@@ -5169,3 +5169,112 @@ fn a_lamp_with_neither_strength_is_the_frame_that_shipped_before_it() {
         );
     }
 }
+
+// -- the bloom's floor -------------------------------------------------------------------
+//
+// `Fidelity` and `Floor` are per-`PrimKind`, and the bloom has no kind: it is a frame
+// property composited by the resolve pass, because the instance pipeline's four bind groups
+// are the four WebGPU guarantees (see `crate::frame::Bloom`). So `cases_for` cannot carry
+// this fixture and the claim has to be made directly.
+//
+// The claim is the same one `Floor::Nothing` makes everywhere else, one level out: the CPU
+// tier draws the frame it would have drawn, exactly, and the bloom is simply absent. That is
+// the right answer rather than a concession -- `tiny-skia` has no target chain, and a hard
+// approximation of a halo reads as a bug where a missing one reads as a plainer theme
+// (UXDD 10.7 groups bloom with glow and halo for this reason).
+
+#[test]
+fn the_cpu_tier_draws_a_bloomed_frame_exactly_as_it_draws_an_unbloomed_one() {
+    use crate::color::Srgba;
+    use crate::cpu_raster::CpuRasterizer;
+    use crate::frame::{Bloom, DrawList, Instance};
+
+    // A scene with something well above any plausible threshold, so a CPU rasterizer that
+    // grew an opinion about the bloom would have something to act on. A dark frame with
+    // nothing bright in it would pass this test while proving nothing.
+    let build = |bloom: Option<Bloom>| {
+        let mut list = DrawList::default();
+        list.reset([64, 64], Srgba::new(0.05, 0.05, 0.06, 1.0), 1);
+        list.instances.push(Instance::rect(
+            8.0,
+            8.0,
+            48.0,
+            48.0,
+            4.0,
+            Srgba::new(0.1, 0.1, 0.12, 1.0),
+        ));
+        list.instances.push(Instance::rect(
+            24.0,
+            24.0,
+            16.0,
+            16.0,
+            2.0,
+            Srgba::new(1.0, 1.0, 0.98, 1.0),
+        ));
+        if let Some(bloom) = bloom {
+            list.set_bloom(bloom);
+        }
+        list.end_batch(None, false);
+        list
+    };
+
+    let bloom = Bloom {
+        threshold: 0.5,
+        strength: 0.35,
+    };
+    assert!(
+        bloom.is_active(),
+        "the fixture must ask for a bloom the GPU tier would actually run, or it asserts \
+         that nothing does nothing"
+    );
+
+    let mut cpu = CpuRasterizer::new(64, 64, 64).expect("a 64x64 pixmap");
+    let plain = cpu.render(&build(None)).data().to_vec();
+    let mut cpu = CpuRasterizer::new(64, 64, 64).expect("a 64x64 pixmap");
+    let bloomed = cpu.render(&build(Some(bloom))).data().to_vec();
+
+    assert_eq!(
+        plain, bloomed,
+        "the CPU tier's floor for the bloom is nothing at all, so a draw list carrying one \
+         must rasterize byte-for-byte as the same list without it"
+    );
+}
+
+#[test]
+fn a_bloom_nobody_set_is_off_and_a_bloom_with_no_headroom_is_too() {
+    use crate::frame::Bloom;
+
+    // Two ways to be off, and they are different questions rather than one written twice.
+    // `Default` is a draw list nobody set a bloom on -- the `FieldWash` rule, so a caller that
+    // stops setting it stops getting it rather than inheriting last frame's.
+    assert!(!Bloom::default().is_active());
+    assert!(!Bloom::NONE.is_active());
+
+    // A threshold at or above 1.0 is off however much strength is asked for, because nothing
+    // in an 8-bit target exceeds full white: the bright pass would select no pixel and the
+    // chain would blur a black image into a black image. This is the light theme's case --
+    // its palette reaches white -- and it is what keeps that theme from paying 1.6 MB and
+    // three full-screen passes per frame to add nothing.
+    assert!(
+        !Bloom {
+            threshold: 1.0,
+            strength: 0.35,
+        }
+        .is_active()
+    );
+    // And strength alone is not enough either way round.
+    assert!(
+        !Bloom {
+            threshold: 0.5,
+            strength: 0.0,
+        }
+        .is_active()
+    );
+    assert!(
+        Bloom {
+            threshold: 0.5,
+            strength: 0.35,
+        }
+        .is_active()
+    );
+}

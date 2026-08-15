@@ -340,28 +340,44 @@ pub const fn blur_reach_pixels() -> u32 {
     BLUR_RADIUS_TEXELS * BLUR_DOWNSAMPLE
 }
 
-/// The quarter-resolution ping-pong pair the separable blur runs on.
+/// The quarter-resolution working set the separable blur runs on, shared by the blur and the
+/// bloom.
 ///
-/// # Why two textures and not one
+/// # Why two textures and not one, and why a third
 ///
-/// A separable Gaussian is two passes, and neither can read and write the same texture. The
-/// pair is allocated together and sized together because they are one resource with two
-/// halves; splitting them into two lazily-allocated fields would allow the state where one
-/// exists at the current size and the other does not.
+/// A separable Gaussian is two passes, and neither can read and write the same texture. `ping`
+/// and `pong` are that pair. They are allocated together and sized together because they are
+/// one resource with two halves; splitting them into lazily-allocated fields would allow the
+/// state where one exists at the current size and the other does not.
+///
+/// `bloom` is a third half, and it exists because **both effects have to survive to the resolve
+/// at once**. The blur leaves its result in `pong`, which the panel samples while it is drawn
+/// over the resolved surface; the bloom leaves its result in `bloom`, which the resolve adds
+/// back. Neither can be recomputed at that point and neither can be where the other is. What
+/// they *do* share is everything else: one struct, one downsample step, one Gaussian shader,
+/// one pair of blur pipelines, and `ping` as scratch — the bloom runs first and is finished
+/// with `ping` before the blur clobbers it. That ordering is why one extra texture buys both
+/// effects in one frame instead of two chains.
 ///
 /// # Cost, stated before it is spent
 ///
 /// Each half is `ceil(w/4) x ceil(h/4) x 4` bytes. At 1920x1080 that is 480x270, **518,400
-/// bytes each and 1,036,800 for the pair**; at 3840x2160, 2,073,600 for the pair. Against the
-/// 8.3 MB and 33.2 MB the colour target already costs at those sizes, the chain adds 12.5% --
-/// which is the whole argument for downsampling stated as a number.
+/// bytes each and 1,555,200 for the three**; at 3840x2160, 3,110,400. Against the 8.3 MB and
+/// 33.2 MB the colour target already costs at those sizes, the chain adds 18.75% -- which is
+/// the whole argument for downsampling stated as a number, and the third half costs 6.25% of
+/// a target rather than 100% of a second one.
 ///
-/// Both halves carry the **surface's own format**, for [`OffscreenTarget`]'s reason: the blur
+/// All three carry the **surface's own format**, for [`OffscreenTarget`]'s reason: the blur
 /// reads an sRGB texture (hardware-decoded to linear), filters in linear, and writes back
 /// through the same encode, so no pass in the chain is a colour conversion.
 pub struct BlurChain {
     ping: wgpu::TextureView,
     pong: wgpu::TextureView,
+    /// Where the bloom's bright pass lands and where its vertical blur writes back: the
+    /// finished bloom the resolve adds. Held apart from the pair for the reason in the type
+    /// docs -- the blur's result and the bloom's are both alive at resolve time.
+    bloom: wgpu::TextureView,
+    bloom_bind_group: wgpu::BindGroup,
     /// Reads the [`OffscreenTarget`] this chain was built against: the source of the
     /// downsample pass.
     ///
@@ -424,6 +440,7 @@ impl BlurChain {
         };
         let ping = make("qs-blur-ping");
         let pong = make("qs-blur-pong");
+        let bloom = make("qs-bloom");
         let bind = |label: &str, view: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
@@ -442,10 +459,13 @@ impl BlurChain {
         };
         let ping_bind_group = bind("qs-blur-ping-bind-group", &ping);
         let pong_bind_group = bind("qs-blur-pong-bind-group", &pong);
+        let bloom_bind_group = bind("qs-bloom-bind-group", &bloom);
         let source_bind_group = bind("qs-blur-source-bind-group", source);
         Self {
             ping,
             pong,
+            bloom,
+            bloom_bind_group,
             source_bind_group,
             generation,
             ping_bind_group,
@@ -501,6 +521,23 @@ impl BlurChain {
         &self.pong_bind_group
     }
 
+    /// Where the bloom's bright pass writes and where its vertical blur writes back: the
+    /// finished bloom.
+    ///
+    /// The same texture twice, one pass apart, exactly as [`BlurChain::pong`] is for the blur
+    /// -- the horizontal pass in between reads it and writes `ping`, so nothing reads and
+    /// writes this view within one pass.
+    #[must_use]
+    pub fn bloom(&self) -> &wgpu::TextureView {
+        &self.bloom
+    }
+
+    /// Reads the finished bloom: what the resolve adds back.
+    #[must_use]
+    pub fn bloom_bind_group(&self) -> &wgpu::BindGroup {
+        &self.bloom_bind_group
+    }
+
     #[must_use]
     pub fn size(&self) -> [u32; 2] {
         self.size
@@ -527,17 +564,23 @@ impl BlurChain {
             && self.generation == generation
     }
 
-    /// GPU memory this chain holds, in bytes: both halves.
+    /// How many quarter-resolution textures a chain holds: `ping`, `pong` and `bloom`.
+    ///
+    /// Named rather than written as a `3` in two places, because the memory figures below and
+    /// the ones pinned in the tests have to move together when a fourth arrives.
+    pub const HALVES: u64 = 3;
+
+    /// GPU memory this chain holds, in bytes: all three halves.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        u64::from(self.size[0]) * u64::from(self.size[1]) * BYTES_PER_TEXEL * 2
+        u64::from(self.size[0]) * u64::from(self.size[1]) * BYTES_PER_TEXEL * Self::HALVES
     }
 
     /// What a chain for `viewport` would cost, without allocating one.
     #[must_use]
     pub fn bytes_at(viewport: [u32; 2]) -> u64 {
         let size = Self::size_for(viewport);
-        u64::from(size[0]) * u64::from(size[1]) * BYTES_PER_TEXEL * 2
+        u64::from(size[0]) * u64::from(size[1]) * BYTES_PER_TEXEL * Self::HALVES
     }
 }
 
@@ -589,17 +632,21 @@ mod tests {
         // factor is the entire argument for the chain being affordable, so the number it buys
         // is pinned. A change to BLUR_DOWNSAMPLE lands here first.
         assert_eq!(BlurChain::size_for([1920, 1080]), [480, 270]);
-        assert_eq!(BlurChain::bytes_at([1920, 1080]), 1_036_800);
+        assert_eq!(BlurChain::bytes_at([1920, 1080]), 1_555_200);
         assert_eq!(BlurChain::size_for([3840, 2160]), [960, 540]);
-        assert_eq!(BlurChain::bytes_at([3840, 2160]), 4_147_200);
+        assert_eq!(BlurChain::bytes_at([3840, 2160]), 6_220_800);
 
         // And the ratio that is the point: the chain is a small fraction of the target it
-        // reads, not a second copy of it. Both halves together, against one colour target.
+        // reads, not a second copy of it. All three halves together, against one colour
+        // target. `prim-bloom` moved this from an eighth to three sixteenths by adding the
+        // third half -- 518 KB at 1080p -- which is what buys a blur and a bloom in the same
+        // frame instead of a second chain at 8.3 MB.
         let chain = BlurChain::bytes_at([1920, 1080]) as f64;
         let target = OffscreenTarget::bytes_at([1920, 1080]) as f64;
+        let expected = BlurChain::HALVES as f64 / 16.0;
         assert!(
-            (chain / target - 0.125).abs() < 1e-9,
-            "two halves at 1/16 the area each is exactly an eighth; got {}",
+            (chain / target - expected).abs() < 1e-9,
+            "three halves at 1/16 the area each is exactly three sixteenths; got {}",
             chain / target
         );
     }

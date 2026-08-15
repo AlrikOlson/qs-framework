@@ -451,7 +451,16 @@ impl PrimKind {
     /// The fourth exhaustive match. The target infrastructure (`crate::target`) landed before
     /// the first effect that uses it, deliberately, so its memory cost, resize behaviour and
     /// tier answer were decided in the open rather than under a visual feature.
-    /// [`PrimKind::Blur`] is the first arm to flip; bloom and refraction are the other two.
+    /// [`PrimKind::Blur`] is the first arm to flip and [`PrimKind::Refract`] is the second.
+    ///
+    /// **There is no third, and the prediction that there would be is worth keeping as a
+    /// correction rather than deleting.** This sentence used to name bloom as well. Bloom is
+    /// not a primitive: the instance pipeline's layout already binds four groups and four is
+    /// what WebGPU guarantees, so there is nowhere to put a bloom texture and a bloom that
+    /// shared group 2 with the blur would bind one of two images per draw span, silently. It
+    /// composites in the resolve pass instead and is a frame property — see [`Bloom`]. A
+    /// primitive is a thing *at a place*; the reason both survivors here are primitives and
+    /// bloom is not is that a panel has a rect and "the bright parts of this window" does not.
     ///
     /// A `true` here obliges two things. The renderer takes its two-pass path for the whole
     /// frame, which costs one full-viewport target — 8.3 MB at 1080p, 33.2 MB at 4K. And the
@@ -1189,6 +1198,67 @@ impl FieldWash {
     }
 }
 
+/// Bloom: what the frame's brightest parts bleed into everything around them.
+///
+/// # Why this is not a [`PrimKind`]
+///
+/// [`PrimKind::needs_backdrop`] predicted bloom would be its third `true` arm, beside
+/// [`PrimKind::Blur`] and [`PrimKind::Refract`]. It is not, and the reason is a device limit
+/// rather than a preference: the instance pipeline's layout already binds **four** groups —
+/// globals, atlas, the blurred backdrop, the sharp backdrop — and four is what WebGPU
+/// guarantees. There is no group 4 to hand a bloom texture, and sharing group 2 with the blur
+/// would mean a frame carrying both a popover and a bloom could bind only one of the two
+/// images, silently, in the middle of a draw span that sets it once.
+///
+/// So the composite happens in the **resolve** pass, whose layout is its own and had room.
+/// That makes bloom a property of the frame, beside [`Environment`] and [`FieldWash`], rather
+/// than of any instance — which it always was: nothing about "the bright parts of this window
+/// bleed" is located anywhere.
+///
+/// # What it reads, and what it therefore cannot reach
+///
+/// The source is the offscreen colour target. On an ordinary frame that target holds the
+/// whole window, so bloom covers everything. On a frame with a backdrop-sampling panel the
+/// target stops at the backdrop cut, so bloom covers what is *behind* the panel and not the
+/// panel itself — which is the right answer anyway, and worth stating because it is a
+/// consequence of the source rather than a rule anybody wrote.
+///
+/// # Both numbers come from the palette
+///
+/// Neither is authored here. `qs_ui::Tokens::bloom` derives `threshold` from the token ramps
+/// and `strength` from the measured lit allowance; this crate has no palette and must not
+/// grow one. See that function for where each number comes from.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct Bloom {
+    /// Relative luminance, in `0..=1`, above which a pixel contributes. Below it a pixel
+    /// contributes exactly nothing.
+    pub threshold: f32,
+    /// How much of the blurred bright-pass is added back, in **linear** light. Zero is off,
+    /// and off is the default — a draw list nobody set a bloom on blooms not at all, which is
+    /// [`FieldWash`]'s rule and for [`FieldWash`]'s reason.
+    pub strength: f32,
+}
+
+impl Bloom {
+    /// The bloom that does nothing.
+    pub const NONE: Self = Self {
+        threshold: 1.0,
+        strength: 0.0,
+    };
+
+    /// Whether this frame has to run the bright pass at all.
+    ///
+    /// A zero `strength` is off and so is a `threshold` at or above 1.0 — nothing in an 8-bit
+    /// target exceeds full white, so a threshold there selects nothing and the three passes
+    /// would produce a black image to add nothing from. Checking both here is what keeps the
+    /// light theme, whose brightest ordinary surface *is* white, from paying for a chain it
+    /// can never see the output of.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        self.strength > 0.0 && self.threshold < 1.0
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct DrawList {
     pub instances: Vec<Instance>,
@@ -1201,6 +1271,8 @@ pub struct DrawList {
     pub environment: Environment,
     /// The ambient colour field a [`PrimKind::Field`] instance draws.
     pub field: FieldWash,
+    /// What the frame's brightest parts bleed. See [`Bloom`]; no instance draws it.
+    pub bloom: Bloom,
     /// Monotonic; the render thread uses it to tell a re-presented frame from a new one.
     pub generation: u64,
     pub stats: DrawStats,
@@ -1229,6 +1301,10 @@ impl DrawList {
         // caller that stops setting it stops getting it. The alternative -- a field that
         // persists across `reset` -- is a scene property that outlives the scene.
         self.field = FieldWash::default();
+        // Same rule as the field above, and the same reason: a bloom survives exactly one
+        // frame, so a caller that stops setting it stops getting it. `Bloom::default()` is
+        // strength zero, which `is_active` reads as off.
+        self.bloom = Bloom::default();
         self.generation = generation;
         self.stats = DrawStats::default();
         self.input_to_commit = None;
@@ -1248,6 +1324,15 @@ impl DrawList {
     /// The ambient field behind the window, for this frame. See [`FieldWash`].
     pub fn set_field(&mut self, field: FieldWash) {
         self.field = field;
+    }
+
+    /// What this frame's bright parts bleed. See [`Bloom`].
+    ///
+    /// Separate from [`DrawList::reset`] for [`DrawList::set_environment`]'s reason: the
+    /// numbers come from the palette and almost every `reset` call site is a fixture with no
+    /// palette to hand.
+    pub fn set_bloom(&mut self, bloom: Bloom) {
+        self.bloom = bloom;
     }
 
     pub fn end_batch(&mut self, scissor: Option<[u32; 4]>, textured: bool) {

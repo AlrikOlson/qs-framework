@@ -1,11 +1,17 @@
 // The backdrop blur chain: downsample, then a separable Gaussian, at a quarter of the
 // viewport's resolution in each axis.
 //
-// Three fragment entry points over one fullscreen triangle, and no uniform buffer at all --
-// every pass reads its own source size with `textureDimensions`, so there is nothing to keep
-// in step with the texture and nothing to write per frame. The constants below are the whole
-// specification of the kernel; `qs_gpu::target` states where each number comes from and pins
-// it with a test.
+// Four fragment entry points over one fullscreen triangle. Three of them take no uniform at
+// all -- every pass reads its own source size with `textureDimensions`, so there is nothing to
+// keep in step with the texture and nothing to write per frame. The constants below are the
+// whole specification of the kernel; `qs_gpu::target` states where each number comes from and
+// pins it with a test.
+//
+// The fourth, `fs_bright_downsample`, is the exception and it is a narrow one: the bloom's
+// threshold is a property of the *palette*, not of the kernel, so it cannot be a constant here
+// without this file acquiring an opinion about colour that `design/tokens.json` is supposed to
+// own. It arrives in a 16-byte uniform at group 1, which the other three pipelines do not
+// bind.
 //
 // # Why a triangle, and no derivatives
 //
@@ -42,6 +48,17 @@ struct VsOut {
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
 
+// The bloom's two numbers, both from the palette. Bound only by `fs_bright_downsample`; see
+// the header. `qs_gpu::batcher::BloomUniform` is the Rust side and must keep this layout.
+struct BloomParams {
+    // Relative luminance above which a pixel contributes. Matched to `qs_ui::Tokens::bloom`.
+    threshold: f32,
+    // Read by the resolve, not here. Present so one buffer serves both pipelines.
+    strength: f32,
+    pad: vec2<f32>,
+};
+@group(1) @binding(0) var<uniform> bloom: BloomParams;
+
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
     // The standard oversized triangle: (-1,-1), (3,-1), (-1,3) in clip space, whose
@@ -77,6 +94,50 @@ fn fs_downsample(in: VsOut) -> @location(0) vec4<f32> {
         + textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(texel.x, -texel.y), 0.0)
         + textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(-texel.x, texel.y), 0.0)
         + textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(texel.x, texel.y), 0.0);
+    return sum * 0.25;
+}
+
+// Relative luminance, per WCAG 2.x, of a LINEAR colour.
+//
+// The same three coefficients `qs_gpu::color::Srgba::relative_luminance` uses, and that is the
+// point rather than a coincidence: the threshold is derived on the CPU by taking the luminance
+// of palette tokens, so a shader measuring brightness some other way -- a max of the channels,
+// an unweighted mean -- would select a different set of pixels from the one the number was
+// chosen against. The sample is already linear because an sRGB texture is decoded on read.
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// How much of a colour survives the bright pass.
+//
+// Linear from nothing at the threshold to all of it at white, so a pixel a hair over the
+// threshold contributes a hair rather than a hard edge -- a step function here reads as a
+// contour line drawn around every bright shape, which is the classic wrong bloom.
+//
+// The result is bounded by the input: at `t = 1` this returns the colour unchanged and never
+// more. That matters because the resolve *adds* this back, and an unbounded bright pass is how
+// a bloom stops being an effect and becomes a blown-out frame.
+fn bright(c: vec4<f32>) -> vec4<f32> {
+    let head = max(1.0 - bloom.threshold, 1e-4);
+    let t = clamp((luminance(c.rgb) - bloom.threshold) / head, 0.0, 1.0);
+    return vec4<f32>(c.rgb * t, 1.0);
+}
+
+// The bloom's first pass: the same 4x4 box average as `fs_downsample`, with each tap put
+// through the bright pass BEFORE it is averaged.
+//
+// Thresholding each tap rather than the average is the whole difference between a bloom that
+// sees an accent and one that does not. A focus ring is a couple of pixels wide; average its
+// 4x4 block first and the ring's brightness is diluted sixteenfold, usually below any
+// threshold worth setting, so exactly the small bright things bloom is for would be the ones
+// it dropped. Four luminance dot products is what that costs.
+@fragment
+fn fs_bright_downsample(in: VsOut) -> @location(0) vec4<f32> {
+    let texel = source_texel();
+    let sum = bright(textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(-texel.x, -texel.y), 0.0))
+        + bright(textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(texel.x, -texel.y), 0.0))
+        + bright(textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(-texel.x, texel.y), 0.0))
+        + bright(textureSampleLevel(source_texture, source_sampler, in.uv + vec2<f32>(texel.x, texel.y), 0.0));
     return sum * 0.25;
 }
 

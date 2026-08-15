@@ -41,6 +41,20 @@ struct Globals {
     field_form: [[f32; 4]; FIELD_CENTRES],
 }
 
+/// The bloom's two palette-derived numbers, as the shaders see them.
+///
+/// One buffer for both pipelines that read it — the bright pass wants `threshold` and the
+/// resolve wants `strength` — because two buffers holding half a decision each is how they
+/// come to disagree. `BloomParams` in both `shaders/blur.wgsl` and `shaders/resolve.wgsl` must
+/// keep this layout; the padding is what makes the block 16 bytes in every one of them.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+struct BloomUniform {
+    threshold: f32,
+    strength: f32,
+    _pad: [f32; 2],
+}
+
 /// One row of the field uniform, taken from the draw list's [`crate::frame::FieldWash`].
 ///
 /// Three of these rather than one loop building three arrays, because the alternative is
@@ -127,7 +141,19 @@ pub struct Renderer {
     blur_downsample_pipeline: wgpu::RenderPipeline,
     blur_h_pipeline: wgpu::RenderPipeline,
     blur_v_pipeline: wgpu::RenderPipeline,
-    /// The quarter-resolution ping-pong pair. Lazy for the same reason the colour target is,
+    /// The bloom's first pass: the same box downsample with a luminance threshold applied to
+    /// each tap. The only pipeline in the chain that binds the bloom uniform.
+    bloom_bright_pipeline: wgpu::RenderPipeline,
+    /// The resolve with the bloom added back. A second pipeline rather than a branch, so the
+    /// plain resolve stays exactly the copy `the_two_pass_path_is_pixel_identical_to_the_one_pass_path`
+    /// holds it to.
+    resolve_bloom_pipeline: wgpu::RenderPipeline,
+    /// The bloom's two palette-derived numbers, written once per blooming frame. Sixteen
+    /// bytes, allocated unconditionally: a uniform buffer this size is cheaper than the branch
+    /// that would keep it lazy.
+    bloom_buffer: wgpu::Buffer,
+    bloom_bind_group: wgpu::BindGroup,
+    /// The quarter-resolution working set. Lazy for the same reason the colour target is,
     /// and allocated with it — see [`crate::target::BlurChain`] for the cost.
     blur: Option<BlurChain>,
     /// What group 2 binds on a frame with no blur in it: a 1x1 texture nothing samples.
@@ -552,6 +578,130 @@ impl Renderer {
         let blur_h_pipeline = blur_pipeline("qs-blur-horizontal", "fs_blur_h");
         let blur_v_pipeline = blur_pipeline("qs-blur-vertical", "fs_blur_v");
 
+        // The bloom. Two pipelines and one 16-byte uniform, and everything else — the two
+        // Gaussian passes, the sampler, the textures — is the blur's, unchanged. That is the
+        // chunk's "shares the blur chain rather than growing a second one" expressed as the
+        // number of new objects here.
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("qs-bloom-params-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bloom_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("qs-bloom-params"),
+            size: size_of::<BloomUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bloom_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("qs-bloom-params-bind-group"),
+            layout: &bloom_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bloom_buffer.as_entire_binding(),
+            }],
+        });
+        // Group 1 is the params; group 0 stays the source texture, so this pipeline reuses the
+        // blur shader's `source_texture` binding and its sampler without a second layout.
+        let bright_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("qs-bloom-bright-pipeline-layout"),
+                bind_group_layouts: &[Some(&backdrop_layout), Some(&bloom_layout)],
+                immediate_size: 0,
+            });
+        let bloom_bright_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("qs-bloom-bright-downsample"),
+                layout: Some(&bright_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blur_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blur_shader,
+                    entry_point: Some("fs_bright_downsample"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        // The resolve that adds the bloom: group 0 the target, group 1 the finished bloom,
+        // group 2 the params. Three groups, which is inside the guaranteed four -- and the
+        // reason bloom composites here rather than in the instance pass, whose four are spent.
+        let resolve_bloom_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("qs-resolve-bloom-pipeline-layout"),
+            bind_group_layouts: &[
+                Some(&resolve_layout),
+                Some(&backdrop_layout),
+                Some(&bloom_layout),
+            ],
+            immediate_size: 0,
+        });
+        let resolve_bloom_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("qs-resolve-bloom-pipeline"),
+                layout: Some(&resolve_bloom_layout),
+                vertex: wgpu::VertexState {
+                    module: &resolve_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &resolve_shader,
+                    entry_point: Some("fs_bloom"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        // `None`, like the plain resolve: this pass writes the whole surface
+                        // from the target plus the bloom. The addition is in the shader, where
+                        // it can be clamped, rather than in fixed-function blending, where the
+                        // 8-bit target would decide the ceiling.
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
         // The placeholder group 2 binds when no blur is in the frame. One texel, never
         // sampled: a KIND_BLUR instance is exactly what makes the chain run, so a frame that
         // binds this contains nothing that reads it.
@@ -696,6 +846,10 @@ impl Renderer {
             blur_downsample_pipeline,
             blur_h_pipeline,
             blur_v_pipeline,
+            bloom_bright_pipeline,
+            resolve_bloom_pipeline,
+            bloom_buffer,
+            bloom_bind_group,
             blur: None,
             backdrop_placeholder,
             lighting: None,
@@ -836,7 +990,13 @@ impl Renderer {
     /// somebody has to remember to set, and a flag that disagrees with the instances is a
     /// frame that samples an unallocated target.
     fn needs_offscreen(&self, list: &DrawList) -> bool {
-        self.force_offscreen || list.instances.iter().any(instance_needs_backdrop)
+        // The bloom is the one caller that is not an instance, and it needs the target for the
+        // same reason every instance here does: it reads the frame back. Asking the draw list
+        // rather than scanning for a kind is what a frame-level effect looks like -- see
+        // `crate::frame::Bloom` for why bloom has no kind to scan for.
+        self.force_offscreen
+            || list.bloom.is_active()
+            || list.instances.iter().any(instance_needs_backdrop)
     }
 
     /// The blur chain, if one has been allocated. Its memory is reported the way the colour
@@ -854,12 +1014,14 @@ impl Renderer {
     /// downsampled size. Like the target, an existing chain is **not** freed on a frame that
     /// happens to draw no panel — that would reallocate once per popover open.
     fn ensure_blur(&mut self, ctx: &GpuContext, list: &DrawList, offscreen: bool) {
-        // Keyed on a **blur** instance, not on any backdrop-sampling one. `KIND_REFRACT` also
-        // needs the two-pass path, and reads the sharp target rather than the chain -- so a
-        // frame whose only glass is refracting would otherwise allocate 3.1 MB and run three
-        // full-screen passes that nothing samples. The cut below is still general; only the
-        // chain is specific, because only the chain is the blur's.
-        if !offscreen || !list.instances.iter().any(instance_is_blur) {
+        // Keyed on a **blur** instance or an active bloom, not on any backdrop-sampling one.
+        // `KIND_REFRACT` also needs the two-pass path, and reads the sharp target rather than
+        // the chain -- so a frame whose only glass is refracting would otherwise allocate the
+        // chain and run three full-screen passes that nothing samples. The cut below is still
+        // general; only the chain is specific, because only the chain's two consumers are the
+        // blur and the bloom.
+        let wanted = list.bloom.is_active() || list.instances.iter().any(instance_is_blur);
+        if !offscreen || !wanted {
             return;
         }
         let Some(target) = self.offscreen.as_ref() else {
@@ -968,6 +1130,22 @@ impl Renderer {
             );
         }
 
+        // Sixteen bytes, written only on a frame that blooms. An unbloomed frame leaves stale
+        // bytes in the buffer and nothing reads them, exactly as the lit uniform above does --
+        // the two pipelines that bind this are the only readers and neither is encoded below
+        // unless `blooming`.
+        if list.bloom.is_active() {
+            ctx.queue.write_buffer(
+                &self.bloom_buffer,
+                0,
+                bytemuck::bytes_of(&BloomUniform {
+                    threshold: list.bloom.threshold,
+                    strength: list.bloom.strength,
+                    _pad: [0.0; 2],
+                }),
+            );
+        }
+
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1010,6 +1188,11 @@ impl Renderer {
         // blurring one. `blurring` is whether the chain has to run, which only a blur asks for.
         let sampling_backdrop = backdrop_at != u32::MAX;
         let blurring = sampling_backdrop && list.instances.iter().any(instance_is_blur);
+        // A third question, and it is neither of the other two. The bloom reads the target and
+        // is composited by the resolve, so it needs `offscreen` and does NOT need anything
+        // drawn after a cut -- an ordinary frame with no panel in it blooms, and that is the
+        // common case rather than the exotic one.
+        let blooming = offscreen && list.bloom.is_active();
 
         {
             let clear = list.clear;
@@ -1062,12 +1245,14 @@ impl Renderer {
         // is exact only as its own step -- folding it into the horizontal blur would make the
         // first axis sample a full-resolution image with a quarter-resolution kernel, which is
         // aliasing dressed as an optimisation.
-        if blurring {
+        if blurring || blooming {
             if let Some(blur) = self.blur.as_ref() {
+                let bloom_params = &self.bloom_bind_group;
                 let mut chain_pass =
                     |label: &str,
                      pipeline: &wgpu::RenderPipeline,
                      source: &wgpu::BindGroup,
+                     params: Option<&wgpu::BindGroup>,
                      into: &wgpu::TextureView| {
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some(label),
@@ -1090,29 +1275,69 @@ impl Renderer {
                         });
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, source, &[]);
+                        if let Some(params) = params {
+                            pass.set_bind_group(1, params, &[]);
+                        }
                         pass.draw(0..3, 0..1);
                     };
-                // Full-resolution backdrop -> ping, at a quarter of the size.
-                chain_pass(
-                    "qs-blur-downsample-pass",
-                    &self.blur_downsample_pipeline,
-                    blur.source_bind_group(),
-                    blur.pong(),
-                );
-                // ping <- horizontal(pong), pong <- ... -- the names follow the ping-pong and
-                // the LAST write lands in `ping`, which is what the instance pipeline samples.
-                chain_pass(
-                    "qs-blur-horizontal-pass",
-                    &self.blur_h_pipeline,
-                    blur.pong_bind_group(),
-                    blur.ping(),
-                );
-                chain_pass(
-                    "qs-blur-vertical-pass",
-                    &self.blur_v_pipeline,
-                    blur.ping_bind_group(),
-                    blur.pong(),
-                );
+
+                // The bloom runs FIRST, and the order is load-bearing rather than arbitrary.
+                // It uses `ping` as its scratch and leaves its result in `bloom`; the blur
+                // below then clobbers `ping` and leaves its own result in `pong`. Run the
+                // other way round, the blur's finished backdrop would be overwritten by the
+                // bloom's horizontal pass and a popover would show the bloom instead of the
+                // list behind it. That is what the third texture buys: two effects, one chain,
+                // one ordering constraint stated here.
+                if blooming {
+                    chain_pass(
+                        "qs-bloom-bright-pass",
+                        &self.bloom_bright_pipeline,
+                        blur.source_bind_group(),
+                        Some(bloom_params),
+                        blur.bloom(),
+                    );
+                    chain_pass(
+                        "qs-bloom-horizontal-pass",
+                        &self.blur_h_pipeline,
+                        blur.bloom_bind_group(),
+                        None,
+                        blur.ping(),
+                    );
+                    chain_pass(
+                        "qs-bloom-vertical-pass",
+                        &self.blur_v_pipeline,
+                        blur.ping_bind_group(),
+                        None,
+                        blur.bloom(),
+                    );
+                }
+
+                if blurring {
+                    // Full-resolution backdrop -> pong, at a quarter of the size.
+                    chain_pass(
+                        "qs-blur-downsample-pass",
+                        &self.blur_downsample_pipeline,
+                        blur.source_bind_group(),
+                        None,
+                        blur.pong(),
+                    );
+                    // ping <- horizontal(pong), pong <- vertical(ping) -- the LAST write lands
+                    // in `pong`, which is what the instance pipeline samples.
+                    chain_pass(
+                        "qs-blur-horizontal-pass",
+                        &self.blur_h_pipeline,
+                        blur.pong_bind_group(),
+                        None,
+                        blur.ping(),
+                    );
+                    chain_pass(
+                        "qs-blur-vertical-pass",
+                        &self.blur_v_pipeline,
+                        blur.ping_bind_group(),
+                        None,
+                        blur.pong(),
+                    );
+                }
             }
         }
 
@@ -1144,8 +1369,28 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.resolve_pipeline);
-            pass.set_bind_group(0, offscreen.bind_group(), &[]);
+            // Two pipelines, chosen here, rather than one with the strength at zero. The plain
+            // resolve is asserted to be exactly a copy, and a copy that samples a second
+            // texture and adds nothing to it is a copy only as long as the arithmetic keeps
+            // rounding the way it does today.
+            //
+            // `blooming` implies the chain exists -- `ensure_blur` allocates on the same
+            // condition -- but the bind group is read out of the `Option` rather than
+            // unwrapped, so a future edit that separates the two draws the frame without the
+            // bloom instead of panicking in the render path.
+            let bloom_source = blooming.then_some(self.blur.as_ref()).flatten();
+            match bloom_source {
+                Some(blur) => {
+                    pass.set_pipeline(&self.resolve_bloom_pipeline);
+                    pass.set_bind_group(0, offscreen.bind_group(), &[]);
+                    pass.set_bind_group(1, blur.bloom_bind_group(), &[]);
+                    pass.set_bind_group(2, &self.bloom_bind_group, &[]);
+                }
+                None => {
+                    pass.set_pipeline(&self.resolve_pipeline);
+                    pass.set_bind_group(0, offscreen.bind_group(), &[]);
+                }
+            }
             pass.set_scissor_rect(0, 0, list.viewport[0].max(1), list.viewport[1].max(1));
             pass.draw(0..3, 0..1);
 

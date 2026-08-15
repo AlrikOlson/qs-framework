@@ -789,6 +789,146 @@ impl Tokens {
             .map(|layer| layer.field)
     }
 
+    /// The frame's bloom, both numbers derived from the palette, for
+    /// [`qs_gpu::frame::DrawList::set_bloom`].
+    ///
+    /// # The threshold clears every colour the palette can name
+    ///
+    /// Not a constant, and the criterion this chunk was accepted against says so: "a threshold
+    /// stated in luminance against the token ramps rather than as a magic constant". The
+    /// statement is that a pixel blooms when it is brighter than **every token in this theme**,
+    /// whatever its role — because a pixel brighter than any colour a designer could have
+    /// written down is not a fill. It is light the *renderer* made: a glow's falloff, a sweep's
+    /// travelling highlight, a rim, the lit mode's addition to a receiver. Those are what "let
+    /// bright accents bleed light" means, and they are exactly what a token-derived ceiling
+    /// separates from flat colour.
+    ///
+    /// **The first version of this took the brightest `Background` token, and it was wrong in a
+    /// way worth recording.** In the dark theme the brightest background is `icon/badge` at
+    /// 0.618 relative luminance, while `content/primary` — body text — sits at 0.817. So that
+    /// threshold bloomed *every glyph on screen*, which is not a look; it lifts the ground
+    /// around each mark and reduces exactly the contrast Principle VI protects, invisibly to
+    /// `cargo xtask contrast`, which reads tokens and not frames. Clearing every token instead
+    /// makes that structurally impossible: no authored colour can bloom, so the gate's world is
+    /// untouched and only rendered light is affected.
+    ///
+    /// Relative luminance is [`Srgba::relative_luminance`], the same WCAG function the contrast
+    /// gate uses and the same three coefficients `blur.wgsl` applies per fragment. Measuring
+    /// brightness two different ways on the two sides of this number would select a different
+    /// set of pixels from the one it was chosen against.
+    ///
+    /// # The light theme blooms nothing, and that is the answer rather than a gap
+    ///
+    /// Several light-theme tokens resolve to white, so the threshold is 1.0, nothing in an
+    /// 8-bit target exceeds it, and [`qs_gpu::frame::Bloom::is_active`] reads that as off. The
+    /// light theme pays for no passes and shows no bloom.
+    ///
+    /// That is the same finding research R13 recorded for the lit palette, arriving again from
+    /// a different direction: *the light theme has no emitter*. There the page is the source
+    /// and dark marks are absorbers, so added light has nothing to come from. A bloom forced on
+    /// anyway would have to bleed the page into the text, which is the one direction the
+    /// contrast budget cannot afford.
+    ///
+    /// # The strength is the measured lit allowance
+    ///
+    /// A bloom *adds light to a receiver*, which is exactly the quantity
+    /// `lighting.allowance.receiver.addition_max` bounds — measured by the `lit_probe` example
+    /// and recorded in research R13, not chosen here. Reusing it rather than authoring a second
+    /// number keeps one answer to "how much light may this palette add", so a future probe run
+    /// that moves it moves the bloom too.
+    /// How much light a bloom would add, in linear light: the receiver's measured allowance.
+    ///
+    /// Deliberately the **receiver's** and never the text ground's, which is 0.0 in both themes
+    /// precisely because a mark's ground may not take light. Beside [`Tokens::bloom_ceiling`]
+    /// rather than folded into [`Tokens::bloom`] for the same reason that one is: the number is
+    /// derived, checkable and ready, and the decision about whether to *spend* it is separate
+    /// from where it comes from.
+    #[must_use]
+    pub fn bloom_strength(&self) -> f32 {
+        self.lighting
+            .allowance
+            .receiver
+            .for_theme(self.theme)
+            .addition_max
+    }
+
+    #[must_use]
+    pub fn bloom_ceiling(&self) -> f32 {
+        // Every token, every role. See below for why narrowing this to backgrounds was the
+        // wrong answer and what it did.
+        self.colors
+            .values()
+            .map(|color| color.relative_luminance())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// The frame's bloom, for [`qs_gpu::frame::DrawList::set_bloom`].
+    ///
+    /// **On the shipped palette this is [`qs_gpu::frame::Bloom::NONE`], and the reason is a
+    /// measurement rather than a preference.** The mechanism is built, exercised and costed —
+    /// `cargo run --release -p qs-gpu --example bloom_cost` renders it and reports +0.021 ms on
+    /// Vulkan, +0.171 ms on GL, and an 84/255 change 20,808 px away from a bright element. What
+    /// it has no source for is light.
+    ///
+    /// # The two numbers, and why they cannot both be satisfied here
+    ///
+    /// The threshold is [`Tokens::bloom_ceiling`]: brighter than every colour this theme can
+    /// name. Above that line a pixel is light the *renderer* made — a glow's falloff, a sweep's
+    /// highlight, the lit mode's addition — and below it, it is a fill somebody authored.
+    ///
+    /// Nothing in this product reaches that line, and that is structural rather than a gap
+    /// waiting on content. Every primitive composites authored colours, so none can exceed the
+    /// brightest authored colour; and the lit mode's addition is bounded to **receivers** by
+    /// `lighting.allowance`, which are grounds sitting two orders of magnitude below the ink.
+    /// Rendering the shipped dark theme through `--shot-gpu`, with and without `--lit`, peaks at
+    /// 0.8969 relative luminance against a ceiling of 0.8986 — short by one 8-bit step, because
+    /// the ceiling is the ideal value of a token whose quantized form is what actually lands.
+    ///
+    /// # Why the threshold is not simply lowered
+    ///
+    /// Because that blooms the ink, and blooming ink was measured: in `bloom_cost`'s
+    /// `contrast_cost_of_blooming_a_mark`, a mark at 0.817 on a ground at 0.011 goes from
+    /// **14.34:1 to 8.21:1 against its own ground — a 42.8% loss** — and `cargo xtask contrast`
+    /// sees none of it, because it reads tokens and not frames. A pair with less headroom than
+    /// body text would cross 4.5:1. This is `specs/002-ray-traced-mode/contracts/lit-contrast.md`
+    /// rule 1a arriving from a third direction: a mark may emit, but the ground behind it may
+    /// never receive, and bloom from a glyph lands on exactly that ground.
+    ///
+    /// **The first version of this took the brightest `Background` token, and it was wrong in a
+    /// way worth recording.** In the dark theme the brightest background is `icon/badge` at
+    /// 0.618 while body text sits at 0.817, so that threshold bloomed every glyph on screen —
+    /// the 42.8% above, everywhere, under a green build.
+    ///
+    /// # What would unlock it
+    ///
+    /// An emissive element that is **not meaning-bearing** and sits above the ink ceiling: a
+    /// lamp, a focus halo's core, a sweep peak authored deliberately above the palette rather
+    /// than mixed from it. That is a palette decision, not this chunk's, and it is filed as
+    /// `bloom-needs-a-source-above-the-ink`. The other route — sourcing the bright pass from the
+    /// **surface half** of the frame only, using the `surface_content_split` seam the lighting
+    /// pass already uses, so ink is not in the source at all — is filed with it, and is a
+    /// second render target rather than a threshold change, because the target holds the whole
+    /// frame and a pass cannot sample the attachment it is writing.
+    #[must_use]
+    pub fn bloom(&self) -> qs_gpu::frame::Bloom {
+        // Forced colours switch effects off entirely, and a bloom is the loudest possible
+        // violation of "use only the colours the user said they can see". Kept as its own
+        // early return rather than folded into the line below, so it stays correct when this
+        // function stops returning NONE unconditionally.
+        if !self.effects_enabled {
+            return qs_gpu::frame::Bloom::NONE;
+        }
+        // NONE, not `{ threshold: self.bloom_ceiling(), strength: ... }`. The distinction is a
+        // frame's worth of work: an inactive bloom allocates no chain and encodes no passes,
+        // where a bloom whose threshold nothing reaches would allocate 1.6 MB and run three
+        // full-screen passes every frame to produce a black image and add it to nothing.
+        //
+        // The ceiling is still derived, still tested, and still what the effect will use --
+        // `bloom_ceiling` is where it lives -- so the number is ready for the palette decision
+        // rather than deleted along with the feature.
+        qs_gpu::frame::Bloom::NONE
+    }
+
     /// Paint a named material onto `surface`, appending to `out`.
     ///
     /// **The** call a component makes. It replaces a hand-built stack of `Instance::…`
@@ -1491,6 +1631,177 @@ mod tests {
     fn the_shipped_token_file_parses_in_both_themes() {
         Tokens::embedded(Theme::Light).expect("light theme must resolve");
         Tokens::embedded(Theme::Dark).expect("dark theme must resolve");
+    }
+
+    #[test]
+    fn no_authored_colour_can_bloom_in_either_theme() {
+        // The acceptance criterion in the words it was written in -- "a threshold stated in
+        // luminance against the token ramps rather than as a magic constant" -- and the
+        // property that makes it safe rather than merely derived. Every token in the file,
+        // whatever its role, must sit at or below the threshold. Nothing a designer can write
+        // down blooms; only light the renderer made does.
+        //
+        // This is what keeps the effect outside `cargo xtask contrast`'s blind spot. The gate
+        // reads tokens, not frames, so it cannot see a bloom lifting a ground -- and it does
+        // not have to, because no token is above the line.
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            let ceiling = tokens.bloom_ceiling();
+            assert!(
+                (0.0..=1.0).contains(&ceiling),
+                "{theme:?}: a relative luminance is in 0..=1"
+            );
+            for name in tokens.colors.keys() {
+                let l = tokens.color(name).relative_luminance();
+                assert!(
+                    l <= ceiling + 1e-6,
+                    "{theme:?}: {name} at {l} is above the bloom ceiling {ceiling}; an authored \
+                     colour that blooms lifts the ground around every mark drawn in it, which \
+                     the contrast gate cannot see"
+                );
+            }
+            // And the ceiling is *reached* rather than parked above everything: it is the
+            // maximum, so at least one token is exactly on it. A 1.0 chosen to be safe would
+            // pass the loop above and select nothing, ever, for a different reason.
+            assert!(
+                tokens
+                    .colors
+                    .values()
+                    .any(|c| (c.relative_luminance() - ceiling).abs() < 1e-6),
+                "{theme:?}: the ceiling must be a token's luminance, not a round number"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_palette_blooms_nothing_and_pays_nothing_for_it() {
+        // The chunk's outcome, asserted rather than described. `bloom_cost`'s
+        // `contrast_cost_of_blooming_a_mark` measured what a lower threshold costs -- 14.34:1
+        // to 8.21:1 against a mark's own ground, 42.8%, invisible to `cargo xtask contrast` --
+        // and nothing in the product reaches the ceiling that spares it. `--shot-gpu` on the
+        // dark theme peaks at 0.8969 against 0.8986, with and without `--lit`.
+        //
+        // NONE rather than a threshold nothing reaches, and the difference is a frame's work:
+        // an inactive bloom allocates no chain and encodes no passes. If this test ever needs
+        // changing, the thing to check first is whether a source above the ceiling now exists
+        // -- see `bloom-needs-a-source-above-the-ink`.
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            assert!(
+                !tokens.bloom().is_active(),
+                "{theme:?}: a bloom with no source must cost no passes"
+            );
+            // And the ceiling it would use is still real, so the number survives the decision.
+            assert!(tokens.bloom_ceiling() > 0.0, "{theme:?}");
+        }
+    }
+
+    #[test]
+    fn body_text_would_have_bloomed_under_the_first_threshold_this_chunk_tried() {
+        // The refutation, kept. Taking the brightest *Background* token reads well and is
+        // wrong: in the dark theme the brightest background is `icon/badge`, a mark rather
+        // than a ground, and body text is brighter than it. That threshold bloomed every glyph
+        // on screen.
+        //
+        // Asserting the inequality rather than describing it means the trap stays visible if
+        // somebody narrows the fold again -- and it goes red the moment the palette changes in
+        // a way that would have made the rejected version look fine, which is exactly when a
+        // reader would be tempted to try it.
+        let dark = Tokens::embedded(Theme::Dark).unwrap();
+        let brightest_ground = dark
+            .colors
+            .iter()
+            .filter(|(name, _)| dark.role(name) == Some(TokenRole::Background))
+            .map(|(_, c)| c.relative_luminance())
+            .fold(0.0_f32, f32::max);
+        let text = dark.color("content/primary").relative_luminance();
+        assert!(
+            text > brightest_ground,
+            "dark theme body text at {text} must be brighter than the brightest background \
+             token at {brightest_ground}; if this stops being true, re-read why the threshold \
+             is taken over every role"
+        );
+        assert!(
+            text <= dark.bloom().threshold,
+            "and the shipped threshold must still spare it"
+        );
+    }
+
+    #[test]
+    fn the_light_theme_has_no_headroom_for_a_bloom_at_all() {
+        // Not a gap. `surface/base` in the light theme is white, so no pixel in an 8-bit target
+        // is brighter than every ground and `is_active` reads the threshold as off. This is
+        // research R13's finding arriving from a second direction -- the light theme has no
+        // emitter, because there the page is the source and marks are absorbers.
+        //
+        // Worth a test rather than a comment because "the effect does nothing in one theme"
+        // is indistinguishable from "the effect is broken" without one, and the next person to
+        // look at a light-theme screenshot will have exactly that question.
+        let light = Tokens::embedded(Theme::Light).unwrap();
+        assert!(
+            (light.color("surface/base").relative_luminance() - 1.0).abs() < 1e-6,
+            "the light theme's list background is white; if that changes, so does this"
+        );
+        assert!(
+            (light.bloom_ceiling() - 1.0).abs() < 1e-6,
+            "so the ceiling is 1.0 and there is no room above it for anything to be"
+        );
+
+        // The dark theme has headroom -- which is why the shipped answer there turns on
+        // whether anything occupies it, and not on whether the palette permits it at all. The
+        // two themes are off for different reasons, and collapsing them would lose one.
+        let dark = Tokens::embedded(Theme::Dark).unwrap();
+        assert!(
+            dark.bloom_ceiling() < 0.95,
+            "the dark theme's brightest token is short of white; got {}",
+            dark.bloom_ceiling()
+        );
+    }
+
+    #[test]
+    fn the_bloom_strength_is_the_measured_receiver_allowance_and_not_a_second_number() {
+        // Bloom adds light to a receiver, which is the quantity `receiver.addition_max`
+        // bounds -- measured by the `lit_probe` example, recorded in research R13. Asserting
+        // the identity rather than the value is what keeps a future probe run from moving one
+        // and not the other.
+        for theme in [Theme::Light, Theme::Dark] {
+            let tokens = Tokens::embedded(theme).unwrap();
+            let allowance = tokens
+                .lighting()
+                .allowance
+                .receiver
+                .for_theme(theme)
+                .addition_max;
+            assert_eq!(tokens.bloom_strength(), allowance, "{theme:?}");
+            // Never the text ground's allowance, which is 0.0 in both themes precisely
+            // because a mark's ground may not take light. Reading that one here would
+            // silently disable the effect and look like a tuning choice.
+            assert_eq!(
+                tokens
+                    .lighting()
+                    .allowance
+                    .text_ground
+                    .for_theme(theme)
+                    .addition_max,
+                0.0,
+                "{theme:?}: if this stops being zero, re-read lit-contrast rule 1a before \
+                 assuming the bloom may use it"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_colours_bloom_nothing() {
+        // A bloom is the loudest possible violation of "use only the colours the user said
+        // they can see" -- it adds light the OS palette never offered, over the whole window.
+        let forced = Tokens::forced(
+            Srgba::new(0.0, 0.0, 0.0, 1.0),
+            Srgba::new(1.0, 1.0, 1.0, 1.0),
+            Srgba::new(1.0, 1.0, 0.0, 1.0),
+            Srgba::new(0.0, 0.0, 0.0, 1.0),
+        );
+        assert!(!forced.effects_enabled());
+        assert!(!forced.bloom().is_active());
     }
 
     #[test]
