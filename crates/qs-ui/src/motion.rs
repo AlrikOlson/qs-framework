@@ -185,15 +185,25 @@ pub enum MotionPattern {
     /// scene because "what reduced motion does to this" is a motion question and this module
     /// is the only place that answers it. See [`InteractionMotion::focus_light_draw`].
     FocusLight,
+    /// A session transitions into awaiting approval: the accent arrives once, then holds.
+    ///
+    /// Not a row of UXDD 10.3 — it is the Sessions workstream's (roadmap `summons-arrival`,
+    /// ADR 014's design half of the needs-you event). It is here for FocusLight's reason:
+    /// what reduced motion does to it is decided in this table and nowhere else, and the
+    /// answer is **instant** — an attention-grabbing arrival is exactly the large-area event
+    /// reduced motion exists to remove, so it is `Layout`, not a `Fade` that would keep an
+    /// 80 ms version playing.
+    SummonsArrival,
 }
 
 impl MotionPattern {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::HoverFeedback,
         Self::PressFeedback,
         Self::SelectionChange,
         Self::DensityChange,
         Self::FocusLight,
+        Self::SummonsArrival,
     ];
 
     /// The floor and the span for a distance-scaled duration, or `None` for a pattern with
@@ -222,7 +232,12 @@ impl MotionPattern {
             // than a second thing moving in lockstep with the first, which reads as one
             // thicker object.
             Self::FocusLight => Some((0.070, 16.0)),
-            Self::HoverFeedback | Self::PressFeedback | Self::DensityChange => None,
+            // An arrival happens where the session already is; there is no distance to scale
+            // by, only a moment to mark.
+            Self::HoverFeedback
+            | Self::PressFeedback
+            | Self::DensityChange
+            | Self::SummonsArrival => None,
         }
     }
 
@@ -243,6 +258,10 @@ impl MotionPattern {
             // Half again the selection region's ceiling. The gap is the effect: the ring
             // lands, then the room catches up.
             Self::FocusLight => 0.180,
+            // Longer than everything above, deliberately: this is the one pattern that plays
+            // when the user did nothing, so it has to be legible from the corner of an eye,
+            // and it plays exactly once so the length costs no ongoing attention.
+            Self::SummonsArrival => 0.260,
         }
     }
 
@@ -254,7 +273,8 @@ impl MotionPattern {
             | Self::PressFeedback
             | Self::SelectionChange
             | Self::DensityChange
-            | Self::FocusLight => Curve::EaseOut,
+            | Self::FocusLight
+            | Self::SummonsArrival => Curve::EaseOut,
         }
     }
 
@@ -268,7 +288,14 @@ impl MotionPattern {
             // lamp is `Layout` rather than `Fade` even though nothing in the *layout* moves:
             // what travels is a light, and a light sweeping across the whole window is more
             // of the large-area movement FR-029 exists for than a row height changing is.
-            Self::SelectionChange | Self::DensityChange | Self::FocusLight => MotionKind::Layout,
+            // The summons is `Layout` for the same argument one step further: nothing moves
+            // at all, but an arrival's entire purpose is to catch an eye that was elsewhere,
+            // and reduced motion is the request not to be caught that way. Instant, not a
+            // shorter fade — the accent still appears, it just appears settled.
+            Self::SelectionChange
+            | Self::DensityChange
+            | Self::FocusLight
+            | Self::SummonsArrival => MotionKind::Layout,
         }
     }
 
@@ -1151,6 +1178,8 @@ mod tests {
         let elsewhere = [
             // spec 002 US3, the lit mode's focus lamp.
             (MotionPattern::FocusLight, 0.180, MotionKind::Layout),
+            // roadmap summons-arrival, the Sessions workstream's needs-you arrival.
+            (MotionPattern::SummonsArrival, 0.260, MotionKind::Layout),
         ];
         assert_eq!(expected.len() + elsewhere.len(), MotionPattern::ALL.len());
 

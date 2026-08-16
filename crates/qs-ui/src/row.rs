@@ -1499,6 +1499,29 @@ impl ListRenderer {
                         rail_w * 0.5,
                         fade(self.tokens.color(token), hidden),
                     ));
+                } else if let Some(flash) = mark.arrival() {
+                    // The summons flash: a session filed here just started awaiting
+                    // approval, and the reserved rail slot carries the accent for the
+                    // handful of frames the arrival lasts, then returns to nothing —
+                    // the row's steady state has no accent, so the arrival must end
+                    // where it began. An outcome rail outranks it, exactly as
+                    // `worst_rail` ranks outcomes above everything alive: the flash is
+                    // "look here", and a failure already says that louder.
+                    let inset = region.h * 0.22;
+                    let rail_h = (region.h - inset * 2.0).max(1.0);
+                    let rail_w = columns.rail.max(1.0);
+                    let accent = fade(self.tokens.color("border/focus"), hidden);
+                    list.instances.push(Instance::rect(
+                        columns.rail_x(),
+                        region.y + inset,
+                        rail_w,
+                        rail_h,
+                        rail_w * 0.5,
+                        Srgba {
+                            a: accent.a * flash,
+                            ..accent
+                        },
+                    ));
                 }
             }
         }
@@ -4591,6 +4614,81 @@ mod tests {
             glyphs(&marked) > glyphs(&bare),
             "the marked folder drew no more text than the unmarked one"
         );
+    }
+
+    #[test]
+    fn a_summons_flash_draws_in_the_rail_slot_and_a_finished_one_draws_nothing() {
+        // The arrival's row reading: mid-flash the reserved rail slot carries the accent;
+        // at intensity zero — which is where the pulse ends — the mark is byte-identical
+        // to one that never flashed. Asserted as whole draw lists for the reason
+        // `a_folder_with_no_sessions_draws_nothing_extra_at_all` gives: an invisible rect
+        // passes a search for a colour and fails this.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let mark = crate::mark::SessionMark::new(2, true, None).unwrap();
+
+        let mut settled = crate::mark::SessionMarks::new();
+        settled.insert(0, mark.clone());
+        // Warm the glyph atlas first: a cold one flushes text at the end of the list while
+        // a warm one emits inline, and what is compared below must differ only in the mark.
+        let _ = frame_with_marks(&mut renderer, &buf, &settled);
+        let quiet = frame_with_marks(&mut renderer, &buf, &settled);
+
+        let mut flashing = crate::mark::SessionMarks::new();
+        flashing.insert(0, mark.clone().with_arrival(Some(0.8)));
+        let flashed = frame_with_marks(&mut renderer, &buf, &flashing);
+        assert_eq!(
+            rails_of(&renderer, &quiet, "border/focus"),
+            0,
+            "a settled mark drew an accent rail"
+        );
+        assert_eq!(
+            flashed.instances.len(),
+            quiet.instances.len() + 1,
+            "the flash is exactly one rect in the reserved slot"
+        );
+
+        // A finished arrival quantizes to nothing and takes the untouched path.
+        let mut finished = crate::mark::SessionMarks::new();
+        finished.insert(0, mark.with_arrival(Some(0.0)));
+        let after = frame_with_marks(&mut renderer, &buf, &finished);
+        assert_eq!(after.instances, quiet.instances);
+    }
+
+    #[test]
+    fn an_outcome_rail_outranks_the_summons_flash() {
+        // A folder where one session failed and another just started waiting shows the
+        // failure: the flash is "look here", and a failure already says that louder. One
+        // rect either way — the two must not stack in one slot.
+        let mut renderer = renderer();
+        if renderer.weight_coverage().is_empty() {
+            return;
+        }
+        let buf = folders_and_a_file();
+        let mut marks = crate::mark::SessionMarks::new();
+        marks.insert(
+            0,
+            crate::mark::SessionMark::new(2, true, Some("rail/conflict"))
+                .unwrap()
+                .with_arrival(Some(0.8)),
+        );
+        let list = frame_with_marks(&mut renderer, &buf, &marks);
+        assert_eq!(rails_of(&renderer, &list, "rail/conflict"), 1);
+        // Counted by position rather than by colour, because the flash is drawn at a
+        // modulated alpha no token search would find: one rect in the slot, full stop.
+        let columns = Columns::for_width(1200.0, 1.0, &renderer.tokens);
+        let in_slot = list
+            .instances
+            .iter()
+            .filter(|i| {
+                i.kind == qs_gpu::frame::PrimKind::Rect as u32
+                    && (i.rect[0] - columns.rail_x()).abs() < 0.5
+            })
+            .count();
+        assert_eq!(in_slot, 1, "the flash stacked under an outcome rail");
     }
 
     #[test]

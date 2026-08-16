@@ -41,6 +41,15 @@ pub struct SessionMark {
     count: usize,
     vouched: bool,
     rail: Option<&'static str>,
+    /// The summons arrival's flash intensity for this row, quantized to 255 steps.
+    ///
+    /// `None` is the settled state and the overwhelmingly common one: the flash exists only
+    /// for the handful of frames after a session filed here starts awaiting approval, and it
+    /// decays to nothing because a row's steady state carries no accent (see `qs`'s
+    /// `marks::worst_rail` for why presence is the count's job). Quantized rather than an
+    /// `f32` so the mark stays `Eq` — a frame's worth of alpha is far coarser than 1/255,
+    /// so the quantization is invisible before it is convenient.
+    arrival: Option<std::num::NonZeroU8>,
 }
 
 impl SessionMark {
@@ -62,7 +71,27 @@ impl SessionMark {
             count,
             vouched,
             rail,
+            arrival: None,
         })
+    }
+
+    /// The same mark with a summons flash at `intensity` (`0.0..=1.0`).
+    ///
+    /// Anything at or below zero — including the exact end of the arrival's envelope — is
+    /// `None`, so a finished arrival is byte-identical to one that never played: the draw
+    /// path skips an absent flash rather than drawing an invisible one.
+    #[must_use]
+    pub fn with_arrival(self, intensity: Option<f32>) -> Self {
+        let arrival = intensity
+            .filter(|value| *value > 0.0)
+            .and_then(|value| std::num::NonZeroU8::new((value.min(1.0) * 255.0).round() as u8));
+        Self { arrival, ..self }
+    }
+
+    /// The summons flash intensity, or `None` when nothing is arriving.
+    #[must_use]
+    pub fn arrival(&self) -> Option<f32> {
+        self.arrival.map(|value| f32::from(value.get()) / 255.0)
     }
 
     #[must_use]
