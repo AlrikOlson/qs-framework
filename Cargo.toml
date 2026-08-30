@@ -1,0 +1,107 @@
+# qs-framework — the GPU UI framework quicksilver-file-explorer is built on,
+# extracted so that quicksilver and magistr can both depend on it.
+#
+# Extracted from AlrikOlson/quicksilver-file-explorer at 6dd3d8b
+# (2026-08-30) with `git filter-repo`, so every file here carries its
+# original history. Nothing file-explorer-specific (qs-vfs, qs-shell,
+# qs-term, qs-command, qs-bench, the `qs` app) lives here, and nothing
+# here may come to depend on any of it.
+[workspace]
+resolver = "3"
+members = [
+    "crates/qs-platform",
+    "crates/qs-gpu",
+    "crates/qs-text",
+    "crates/qs-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# `wgpu` 30 declares `rust-version = "1.87"`; the floor is inherited from it
+# (quicksilver's docs/adr/011-msrv-1-87.md). Raise deliberately, never as a
+# side effect of adding a dependency.
+rust-version = "1.87"
+license = "Apache-2.0"
+repository = "https://github.com/AlrikOlson/qs-framework"
+publish = false
+
+[workspace.dependencies]
+# --- rendering -------------------------------------------------------------
+wgpu = "30.0"
+wgpu-hal = "30.0"
+# Dev-only, and deliberately the same major as `wgpu`: it is the compiler `wgpu` itself
+# puts `instance.wgsl` through, so validating with it at test time is the same check the
+# device does at startup, minus the device. A different version would be a second opinion.
+naga = { version = "30.0", features = ["wgsl-in"] }
+raw-window-handle = "0.6"
+bytemuck = { version = "1.19", features = ["derive"] }
+
+# --- windowing / input -----------------------------------------------------
+winit = "0.30"
+
+# --- accessibility ---------------------------------------------------------
+# accesskit_winit 0.33 is the adapter built against winit 0.30. These three
+# move together; bumping one without the others yields two winit versions in
+# the graph and a type mismatch at the adapter boundary. Every consumer of
+# this workspace (quicksilver, magistr) pins the same trio for the same reason.
+accesskit = "0.24"
+accesskit_winit = "0.33"
+
+# --- text ------------------------------------------------------------------
+rustybuzz = "0.20"
+swash = "0.2"
+unicode-bidi = "0.3"
+unicode-script = "0.5"
+ttf-parser = "0.25"
+
+# --- cpu raster ------------------------------------------------------------
+tiny-skia = "0.12"
+
+# --- serialization ---------------------------------------------------------
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- misc ------------------------------------------------------------------
+tracing = "0.1"
+thiserror = "2.0"
+pollster = "1.0"
+
+# --- dev / test ------------------------------------------------------------
+proptest = "1.5"
+loom = "0.7"
+
+# --- internal --------------------------------------------------------------
+qs-platform = { path = "crates/qs-platform" }
+qs-gpu = { path = "crates/qs-gpu" }
+qs-text = { path = "crates/qs-text" }
+qs-ui = { path = "crates/qs-ui" }
+
+# Constitution: no blocking work and no silent panics on the frame path.
+# `unwrap`/`expect` are denied workspace-wide; tests and one-time initialisation
+# opt out locally with `#![allow(clippy::unwrap_used)]`, which makes every
+# exception greppable instead of ambient.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "warn"
+indexing_slicing = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+# `loom` is enabled by `RUSTFLAGS="--cfg loom"`, not by a Cargo feature, because loom has to
+# replace std's atomics across the whole dependency graph of the test binary.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# The release profile is the profile that gets measured.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = 1
+
+# Golden-image work is unusable at -O0; give dependencies real optimisation
+# even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2

@@ -28,10 +28,6 @@ tiny-skia.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
-# A dev-dependency cycle (qs-bench depends on qs-ui). Cargo permits this, and it is the
-# right shape here: the RS-1 test needs a source that would genuinely block, and the only
-# honest one lives beside the corpus generator rather than being reimplemented in a fixture.
-qs-bench.workspace = true
 
 [lints]
 workspace = true
