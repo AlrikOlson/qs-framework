@@ -175,7 +175,27 @@ impl std::fmt::Debug for Renderer {
 }
 
 impl Renderer {
+    /// A renderer whose colour page is [`DEFAULT_COLOUR_PAGE`](crate::atlas::DEFAULT_COLOUR_PAGE)
+    /// texels on a side -- the page a [`GlyphAtlas::new`](crate::atlas::GlyphAtlas::new)
+    /// atlas emits uploads for. An atlas built with
+    /// [`GlyphAtlas::with_budget`](crate::atlas::GlyphAtlas::with_budget) needs
+    /// [`Renderer::with_colour_page`].
     pub fn new(ctx: &GpuContext, atlas_size: u32) -> Self {
+        Self::with_colour_page(ctx, atlas_size, crate::atlas::DEFAULT_COLOUR_PAGE)
+    }
+
+    /// A renderer over both of an atlas's pages: `atlas_size` is the coverage page's edge
+    /// and `colour_size` the colour page's.
+    ///
+    /// `colour_size` **must** be the edge of the atlas whose uploads this renderer applies
+    /// ([`GlyphAtlas::colour_size`](crate::atlas::GlyphAtlas::colour_size)) -- the same
+    /// coupling [`CpuRasterizer::with_colour_page`](crate::cpu_raster::CpuRasterizer::with_colour_page)
+    /// states for the CPU tier. A texture smaller than the page makes
+    /// [`Renderer::upload_images`] a `write_texture` past the texture's edge for any picture
+    /// the atlas placed beyond it, which wgpu refuses as a validation error rather than
+    /// clipping; a texture larger than the page wastes memory and samples nothing, since
+    /// every `uv` is normalized against the page the atlas knows.
+    pub fn with_colour_page(ctx: &GpuContext, atlas_size: u32, colour_size: u32) -> Self {
         let device = &ctx.device;
         let format = ctx.capabilities.surface_format;
 
@@ -274,7 +294,7 @@ impl Renderer {
         });
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let colour_size = crate::atlas::DEFAULT_COLOUR_PAGE;
+        let colour_size = colour_size.max(1);
         let colour_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("qs-colour-atlas"),
             size: wgpu::Extent3d {

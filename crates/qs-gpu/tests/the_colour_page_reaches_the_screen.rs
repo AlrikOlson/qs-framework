@@ -30,7 +30,7 @@
     clippy::cast_precision_loss
 )]
 
-use qs_gpu::atlas::{DEFAULT_COLOUR_PAGE, GlyphAtlas, ImageKey, RgbaImage};
+use qs_gpu::atlas::{AtlasBudget, DEFAULT_COLOUR_PAGE, GlyphAtlas, ImageKey, RgbaImage};
 use qs_gpu::batcher::Renderer;
 use qs_gpu::color::Srgba;
 use qs_gpu::device::{GpuContext, new_instance};
@@ -289,5 +289,97 @@ fn a_picture_is_lit_by_its_own_bytes_and_not_by_the_glyph_page() {
         "the red quadrant came back as {red:?}, whose channels are too close together to \
          have come from a four-channel texture -- the sampler is reading a single-channel \
          page and broadcasting it"
+    );
+}
+
+/// A `wide` x `PIC` stripe: red everywhere but its last `PIC` columns, which are green.
+///
+/// Wider than [`DEFAULT_COLOUR_PAGE`] on purpose -- the shelf allocator places it from the
+/// page's left edge, so its green tail lands past the edge of the default page and only a
+/// texture sized to the wider page can hold it.
+fn stripe(wide: u32) -> RgbaImage {
+    let mut rgba = Vec::with_capacity((wide * PIC * 4) as usize);
+    for _y in 0..PIC {
+        for x in 0..wide {
+            let texel = if x >= wide - PIC {
+                [0, 255, 0, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            rgba.extend_from_slice(&texel);
+        }
+    }
+    RgbaImage {
+        width: wide,
+        height: PIC,
+        rgba,
+    }
+}
+
+#[test]
+fn a_picture_past_the_default_page_reaches_the_screen_on_a_renderer_sized_to_the_atlas() {
+    // A consumer that widened the colour page (`GlyphAtlas::with_budget`) admits pictures
+    // the default page could not hold, and the atlas places them past `DEFAULT_COLOUR_PAGE`
+    // texels. A renderer still holding the default-sized texture would `write_texture`
+    // past its own edge -- a validation error, not a clip -- so the renderer takes the
+    // page's edge from the atlas, exactly as `CpuRasterizer::with_colour_page` does.
+    let Some(ctx) = context() else { return };
+
+    let colour_size = 2 * DEFAULT_COLOUR_PAGE;
+    let mut atlas = GlyphAtlas::try_with_budget(
+        AtlasBudget {
+            coverage_size: 512,
+            colour_size,
+        },
+        64,
+    )
+    .expect("two pages of 512 and 2048 fit the cap");
+    atlas.begin_frame();
+    let wide = DEFAULT_COLOUR_PAGE + PIC * 4;
+    let entry = atlas
+        .get_or_decode_image(ImageKey(3), |_| Some(stripe(wide)))
+        .expect("the wider page admits a stripe wider than the default page");
+    assert_eq!(atlas.colour_size(), colour_size);
+    assert!(
+        entry.width == wide
+            && (entry.uv[2] * colour_size as f32).round() as u32 > DEFAULT_COLOUR_PAGE,
+        "the stripe's right edge should sit past the default page's edge: {:?}",
+        entry.uv
+    );
+
+    let mut renderer = Renderer::with_colour_page(&ctx, 512, atlas.colour_size());
+    renderer.upload_images(&ctx, &atlas.take_image_uploads());
+
+    // Two slices of one entry, cut along `u`: the head (red) and the tail (green). The
+    // tail is the part that lives past the default page, and a sliced `uv` is how a
+    // consumer shows the rows of a picture that are on screen without re-admitting it.
+    let [u0, v0, u1, v1] = entry.uv;
+    let span = u1 - u0;
+    let head = [u0, v0, u0 + span * (PIC as f32 / wide as f32), v1];
+    let tail = [u1 - span * (PIC as f32 / wide as f32), v0, u1, v1];
+
+    let mut list = DrawList::default();
+    list.reset([WIDTH, HEIGHT], Srgba::new(0.0, 0.0, 0.0, 1.0), 1);
+    let white = Srgba::new(1.0, 1.0, 1.0, 1.0);
+    list.instances.push(Instance::image(
+        4.0, 4.0, PIC as f32, PIC as f32, head, white,
+    ));
+    list.instances.push(Instance::image(
+        36.0, 36.0, PIC as f32, PIC as f32, tail, white,
+    ));
+    list.end_batch(None, true);
+
+    let pixels = draw(&ctx, &mut renderer, &list);
+    let mid = PIC / 2;
+    assert_eq!(
+        dominant(at(&pixels, &ctx, 4 + mid, 4 + mid)),
+        Some("red"),
+        "the head of the stripe should read red"
+    );
+    assert_eq!(
+        dominant(at(&pixels, &ctx, 36 + mid, 36 + mid)),
+        Some("green"),
+        "the tail of the stripe -- the part past the default page's edge -- should read \
+         green; black means the upload never reached the texture"
     );
 }
