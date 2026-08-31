@@ -23,6 +23,7 @@ const KIND_FIELD:    u32 = 8u;
 const KIND_IMAGE:    u32 = 9u;
 const KIND_BLUR:     u32 = 10u;
 const KIND_REFRACT:  u32 = 11u;
+const KIND_DASHED_STROKE: u32 = 12u;
 
 const PI: f32 = 3.14159265;
 const TAU: f32 = 6.28318531;
@@ -185,6 +186,63 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: InstanceIn) -> VsOut 
 fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
     let q = abs(p) - b + vec2<f32>(r, r);
     return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// Where a fragment sits along the shape's boundary, in pixels of arc length, walked
+// clockwise from the top edge's left end. The boundary decomposes into four straight
+// edges and four quarter arcs; a fragment in the interior core reads as its nearest
+// edge, which is harmless because the stroke's coverage is zero there anyway.
+//
+// Mirrored in Rust by `cpu_raster` -- the two must stay the same walk, or the tiers'
+// dashes land on different arcs.
+fn perimeter_s(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let e = max(b - vec2<f32>(r, r), vec2<f32>(0.0, 0.0));
+    let top = 2.0 * e.x;
+    let side = 2.0 * e.y;
+    let arc = 0.5 * PI * r;
+    if (abs(p.x) <= e.x) {
+        if (p.y < 0.0) {
+            return p.x + e.x;
+        }
+        return top + 2.0 * arc + side + (e.x - p.x);
+    }
+    if (abs(p.y) <= e.y) {
+        if (p.x > 0.0) {
+            return top + arc + (p.y + e.y);
+        }
+        return 2.0 * top + 3.0 * arc + side + (e.y - p.y);
+    }
+    let d = p - vec2<f32>(sign(p.x) * e.x, sign(p.y) * e.y);
+    let quarter = 0.5 * PI;
+    if (p.x > 0.0 && p.y < 0.0) {
+        return top + clamp(atan2(d.x, -d.y), 0.0, quarter) * r;
+    }
+    if (p.x > 0.0 && p.y > 0.0) {
+        return top + arc + side + clamp(atan2(d.y, d.x), 0.0, quarter) * r;
+    }
+    if (p.x < 0.0 && p.y > 0.0) {
+        return 2.0 * top + 2.0 * arc + side + clamp(atan2(-d.x, d.y), 0.0, quarter) * r;
+    }
+    return 2.0 * top + 3.0 * arc + 2.0 * side + clamp(atan2(-d.y, -d.x), 0.0, quarter) * r;
+}
+
+// The dash pattern's coverage at a fragment: 1 inside a dash, 0 inside a gap, with a
+// one-pixel analytic edge at each cut -- the same edge treatment every fill here has.
+// The period is scaled so a whole number of dashes closes the loop; without that the
+// seam at s = 0 lands mid-dash at a fixed corner no caller chose. Mirrored in Rust by
+// `cpu_raster`.
+fn dash_mask(p: vec2<f32>, b: vec2<f32>, r: f32, dash: f32, gap: f32) -> f32 {
+    let period = dash + gap;
+    if (period <= 0.0 || dash <= 0.0) {
+        return 1.0;
+    }
+    let e = max(b - vec2<f32>(r, r), vec2<f32>(0.0, 0.0));
+    let perimeter = 4.0 * (e.x + e.y) + TAU * r;
+    let count = max(round(perimeter / period), 1.0);
+    let scaled = perimeter / count;
+    let on = dash * scaled / period;
+    let m = perimeter_s(p, b, r) % scaled;
+    return clamp(min(m, on - m) + 0.5, 0.0, 1.0);
 }
 
 // -- Oklab -----------------------------------------------------------------------------
@@ -931,11 +989,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let distance = sd_rounded_box(in.local, in.half_size, radius);
 
     var alpha: f32;
-    if (in.kind == KIND_STROKE) {
+    if (in.kind == KIND_STROKE || in.kind == KIND_DASHED_STROKE) {
         // Distance to the centre-line of a band of width `param`, then the same one-pixel
         // analytic coverage as the fill.
         let half_width = in.param * 0.5;
         alpha = clamp(0.5 - (abs(distance + half_width) - half_width), 0.0, 1.0);
+        if (in.kind == KIND_DASHED_STROKE) {
+            // The band's coverage times the dash's: the cuts run across the band, so a
+            // dash end gets the same one-pixel edge the band's own sides have.
+            alpha = alpha * dash_mask(in.local, in.half_size, radius, in.aux.x, in.aux.y);
+        }
     } else if (in.kind == KIND_GLOW) {
         // Quadratic, not linear: a linear ramp reads as a cone with a visible outer edge
         // where its slope stops, and a glow is mostly its bright near half. The curve is

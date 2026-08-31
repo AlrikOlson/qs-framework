@@ -308,6 +308,9 @@ impl CpuRasterizer {
                     clip_mask(clip).as_ref(),
                 );
             }
+            k if k == PrimKind::DashedStroke as u32 => {
+                self.draw_dashed_stroke(instance, r, g, b, a, clip);
+            }
             _ => {
                 let Some(path) = rounded_rect(x, y, w, h, instance.radius) else {
                     return;
@@ -336,6 +339,87 @@ impl CpuRasterizer {
     /// through a general path fill would resample an already-antialiased mask and soften
     /// every glyph.
     #[allow(clippy::too_many_arguments)]
+    /// The dashed stroke, evaluated per pixel from the same signed distance and the same
+    /// perimeter walk as `shaders/instance.wgsl` -- a transcription, not an approximation.
+    ///
+    /// `tiny-skia` can dash a stroked path, and that was refused deliberately: it dashes
+    /// the *inset* path this tier strokes (a shorter perimeter), starting wherever the
+    /// path happens to begin, so its dashes and the shader's drift apart around the
+    /// shape. A dashed slot must be the same outline on every tier.
+    #[allow(clippy::many_single_char_names)]
+    fn draw_dashed_stroke(
+        &mut self,
+        instance: &Instance,
+        r: f32,
+        g: f32,
+        b: f32,
+        a: f32,
+        clip: Option<Rect>,
+    ) {
+        let [x, y, w, h] = instance.rect;
+        let half = [w * 0.5, h * 0.5];
+        let center = [x + half[0], y + half[1]];
+        // The same clamp the shader applies: an unclamped radius inverts the SDF.
+        let radius = instance.radius.clamp(0.0, half[0].min(half[1]));
+        let width = instance.param;
+        let (dash, gap) = (instance.uv[0], instance.uv[1]);
+
+        let pw = self.pixmap.width() as i64;
+        let ph = self.pixmap.height() as i64;
+        let (cx0, cy0, cx1, cy1) = match clip {
+            Some(rect) => (
+                rect.left() as i64,
+                rect.top() as i64,
+                rect.right() as i64,
+                rect.bottom() as i64,
+            ),
+            None => (0, 0, pw, ph),
+        };
+        let x0 = (x.floor() as i64).max(cx0).max(0);
+        let y0 = (y.floor() as i64).max(cy0).max(0);
+        let x1 = ((x + w).ceil() as i64).min(cx1).min(pw);
+        let y1 = ((y + h).ceil() as i64).min(cy1).min(ph);
+
+        for py in y0..y1 {
+            for px in x0..x1 {
+                // The fragment centre, in the shader's local space.
+                let local = [(px as f32 + 0.5) - center[0], (py as f32 + 0.5) - center[1]];
+                let distance = sd_rounded_box(local, half, radius);
+                let half_width = width * 0.5;
+                let band = (0.5 - ((distance + half_width).abs() - half_width)).clamp(0.0, 1.0);
+                if band <= 0.0 {
+                    continue;
+                }
+                let coverage = band * dash_mask(local, half, radius, dash, gap);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let index = (py as usize) * (self.pixmap.width() as usize) + px as usize;
+                let Some(dst) = self.pixmap.pixels_mut().get_mut(index) else {
+                    continue;
+                };
+                // Premultiplied source-over, the blend `draw_glyph` spells out.
+                let sa = a * coverage;
+                let inv = 1.0 - sa;
+                let dr = f32::from(dst.red()) / 255.0;
+                let dg = f32::from(dst.green()) / 255.0;
+                let db = f32::from(dst.blue()) / 255.0;
+                let da = f32::from(dst.alpha()) / 255.0;
+                let out = |s: f32, d: f32| -> u8 {
+                    ((s * coverage + d * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+                };
+                if let Some(px) = PremultipliedColorU8::from_rgba(
+                    out(r, dr),
+                    out(g, dg),
+                    out(b, db),
+                    ((sa + da * inv).clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                ) {
+                    *dst = px;
+                }
+            }
+        }
+    }
+
     fn draw_glyph(
         &mut self,
         instance: &Instance,
@@ -773,6 +857,62 @@ fn linear_premul(r: f32, g: f32, b: f32, a: f32) -> tiny_skia::Color {
 
 /// Build a rounded-rectangle path. `radius` is clamped to what the rectangle can hold, for
 /// the same reason the shader clamps it: an over-large radius inverts the corners.
+/// `sd_rounded_box` from `shaders/instance.wgsl`, transcribed.
+fn sd_rounded_box(p: [f32; 2], b: [f32; 2], r: f32) -> f32 {
+    let q = [p[0].abs() - b[0] + r, p[1].abs() - b[1] + r];
+    let outside = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)).sqrt();
+    outside + q[0].max(q[1]).min(0.0) - r
+}
+
+/// `perimeter_s` from `shaders/instance.wgsl`, transcribed: arc length along the shape's
+/// boundary, clockwise from the top edge's left end.
+fn perimeter_s(p: [f32; 2], b: [f32; 2], r: f32) -> f32 {
+    let e = [(b[0] - r).max(0.0), (b[1] - r).max(0.0)];
+    let top = 2.0 * e[0];
+    let side = 2.0 * e[1];
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let arc = quarter * r;
+    if p[0].abs() <= e[0] {
+        if p[1] < 0.0 {
+            return p[0] + e[0];
+        }
+        return top + 2.0 * arc + side + (e[0] - p[0]);
+    }
+    if p[1].abs() <= e[1] {
+        if p[0] > 0.0 {
+            return top + arc + (p[1] + e[1]);
+        }
+        return 2.0 * top + 3.0 * arc + side + (e[1] - p[1]);
+    }
+    let d = [p[0] - p[0].signum() * e[0], p[1] - p[1].signum() * e[1]];
+    if p[0] > 0.0 && p[1] < 0.0 {
+        return top + d[0].atan2(-d[1]).clamp(0.0, quarter) * r;
+    }
+    if p[0] > 0.0 && p[1] > 0.0 {
+        return top + arc + side + d[1].atan2(d[0]).clamp(0.0, quarter) * r;
+    }
+    if p[0] < 0.0 && p[1] > 0.0 {
+        return 2.0 * top + 2.0 * arc + side + (-d[0]).atan2(d[1]).clamp(0.0, quarter) * r;
+    }
+    2.0 * top + 3.0 * arc + 2.0 * side + (-d[1]).atan2(-d[0]).clamp(0.0, quarter) * r
+}
+
+/// `dash_mask` from `shaders/instance.wgsl`, transcribed: the pattern's coverage at a
+/// fragment, with the period scaled so a whole number of dashes closes the loop.
+fn dash_mask(p: [f32; 2], b: [f32; 2], r: f32, dash: f32, gap: f32) -> f32 {
+    let period = dash + gap;
+    if period <= 0.0 || dash <= 0.0 {
+        return 1.0;
+    }
+    let e = [(b[0] - r).max(0.0), (b[1] - r).max(0.0)];
+    let perimeter = 4.0 * (e[0] + e[1]) + std::f32::consts::TAU * r;
+    let count = (perimeter / period).round().max(1.0);
+    let scaled = perimeter / count;
+    let on = dash * scaled / period;
+    let m = perimeter_s(p, b, r) % scaled;
+    (m.min(on - m) + 0.5).clamp(0.0, 1.0)
+}
+
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
     let r = radius.clamp(0.0, (w.min(h)) * 0.5);
     let mut pb = PathBuilder::new();
@@ -1012,6 +1152,153 @@ mod tests {
             last, 29,
             "the ring must end at the rect's right edge, not outside it"
         );
+    }
+
+    #[test]
+    fn a_dashed_stroke_draws_gaps_where_a_plain_stroke_draws_ink() {
+        let mut r = CpuRasterizer::new(64, 64, 64).unwrap();
+        let mut list = DrawList::default();
+        list.reset([64, 64], Srgba::new(0.0, 0.0, 0.0, 0.0), 1);
+        list.instances.push(Instance::dashed_stroke(
+            4.0,
+            4.0,
+            56.0,
+            40.0,
+            6.0,
+            2.0,
+            4.0,
+            4.0,
+            Srgba::new(1.0, 1.0, 1.0, 1.0),
+        ));
+        list.end_batch(None, false);
+        let pixmap = r.render(&list).clone();
+        // Walk the top edge's straight span and count ink runs: a plain stroke is one
+        // run, a dashed one is several with real gaps between them.
+        let y = 5u32;
+        let mut runs = 0;
+        let mut inside = false;
+        let mut gap_pixels = 0;
+        for x in 12..52u32 {
+            let ink = pixmap.pixels()[(y * 64 + x) as usize].alpha() > 64;
+            if ink && !inside {
+                runs += 1;
+            }
+            if !ink {
+                gap_pixels += 1;
+            }
+            inside = ink;
+        }
+        assert!(
+            runs >= 3,
+            "one run of ink is a plain stroke, not dashes ({runs})"
+        );
+        assert!(
+            gap_pixels >= 8,
+            "the gaps must be real absences ({gap_pixels})"
+        );
+        // And nothing leaks into the interior: the band is the outline only.
+        assert_eq!(
+            pixmap.pixels()[(24 * 64 + 32) as usize].alpha(),
+            0,
+            "the middle of a slot is empty"
+        );
+    }
+
+    #[test]
+    fn the_dash_pattern_closes_the_loop_with_whole_periods() {
+        // The scaled period divides the perimeter exactly, whatever the geometry -- the
+        // seam at the walk's origin lands on a dash boundary rather than mid-dash.
+        for (b, r, dash, gap) in [
+            ([28.0f32, 14.0], 6.0f32, 4.0f32, 4.0f32),
+            ([22.0, 10.0], 10.0, 6.0, 3.0),
+            ([30.0, 30.0], 30.0, 5.0, 5.0),
+        ] {
+            let e = [(b[0] - r).max(0.0), (b[1] - r).max(0.0)];
+            let perimeter = 4.0 * (e[0] + e[1]) + std::f32::consts::TAU * r;
+            let count = (perimeter / (dash + gap)).round().max(1.0);
+            let scaled = perimeter / count;
+            let periods = perimeter / scaled;
+            assert!(
+                (periods - periods.round()).abs() < 1e-3,
+                "{periods} periods do not close the loop"
+            );
+            // The mask agrees: a point just past the seam is inside the first dash.
+            let p = [-e[0] + 0.6, -b[1]];
+            assert!(
+                dash_mask(p, b, r, dash, gap) > 0.5,
+                "the seam starts a dash"
+            );
+        }
+    }
+
+    #[test]
+    fn the_perimeter_walk_is_continuous_across_every_joint() {
+        // Each edge hands over to its corner arc at the same arc length, so a dash
+        // crossing a corner neither jumps nor repeats. Walk the boundary densely and
+        // hold successive samples to the step size.
+        let b = [24.0f32, 16.0];
+        let r = 6.0f32;
+        let e = [b[0] - r, b[1] - r];
+        let perimeter = 4.0 * (e[0] + e[1]) + std::f32::consts::TAU * r;
+        let steps = 2000;
+        let mut previous = None;
+        for i in 0..steps {
+            let s = perimeter * (i as f32) / (steps as f32);
+            let p = boundary_point(s, b, r);
+            let measured = perimeter_s(p, b, r);
+            if let Some(last) = previous {
+                let delta = measured - last;
+                assert!(
+                    (0.0..=perimeter / steps as f32 * 3.0).contains(&delta),
+                    "the walk jumped by {delta} at s = {s}"
+                );
+            }
+            previous = Some(measured);
+        }
+    }
+
+    /// The point at arc length `s` along the boundary, by the same clockwise
+    /// decomposition `perimeter_s` reads back -- the test's independent construction.
+    fn boundary_point(s: f32, b: [f32; 2], r: f32) -> [f32; 2] {
+        let e = [b[0] - r, b[1] - r];
+        let top = 2.0 * e[0];
+        let side = 2.0 * e[1];
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let arc = quarter * r;
+        let mut s = s;
+        if s < top {
+            return [-e[0] + s, -b[1]];
+        }
+        s -= top;
+        if s < arc {
+            let theta = s / r;
+            return [e[0] + r * theta.sin(), -e[1] - r * theta.cos()];
+        }
+        s -= arc;
+        if s < side {
+            return [b[0], -e[1] + s];
+        }
+        s -= side;
+        if s < arc {
+            let theta = s / r;
+            return [e[0] + r * theta.cos(), e[1] + r * theta.sin()];
+        }
+        s -= arc;
+        if s < top {
+            return [e[0] - s, b[1]];
+        }
+        s -= top;
+        if s < arc {
+            let theta = s / r;
+            return [-e[0] - r * theta.sin(), e[1] + r * theta.cos()];
+        }
+        s -= arc;
+        if s < side {
+            return [-b[0], e[1] - s];
+        }
+        s -= side;
+        let theta = (s / r).min(quarter);
+        [-e[0] - r * theta.cos(), -e[1] - r * theta.sin()]
     }
 
     #[test]

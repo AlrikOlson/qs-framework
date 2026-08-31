@@ -145,6 +145,8 @@ pub(crate) mod shader {
     pub const KIND_FIELD: u32 = 8;
     /// `const KIND_IMAGE: u32 = 9u;` -- shader line 23.
     pub const KIND_IMAGE: u32 = 9;
+    /// `const KIND_DASHED_STROKE: u32 = 12u;` -- shader line 26.
+    pub const KIND_DASHED_STROKE: u32 = 12;
 
     pub const PI: f32 = std::f32::consts::PI;
     pub const TAU: f32 = std::f32::consts::TAU;
@@ -465,8 +467,11 @@ pub(crate) mod shader {
     ) -> f32 {
         let distance = fs_distance(local, half_size, radius);
 
-        if kind == KIND_STROKE {
+        if kind == KIND_STROKE || kind == KIND_DASHED_STROKE {
             // Lines 120-121: distance to the centre-line of a band of width `param`.
+            // The dashed variant multiplies the dash mask in at the call site, exactly
+            // as `fs_main` does inside this branch -- the mask needs `aux`, which this
+            // signature deliberately does not carry.
             let half_width = param * 0.5;
             (0.5 - ((distance + half_width).abs() - half_width)).clamp(0.0, 1.0)
         } else if kind == KIND_GLOW {
@@ -488,6 +493,55 @@ pub(crate) mod shader {
             // Line 127.
             (0.5 - distance).clamp(0.0, 1.0)
         }
+    }
+
+    /// `fn perimeter_s(p, b, r)` -- arc length along the shape's boundary, clockwise from
+    /// the top edge's left end.
+    pub fn perimeter_s(p: [f32; 2], b: [f32; 2], r: f32) -> f32 {
+        let e = [(b[0] - r).max(0.0), (b[1] - r).max(0.0)];
+        let top = 2.0 * e[0];
+        let side = 2.0 * e[1];
+        let quarter = 0.5 * PI;
+        let arc = quarter * r;
+        if p[0].abs() <= e[0] {
+            if p[1] < 0.0 {
+                return p[0] + e[0];
+            }
+            return top + 2.0 * arc + side + (e[0] - p[0]);
+        }
+        if p[1].abs() <= e[1] {
+            if p[0] > 0.0 {
+                return top + arc + (p[1] + e[1]);
+            }
+            return 2.0 * top + 3.0 * arc + side + (e[1] - p[1]);
+        }
+        let d = [p[0] - sign(p[0]) * e[0], p[1] - sign(p[1]) * e[1]];
+        if p[0] > 0.0 && p[1] < 0.0 {
+            return top + d[0].atan2(-d[1]).clamp(0.0, quarter) * r;
+        }
+        if p[0] > 0.0 && p[1] > 0.0 {
+            return top + arc + side + d[1].atan2(d[0]).clamp(0.0, quarter) * r;
+        }
+        if p[0] < 0.0 && p[1] > 0.0 {
+            return 2.0 * top + 2.0 * arc + side + (-d[0]).atan2(d[1]).clamp(0.0, quarter) * r;
+        }
+        2.0 * top + 3.0 * arc + 2.0 * side + (-d[1]).atan2(-d[0]).clamp(0.0, quarter) * r
+    }
+
+    /// `fn dash_mask(p, b, r, dash, gap)` -- the dash pattern's coverage at a fragment,
+    /// with the period scaled so a whole number of dashes closes the loop.
+    pub fn dash_mask(p: [f32; 2], b: [f32; 2], r: f32, dash: f32, gap: f32) -> f32 {
+        let period = dash + gap;
+        if period <= 0.0 || dash <= 0.0 {
+            return 1.0;
+        }
+        let e = [(b[0] - r).max(0.0), (b[1] - r).max(0.0)];
+        let perimeter = 4.0 * (e[0] + e[1]) + TAU * r;
+        let count = (perimeter / period).round().max(1.0);
+        let scaled = perimeter / count;
+        let on = dash * scaled / period;
+        let m = perimeter_s(p, b, r) % scaled;
+        (m.min(on - m) + 0.5).clamp(0.0, 1.0)
     }
 
     /// `fn unpremultiply(c)` -- the shader's helper, transcribed.
@@ -1188,13 +1242,21 @@ fn draw_reference_instance(
                 // `vec4(texel.rgb * texel.a, texel.a) * in.color` term for term.
                 shader::texture_sample_rgba(pages.colour, pages.colour_size, sampled_uv())[3]
             } else {
-                shader::fs_alpha(
+                let mut alpha = shader::fs_alpha(
                     instance.kind,
                     local,
                     half_size,
                     instance.radius,
                     instance.param,
-                )
+                );
+                if instance.kind == shader::KIND_DASHED_STROKE {
+                    // The band's coverage times the dash's -- `fs_main`'s own order, with
+                    // the same clamped radius the distance was taken at.
+                    let radius = instance.radius.clamp(0.0, half_size[0].min(half_size[1]));
+                    alpha *=
+                        shader::dash_mask(local, half_size, radius, instance.uv[0], instance.uv[1]);
+                }
+                alpha
             };
 
             // Coverage and colour are separable in `fs_main`: a gradient takes the fill's
@@ -1579,6 +1641,41 @@ fn cases_for(kind: PrimKind) -> Vec<Case> {
     const ROUNDED_AND_OFF_GRID: u8 = QUANTISATION_CHANNEL_BUDGET + CURVATURE;
 
     match kind {
+        // Exact by transcription: the CPU arm evaluates the same signed distance, the
+        // same perimeter walk and the same dash mask as the shader, so what is left
+        // between the tiers is float rounding at the dash cuts and the readback's u8
+        // quantisation. The bounds are tighter than the path-drawn kinds' for exactly
+        // that reason -- loosening them is the signal the two walks have drifted apart.
+        PrimKind::DashedStroke => vec![
+            Case {
+                // The design's empty slot: hairline, radius 6, even dashes.
+                name: "dashed/slot",
+                instance: Instance::dashed_stroke(
+                    12.0, 10.0, 40.0, 28.0, 6.0, 1.0, 4.0, 4.0, white,
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 24,
+                mean_channel: 0.10,
+                centroid_shift: 0.02,
+                ink_area: 0.01,
+            },
+            Case {
+                // A clamped radius makes the shape a stadium -- arc all the way round --
+                // so the perimeter walk is exercised with no straight edge to hide on,
+                // and a thicker band exercises the coverage away from the hairline case.
+                name: "dashed/stadium",
+                instance: Instance::dashed_stroke(
+                    8.0, 12.0, 44.0, 20.0, 1000.0, 2.0, 6.0, 3.0, white,
+                ),
+                uploads: Vec::new(),
+                images: Vec::new(),
+                max_channel: 24,
+                mean_channel: 0.10,
+                centroid_shift: 0.02,
+                ink_area: 0.01,
+            },
+        ],
         PrimKind::Rect => vec![
             Case {
                 // The baseline. Axis-aligned, integer bounds, no curvature: the analytic
@@ -3087,6 +3184,11 @@ fn rect_agrees_across_tiers() {
 #[test]
 fn stroke_agrees_across_tiers() {
     run_kind(PrimKind::Stroke);
+}
+
+#[test]
+fn dashed_stroke_agrees_across_tiers() {
+    run_kind(PrimKind::DashedStroke);
 }
 
 #[test]

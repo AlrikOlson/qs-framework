@@ -274,6 +274,26 @@ pub enum PrimKind {
     /// chain -- the CPU tier gets the albedo through `Floor`, and a frame with no backdrop
     /// bound gets the PBR shading path in the shader, which already exists.
     Refract = 11,
+    /// Pass 1's band drawn as dashes: the same inside-aligned stroke, its coverage cut by
+    /// an on/off pattern walked along the shape's perimeter.
+    ///
+    /// [`Instance::param`] is the stroke width the way a stroke's is; [`Instance::uv`] is
+    /// `[dash, gap, 0, 0]` in pixels of perimeter. The pattern is scaled so a whole number
+    /// of periods closes the loop -- a pattern that merely tiled the perimeter would end on
+    /// a fragment of a dash wherever the seam fell.
+    ///
+    /// A primitive rather than a row of short rects, because a dashed outline is a *shape*:
+    /// the dashes follow the corners' arcs, a probe can count dashed outlines on a draw
+    /// list the way it counts gradients, and a row of rects is indistinguishable from a
+    /// row of rules. It exists for the design language's empty slots and drop targets --
+    /// the one class its UI grammar allows a dashed outline.
+    ///
+    /// [`Fidelity::Exact`], and the CPU tier earns it by **transcription**: `tiny-skia` can
+    /// dash a stroked path, but it dashes the *inset* path that tier strokes (a shorter
+    /// perimeter) from wherever the path happens to start, so its dashes and the shader's
+    /// drift apart around the shape. The CPU arm evaluates the same signed distance and the
+    /// same perimeter walk per pixel instead.
+    DashedStroke = 12,
 }
 
 impl PrimKind {
@@ -292,7 +312,7 @@ impl PrimKind {
     ///
     /// It exists so the `tier_parity` suite can assert that *every* kind has a parity
     /// fixture, rather than asserting it about whichever kinds someone remembered.
-    pub const ALL: [PrimKind; 12] = [
+    pub const ALL: [PrimKind; 13] = [
         Self::Rect,
         Self::Stroke,
         Self::Glyph,
@@ -305,6 +325,7 @@ impl PrimKind {
         Self::Image,
         Self::Blur,
         Self::Refract,
+        Self::DashedStroke,
     ];
 
     /// This variant's position in [`PrimKind::ALL`].
@@ -326,6 +347,7 @@ impl PrimKind {
             Self::Image => 9,
             Self::Blur => 10,
             Self::Refract => 11,
+            Self::DashedStroke => 12,
         }
     }
 
@@ -349,6 +371,7 @@ impl PrimKind {
             Self::Image => "KIND_IMAGE",
             Self::Blur => "KIND_BLUR",
             Self::Refract => "KIND_REFRACT",
+            Self::DashedStroke => "KIND_DASHED_STROKE",
         }
     }
 
@@ -395,6 +418,10 @@ impl PrimKind {
             // which is where this chunk started.
             Self::Rect
             | Self::Stroke
+            // The dashed stroke is the stroke with its coverage cut, and the CPU arm is a
+            // transcription of the same distance and perimeter arithmetic -- so the two
+            // tiers are held to the same picture the way the plain stroke's are.
+            | Self::DashedStroke
             | Self::Glyph
             | Self::Gradient
             | Self::Sweep
@@ -487,6 +514,8 @@ impl PrimKind {
             // The atlas is content the frame put there itself; a backdrop is the frame's own
             // prior output, and only the second needs the two-pass path.
             | Self::Image => false,
+            // A dash is a function of the fragment's own place on the perimeter.
+            Self::DashedStroke => false,
             // And this is that second thing. A blurred pixel is a weighted sum over its
             // neighbours, which no amount of closed form reaches from one fragment.
             Self::Blur
@@ -525,6 +554,7 @@ impl PrimKind {
             9 => Some(Self::Image),
             10 => Some(Self::Blur),
             11 => Some(Self::Refract),
+            12 => Some(Self::DashedStroke),
             _ => None,
         }
     }
@@ -632,6 +662,33 @@ impl Instance {
             radius,
             param: width,
             kind: PrimKind::Stroke as u32,
+        }
+    }
+
+    /// A rounded-rect stroke drawn as dashes: `width` thick, `dash` pixels of ink then
+    /// `gap` pixels of nothing, walked clockwise along the shape's perimeter from the top
+    /// edge's left end. See [`PrimKind::DashedStroke`] for the seam scaling and why the
+    /// CPU tier transcribes rather than dashes a path.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn dashed_stroke(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        width: f32,
+        dash: f32,
+        gap: f32,
+        color: Srgba,
+    ) -> Self {
+        Self {
+            rect: [x, y, w, h],
+            uv: [dash.max(0.0), gap.max(0.0), 0.0, 0.0],
+            color: color.to_premul_linear_rgba8(),
+            radius,
+            param: width,
+            kind: PrimKind::DashedStroke as u32,
         }
     }
 
