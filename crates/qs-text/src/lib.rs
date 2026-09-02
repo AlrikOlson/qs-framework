@@ -57,4 +57,8 @@ pub struct Features {
     /// `tnum` -- fixed-advance digits. The size and modified columns need it so numbers
     /// do not jitter horizontally as rows scroll past (FR-013).
     pub tabular_figures: bool,
+    /// `zero` -- the face's slashed-zero alternate, so an id or a hash reads `0` against
+    /// `O` at a glance. A face without the feature shapes its default zero; the tag is
+    /// simply not applied.
+    pub slashed_zero: bool,
 }

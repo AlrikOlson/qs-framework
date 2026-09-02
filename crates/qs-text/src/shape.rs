@@ -333,6 +333,14 @@ fn feature_list(features: Features) -> Vec<Feature> {
             ..,
         ));
     }
+    if features.slashed_zero {
+        // `zero`: the slashed alternate of `0`, where the face draws one.
+        list.push(Feature::new(
+            rustybuzz::ttf_parser::Tag::from_bytes(b"zero"),
+            1,
+            ..,
+        ));
+    }
     list
 }
 
@@ -341,6 +349,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::fontdb::SystemFontDb;
+
+    /// Each flag maps to exactly its tag, and the default asks the face for nothing.
+    #[test]
+    fn features_map_to_their_tags() {
+        let tags = |f: Features| -> Vec<rustybuzz::ttf_parser::Tag> {
+            feature_list(f).iter().map(|feature| feature.tag).collect()
+        };
+        assert!(tags(Features::default()).is_empty());
+        let tnum = rustybuzz::ttf_parser::Tag::from_bytes(b"tnum");
+        let zero = rustybuzz::ttf_parser::Tag::from_bytes(b"zero");
+        assert_eq!(
+            tags(Features {
+                tabular_figures: true,
+                slashed_zero: false,
+            }),
+            vec![tnum]
+        );
+        assert_eq!(
+            tags(Features {
+                tabular_figures: false,
+                slashed_zero: true,
+            }),
+            vec![zero]
+        );
+        assert_eq!(
+            tags(Features {
+                tabular_figures: true,
+                slashed_zero: true,
+            }),
+            vec![tnum, zero]
+        );
+    }
 
     fn shaper() -> Option<(Shaper, FontId)> {
         let db = SystemFontDb::scan();
