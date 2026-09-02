@@ -1433,6 +1433,7 @@ impl ListRenderer {
         // than a ragged edge as rows scroll past (FR-013).
         let tabular = Features {
             tabular_figures: true,
+            ..Features::default()
         };
 
         if columns.metadata && !row.flags.contains(RowFlags::IS_DIR) {
