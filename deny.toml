@@ -1,11 +1,4 @@
-# cargo-deny policy. Run with `cargo deny check` (or `cargo xtask deny`).
-#
-# Two things are gated here, and they fail the build rather than warn:
-#   1. Licence compatibility -- Quicksilver ships as a binary, so a copyleft
-#      dependency is a distribution problem discovered at release time unless
-#      it is caught at merge time.
-#   2. Security advisories -- an unpatched RUSTSEC advisory in a desktop app
-#      with filesystem reach is not a backlog item.
+# Dependency license and security checks. Run with `cargo deny check`.
 
 [graph]
 targets = [
@@ -27,8 +20,7 @@ ignore = []
 
 [licenses]
 version = 2
-# Permissive licences only. Anything outside this list needs an explicit
-# exception below with a reason, not a silent addition to the allow list.
+# Allowed dependency licenses. Additional exceptions go in `exceptions` below.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -56,17 +48,11 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# `all`, not `all-duplicates`: this key has only ever accepted
-# simplest-path | lowest-version | all, so the old value made cargo-deny refuse
-# to parse this file at all. Which means the licence gate had never run --
-# found by `terminal-fork-vendoring`, whose acceptance requires it to.
+# Show every dependency path when reporting a duplicate.
 highlight = "all"
 
-# Crates that must never appear in the graph, with the reason stated so the
-# next person does not have to reconstruct it.
+# Disallowed dependencies.
 deny = [
-    # A blocking async runtime on the frame path is Constitution I in crate form.
-    # If one of these becomes genuinely necessary it needs an ADR, not a merge.
     { name = "openssl-sys", reason = "native TLS pulls a C toolchain into all 8 cross-compilation targets" },
 ]
 

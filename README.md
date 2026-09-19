@@ -1,9 +1,7 @@
 # qs-framework
 
 Rust libraries for drawing desktop interfaces. They handle windows, GPU and CPU
-rendering, text, and virtualized lists. They are used by
-[Quicksilver](https://github.com/AlrikOlson/quicksilver-file-explorer) and
-[Magistr](https://github.com/AlrikOlson/magistr).
+rendering, text, and virtualized lists.
 
 | Crate | Contents |
 | --- | --- |
