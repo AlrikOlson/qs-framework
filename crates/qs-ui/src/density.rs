@@ -1,23 +1,8 @@
-//! Row density and type scaling.
+//! Row density and text scaling.
 //!
-//! # Two densities at M0, and why not four
-//!
-//! The data model names `Compact(24)` and `Default(28)` at M0, with `Comfortable` and
-//! `Touch` deferred to M1. That is not an arbitrary cut: 24 px and 28 px bracket the range
-//! where the *virtualization* behaves differently (roughly 45 vs 38 rows in a 1080p
-//! viewport), while a fifth density would exercise no new code path and would need a fifth
-//! set of golden images.
-//!
-//! # Type scale is multiplicative and clamped
-//!
-//! FR-015 requires honouring the OS text-size setting, and SC-007 requires 200% to work.
-//! The row height grows with the text, because text that outgrows its row is the failure
-//! mode -- a 200% setting inside a 28 px row produces clipped descenders, which is worse
-//! than a taller row.
-//!
-//! The clamp exists because some platforms report scales far outside anything usable
-//! (a misconfigured `GDK_DPI_SCALE`, a `Text Size` slider dragged to an accessibility
-//! extreme). Honouring a 10x request literally produces one visible row and no way back.
+//! Compact and default densities use 24- and 28-pixel rows at the base scale.
+//! Rows grow with text size to avoid clipping. Platform text-scale values are
+//! clamped to the supported range.
 
 /// How tall rows are.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]

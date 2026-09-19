@@ -1,28 +1,11 @@
-//! Row layout and rendering: status rail, icon slot, name, size, modified, kind.
+//! Row layout and rendering for names, icons and metadata.
 //!
-//! This is the only file that turns rows into [`Instance`]s, and it is deliberately the
-//! only one -- RP-2 (all three tiers consume the same draw lists) holds because there is
-//! exactly one place a draw list can come from.
+//! Long names use a middle ellipsis that preserves the extension. Cuts follow
+//! shaping cluster boundaries to keep combining marks and syllables intact.
 //!
-//! # Middle ellipsis, and why the extension is preserved
-//!
-//! `a-very-long-quarterly-report-final-v3.xlsx` truncated at the end becomes
-//! `a-very-long-quarterly-rep…`, which loses the single most identifying part of the name.
-//! Truncating in the middle keeps both ends: `a-very-long-qua….xlsx`. The extension is
-//! reserved *first*, before the head is measured, because a name whose extension gets eaten
-//! by the ellipsis is worse than one truncated a few characters earlier.
-//!
-//! Cuts land on cluster boundaries. Cutting between glyphs of one cluster puts half a
-//! Devanagari syllable or a lone combining mark on screen.
-//!
-//! # Placeholder rows
-//!
-//! FR-017 requires a [`LoadState::Stub`] row to render. The renderer MUST NOT read `size`,
-//! `mtime` or `kind` from a stub -- they are undefined, not merely stale -- so a stub draws
-//! its name (which is known) and grey bars where the metadata will go. When the row
-//! upgrades, the bars are replaced in place: same row, same position, no reflow. A
-//! placeholder that shifts the layout when it resolves is worse than one that does not
-//! appear at all, because the user's pointer was already moving toward something.
+//! A [`LoadState::Stub`] row draws its known name and placeholder bars. Its size,
+//! modification time and kind are not read until loading finishes. Placeholder
+//! and loaded rows use the same layout.
 
 use std::sync::Arc;
 
@@ -74,19 +57,11 @@ pub struct Columns {
 }
 
 impl Columns {
-    /// Lay out columns for a viewport width.
+    /// Lay out columns for a viewport width, starting at `x = 0`.
     ///
-    /// Gaps, padding, the rail and the selection inset all come from the space scale
-    /// (UXDD 10.1). Column *widths* deliberately do not: a column is sized by the content
-    /// it must hold -- "999.9 GB", a fixed-width timestamp -- which is a measurement, not a
-    /// spacing decision, and forcing it onto an 8-step scale would either clip content or
-    /// waste the only column users actually read.
-    ///
-    /// The name column absorbs all slack.
-    ///
-    /// Equivalent to [`Columns::for_rect`] at `x = 0`: the list owns the window's left
-    /// edge. Kept because most callers -- and every test about column *widths* -- have no
-    /// opinion about where the surface starts.
+    /// Gaps and padding use the spacing scale. Metadata columns are sized for
+    /// their contents; the name column takes the remaining width.
+    /// See [`Columns::for_rect`] for a positioned entry area.
     pub fn for_width(width: f32, scale: f32, tokens: &Tokens) -> Self {
         Self::for_rect(0.0, width, scale, tokens)
     }
@@ -314,22 +289,10 @@ pub fn format_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS.get(unit).copied().unwrap_or("B"))
 }
 
-/// Unix **seconds** to a fixed-width local-ish timestamp.
+/// Format Unix seconds as a fixed-width timestamp.
 ///
-/// Deliberately not locale-aware and deliberately not `chrono`. M0 needs a *stable*,
-/// fixed-width string so the modified column's width and the golden images are
-/// reproducible; a locale-dependent format would make a reference image captured in one
-/// region fail in another, which is a golden-image suite people learn to ignore.
-///
-/// # The unit is seconds, and it used to be nanoseconds
-///
-/// This took **nanoseconds** while `qs-shell` filled [`RowView::mtime`] in seconds
-/// (`unix_seconds`, from `SystemTime::duration_since`). Nothing connected the two, so every
-/// real file rendered as `1970-01-01 00:00`: 1.7e9 seconds read as nanoseconds is 1.7
-/// seconds past the epoch. Every test passed, because each one fed nanoseconds to a
-/// nanosecond function — the defect lived in the gap between two crates that agreed on a
-/// type and not on a unit, which is the one place a unit test cannot look.
-/// `a_timestamp_from_the_listing_pipeline_is_not_1970` is the test that spans the gap.
+/// The format is independent of locale. Input uses the same seconds unit
+/// as [`RowView::mtime`].
 pub fn format_mtime(unix_seconds: i64) -> String {
     let secs = unix_seconds;
     let days = secs.div_euclid(86_400);
@@ -355,24 +318,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// What the **view** knows about this frame's rows, over and above what the source said.
+/// Per-view state supplied alongside row data.
 ///
-/// Deliberately *not* carried on [`RowView`]. Hover, focus and selection are properties of
-/// the **view**, not of the data: two panes showing the same directory have different
-/// focused rows, and a `RowSource` that had to know about them could not be shared. The
-/// source stays pure data and the view supplies interaction state at draw time.
-/// Borrowed rather than owned, and that is what keeps this `Copy`: a selection is a set
-/// with an allocation behind it, and the renderer takes this by value once per row.
-///
-/// # Why [`SessionMarks`] is in here with the pointer and the keyboard
-///
-/// It is not interaction, and the name is now slightly wider than it reads. It is here
-/// because this is the one per-frame value that reaches **both**
-/// [`ListRenderer::render`] and [`crate::a11y::SemanticTree::for_frame`], and a session mark
-/// has to appear in both: rendered in ink and missing from the accessible name, the folder's
-/// confidence would be a claim made to sighted users only. Every alternative transport — a
-/// field on the renderer, another argument to `render` — reaches exactly one of the two, and
-/// the other then grows a second answer to the same question. See [`crate::mark`].
+/// Hover, focus, selection and session marks are borrowed for the frame.
+/// The same state feeds drawing and accessibility. See [`crate::mark`]
+/// for session indicators.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Interaction<'a> {
     /// Logical corpus index under the pointer.
@@ -388,7 +338,7 @@ pub struct Interaction<'a> {
     /// flags because a row can carry them from the *data* side too. Press is purely a
     /// presentation state with no data counterpart, and what the renderer reads is not its
     /// boolean but its animated intensity, which comes from
-    /// [`InteractionMotion`](crate::motion::InteractionMotion) rather than from here.
+    /// [`InteractionMotion`] rather than from here.
     pub pressed: Option<u64>,
     /// The agent sessions filed under the directories on screen, by corpus index.
     ///
@@ -448,17 +398,10 @@ struct RowType {
     secondary_px: PxSize,
 }
 
-/// A type role resolved against one frame's scale: the face that satisfies its weight, its
-/// physical size, and the vertical metrics needed to place a line.
+/// A type role resolved to a font face, physical size and vertical metrics.
 ///
-/// This is the public counterpart of [`RowType`], and it is a handle rather than a role
-/// *name* for the same reason [`ListRenderer::render`] resolves its two roles once per
-/// frame: the resolution is a font-database question and a metrics parse, and repeating it
-/// per string would put both on the frame path.
-///
-/// It exists so callers outside the row builder -- the diagnostics overlay is the first --
-/// can draw text through the same shaper, cache and atlas as rows. A second text path would
-/// render differently on the CPU tier, which is exactly what RP-2 forbids.
+/// Resolve it once per frame and reuse it for strings drawn through the
+/// list renderer's shaper, cache and atlas.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ResolvedRole {
     size: PxSize,
@@ -469,19 +412,9 @@ pub struct ResolvedRole {
     pub line_height: f32,
 }
 
-/// Where a row's text baseline sits, and how much room is left around it.
+/// Text baseline and the remaining space above and below the glyphs.
 ///
-/// # This type exists so SC-007 can fail
-///
-/// SC-007 is "200% text scale does not clip". The evidence behind it used to be that row
-/// height and font size both double at 200% -- a statement about *proportion*, which stays
-/// true no matter how badly the text overflows its row, because a box twice too small is
-/// still twice as big as a box that was once too small. Nothing compared a glyph's extent
-/// to a row's height, so the criterion was green for a reason unrelated to what it claims.
-///
-/// The two headrooms are that comparison. They are the quantity a clipped descender is a
-/// symptom of, so a test that asserts they stay non-negative can go red for the reason
-/// SC-007 names.
+/// Non-negative headroom means the measured text fits within the row.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct RowTextFit {
     /// Distance from the row's top edge down to the baseline.
@@ -553,28 +486,18 @@ pub struct ListRenderer {
     /// Resolved face per weight class, so a role's weight costs one map lookup rather than
     /// a font-database query per string per frame.
     faces: std::collections::HashMap<u16, FontId>,
-    /// Weight classes this machine can actually satisfy, captured once at construction.
-    ///
-    /// Reported rather than assumed: on a platform whose UI family ships as a variable font
-    /// (macOS) this is a single entry, every role resolves to 400, and the type scale is
-    /// carried by size alone. That is a real degradation and Constitution III says it must
-    /// be visible, not silent.
+    /// Available font-weight classes, recorded when the renderer is created.
     weight_coverage: Vec<u16>,
-    /// Glyphs wanted this frame that the atlas could not supply. Reported, because a
-    /// missing glyph is the SC-006 failure and it must not be invisible in the telemetry.
+    /// Requested glyphs the atlas could not supply this frame.
     pub glyphs_dropped: u32,
     /// Icons wanted this frame that the atlas could not supply. See
     /// [`qs_gpu::frame::DrawStats::icons_dropped`] for why this is not folded into
     /// `glyphs_dropped`.
     pub icons_dropped: u32,
-    /// The vertical metric the last frame's rows were laid out on, or `None` when the face
-    /// had no parseable metrics and the fallback baseline was used.
+    /// Vertical metrics used for the last frame's rows.
     ///
-    /// Diagnostic state, the same kind as `glyphs_dropped`: it reports something about the
-    /// frame that is otherwise invisible once the draw list is flat. SC-007 is why it is
-    /// worth reporting -- a row whose text does not fit is a criterion failure, and without
-    /// this the headroom is a number that exists for one expression inside `render` and is
-    /// then unrecoverable from anything the renderer produces.
+    /// `None` means the face had no readable metrics and a fallback baseline
+    /// was used.
     pub last_text_fit: Option<RowTextFit>,
     icons: IconCache,
     /// Glyph draws this pass could not emit yet, because the atlas did not have the glyph
@@ -826,33 +749,11 @@ impl ListRenderer {
         );
     }
 
-    /// Draw one state icon with its top-left corner at `(x, y)`, in a box of `px` device
-    /// pixels. Returns whether anything was drawn.
+    /// Draw a state icon at `(x, y)` in a square of `px` device pixels.
     ///
-    /// # Why this is the entry point rather than a mark in a string
-    ///
-    /// A session's state used to reach the screen as a codepoint inside a label —
-    /// `qs::terminal::Status::mark`, one of U+25CF, U+25CB, U+25B2 — and that channel is only
-    /// as reliable as the machine's font stack. Its own history says so: the first build of it
-    /// used U+26A0 and drew a notdef box. A [`StateIcon`] is a path this workspace rasterizes,
-    /// so it resolves everywhere, and this is how a surface that is not a row reaches it.
-    ///
-    /// The words stay in the label. A reader using the accessible name needs text, and an icon
-    /// is silent to them — so the two channels carry the same state by different means rather
-    /// than one replacing the other.
-    ///
-    /// # Why it asks the atlas directly and holds no per-frame slot
-    ///
-    /// [`ListRenderer::icon_entry`] caches into [`IconCache`] because the row loop asks for
-    /// the same nine kinds a thousand times a frame. Chrome does not: a tab strip draws one of
-    /// these per tab and the overview one per session, so the handful of atlas lookups cost
-    /// less than a second cache keyed by `(state, px)` would — and that cache would have to be
-    /// keyed by size, because these are drawn at a tab's size, a row's size and the overview's
-    /// size in the same frame.
-    ///
-    /// A refusal is counted in `icons_dropped` exactly as a kind's is, for the same reason: on
-    /// the CPU tier that counter is the upload-budget failure, and a state icon competes for
-    /// the same [`UploadClass::Structural`] bound.
+    /// Returns whether anything was drawn. Vector masks use the structural
+    /// atlas budget, and failed lookups increment `icons_dropped`.
+    /// Provide a text description separately for accessibility.
     pub fn draw_state_icon(
         &mut self,
         list: &mut DrawList,
@@ -988,14 +889,9 @@ impl ListRenderer {
         self.render_rows(list, buf, layout, interaction, motion, true, None);
     }
 
-    /// [`ListRenderer::render`], also describing every painted surface to `scene`.
+    /// Render rows and add their painted surfaces to `scene`.
     ///
-    /// The lit mode's walk (specs/002 T015's second half): the slab is admitted at the same
-    /// call site that paints the material, with the same [`Surface`], so which material a
-    /// row gets is decided exactly once — a re-derivation in the caller is the
-    /// two-descriptions drift scene-handoff rule 1 exists to catch. A separate entry point
-    /// rather than an `Option` on `render`, for the reason `compile_with` is one: every
-    /// existing caller keeps the signature it has.
+    /// The draw list and lighting slabs use the same material and [`Surface`].
     pub fn render_lit(
         &mut self,
         list: &mut DrawList,
@@ -1561,33 +1457,12 @@ impl ListRenderer {
         );
     }
 
-    /// Draw the selection regions and their status rails.
+    /// Draw selection regions and their status rails.
     ///
-    /// # Two paths, because a morph is a single-selection idea
-    ///
-    /// One selected row is drawn through [`InteractionMotion`], which slides a single region
-    /// between the row it left and the row it arrived at -- UXDD §10.3's geometry morph, and
-    /// the thing that makes arrowing through a list read as one object moving rather than as
-    /// a light switching off and another on.
-    ///
-    /// Several selected rows are several regions, and there is no coherent "the region" to
-    /// move. Asking the morph to represent them would mean picking one row to animate and
-    /// leaving the rest to appear instantly, which reads as a bug. So a multiple selection
-    /// draws its rows directly and the morph sits out the frame --
-    /// [`Selection::morph_target`] is what keeps the two from both drawing the same row.
-    ///
-    /// # The halo is a separate pass, and it has to be
-    ///
-    /// Every selected row's glow reaches a falloff past its own band, so a loop that emitted
-    /// glow-then-fill per row would paint row N+1's halo over row N's *fill* -- a bright
-    /// accent band across the bottom of every selected row but the last, which looks like a
-    /// rendering bug rather than like a glow. All the halos go down first, then all the
-    /// fills, and the two passes iterate the same runs rather than collecting a `Vec` the
-    /// steady-state frame is not allowed to allocate.
-    ///
-    /// Which layers bleed is the *material's* answer rather than this function's --
-    /// [`material::Pass`] -- so a look that later grows a second reaching layer does not
-    /// need this loop rewritten.
+    /// A single selection uses [`InteractionMotion`]. Multiple selections
+    /// draw their regions directly. All halos are drawn before any fills,
+    /// preventing one row's glow from painting over a neighboring selection.
+    /// [`material::Pass`] classifies the layers.
     #[allow(clippy::too_many_arguments)]
     fn draw_selection(
         &mut self,
@@ -1683,32 +1558,11 @@ impl ListRenderer {
         );
     }
 
-    /// State the focus lamp on the scene, or leave it absent when nothing has focus (T062).
+    /// Set the scene's focus lamp, or leave it absent when nothing has focus.
     ///
-    /// # The lamp reads the same region the focus ring is painted on
-    ///
-    /// [`StateRegion`] owns where a row's state is drawn, and the lamp takes its position from
-    /// exactly that rectangle rather than rebuilding one. A lamp positioned from a second
-    /// description of the same row would drift from the ring by whatever the two disagreed
-    /// about, and a light that is not quite over the thing it is finding is worse than no
-    /// light: the user's eye goes to the brightest place and the ring is somewhere else.
-    ///
-    /// # The height is measured from the canvas, not from the focused row
-    ///
-    /// A row's elevation is a property of *that row*; how the room is lit is a property of the
-    /// room. Hanging the lamp a fixed distance over whatever the focused row happens to be
-    /// made of would make the whole window's shadows shift when a row gained a step, which
-    /// reads as the lighting flickering as the keyboard moves between differently-elevated
-    /// rows.
-    ///
-    /// # Mid-travel, and off-screen
-    ///
-    /// The lamp's slot may be fractional (it is travelling) and may be outside the viewport
-    /// entirely (focus scrolled away). Both are fine and neither is culled: a light outside
-    /// the frame still lights what is inside it, which is the difference between a light and a
-    /// slab. The arithmetic stays relative to the first visible row for
-    /// [`ViewportLayout::row_top`]'s reason -- row 999,999's absolute offset does not survive
-    /// an `f32`.
+    /// The lamp uses the focus ring's rectangle. Height is measured from the
+    /// canvas. Fractional and offscreen positions remain valid during travel;
+    /// position calculations stay relative to the first visible row.
     fn set_focus_lamp(
         &self,
         scene: &mut crate::scene::SceneBuilder,
@@ -1735,15 +1589,10 @@ impl ListRenderer {
         )));
     }
 
-    /// One pass of one selected row, at a surface-relative `top`.
+    /// Draw one pass of a selected row at a surface-relative `top`.
     ///
-    /// The halo is under the fill because that is the order the material declares its layers
-    /// in, and it matters: a glow is solid inside its own shape, so a halo on top of the
-    /// selected fill would deepen the row's background by whatever the accent contributes and
-    /// quietly cost the secondary and tertiary text the 4.5:1 their token is authored to
-    /// preserve. That used to be a rule this comment asserted and no gate could see; the
-    /// material's `over`/`text` declaration is what turned it into a check -- see
-    /// [`crate::material::Material::composites`].
+    /// The material places its halo below the fill. Contrast checks evaluate
+    /// the resulting stack through [`crate::material::Material::composites`].
     #[allow(clippy::too_many_arguments)]
     fn push_selection(
         &self,
@@ -1968,27 +1817,11 @@ impl ListRenderer {
         entry
     }
 
-    /// Badge an icon with the file's extension, on a ribbon knocked out of its bottom-right.
+    /// Draw an extension ribbon at the icon's bottom-right corner.
     ///
-    /// # Why the ribbon is not inside the silhouette
-    ///
-    /// UXDD §10.4 says the extension is "shown in the icon", which in Windows and Finder means
-    /// text on the face of a page — those shells can do that because their generic document
-    /// icon *is* a page. Seven of `qs_gpu::icon`'s nine silhouettes have no interior to write
-    /// in: `Code` is `</>` with no container, `Text` is four bare rules, and `Document`,
-    /// `Image`, `Config` and `Data` all fill their own interiors with their own marks. So the
-    /// badge knocks a well out of the icon instead, the same move `Emblem::Plate` makes.
-    ///
-    /// # Why it is a Rect and not an emblem
-    ///
-    /// An emblem is a `px * px` square by construction — `rasterize` produces a square mask and
-    /// `IconKey` carries one dimension — and a ribbon is wide and short. `Instance::rect`
-    /// already carries a corner radius and already renders on all three tiers, and it costs no
-    /// atlas entry: this whole function adds nothing to the icon half of the atlas.
-    ///
-    /// Returns without drawing anything at all when the badge would not read: no extension, an
-    /// icon too small to carry one, or text too wide for the space left beside the emblem's
-    /// corner. Never a clipped ribbon — "the badge is present" has to stay a reliable signal.
+    /// The ribbon uses a rounded rectangle without an extra atlas entry.
+    /// It is omitted if the extension is missing, the icon is too small,
+    /// or the label cannot fit beside the emblem.
     #[allow(clippy::too_many_arguments)]
     fn draw_extension_badge(
         &mut self,
@@ -2452,14 +2285,10 @@ impl ListRenderer {
     }
 }
 
-/// The grid's cell geometry, derived from one continuously variable size.
+/// Grid geometry derived from a continuous logical cell size.
 ///
-/// UXDD §5.1 says the size is scalable "with no fixed steps", so everything here is a
-/// function of `cell_logical` rather than a lookup into a table of sizes. The one place the
-/// continuity genuinely stops is [`GridMetrics::icon_px`], because the icon rasterizer has
-/// a hard ceiling: past `qs_gpu::icon::MAX_PX` the cell keeps growing and the glyph does
-/// not. That is a real limit of the icon path rather than of the grid, and it is clamped
-/// here where it is visible instead of failing to rasterize later.
+/// The icon size is capped at the rasterizer's maximum even when the
+/// cell grows beyond it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GridMetrics {
     /// The requested cell width in logical pixels, before it is stretched to fill.
@@ -2478,16 +2307,9 @@ pub struct GridMetrics {
 /// Fraction of the cell width the icon box occupies. The rest is padding and the label.
 const ICON_BOX_FRACTION: f32 = 0.55;
 
-/// How many times the extension badge's own height the icon box must be before the badge is
-/// drawn at all (UXDD §10.4, "the extension shown in the icon at ≥ 32 px").
+/// Minimum icon height as a multiple of extension-badge height.
 ///
-/// A *ratio*, not the literal 32, for two reasons. It derives UXDD's number rather than
-/// copying it: `ui/xs` is 11 px, so the ribbon is about 13 logical px tall and the threshold
-/// lands at roughly 32.5 — which is presumably where 32 came from. And because both sides of
-/// the comparison are physical pixels, the device scale cancels, so the threshold is the same
-/// 32 *logical* px on every display, while a user who turns text scale up correctly needs a
-/// bigger icon before a bigger badge will fit. Anyone tempted to divide one side by `scale`
-/// should read this twice.
+/// Using a ratio makes the threshold follow device scale and text size.
 const BADGE_ICON_RATIO: f32 = 2.5;
 
 /// The gap between the emblem's reserved corner and the badge, as a fraction of the icon box.
@@ -2658,30 +2480,12 @@ fn fade_on(color: Srgba, hidden: bool, lit: bool) -> Srgba {
     }
 }
 
-/// Which icon a row gets.
+/// Choose the icon for a row.
 ///
-/// Two rules, in order.
-///
-/// `IS_DIR` wins over `kind` unconditionally. A source that reports a directory whose name
-/// ends in `.rs` is describing a directory, and drawing it as source code would be a lie
-/// about what activating the row does.
-///
-/// A [`LoadState::Stub`] never reaches the kind table at all: the [`RowSource`] contract
-/// says `kind` is *undefined* on a stub, not stale, and only `name` and `IS_DIR` are
-/// readable. So a stub is a folder or a generic file and nothing else -- which is also the
-/// honest picture, because that is genuinely all that is known about it yet.
-///
-/// The numeric table mirrors `qs_bench::gen::kind_of_extension`, M0's stand-in for a type
-/// resolver. It is written out rather than imported because `qs-ui` must not depend on the
-/// bench crate, and because M1 replaces the *producer* of these ids, not this consumer:
-/// `KindId -> IconKind` is the mapping that survives, whoever assigns the `KindId`.
-///
-/// [`RowSource`]: crate::row_source::RowSource
-/// **Public because the multi-selection histogram counts the same kinds the icons draw.**
-/// A chart with its own `match row.kind.0` would be a second answer to one question, and it
-/// fails quietly: a folder counted as `Generic` in the chart while the list draws it as a
-/// folder looks plausible from either side. Promoting this was `inspector-metadata`'s first
-/// move for exactly that reason.
+/// Directories always get a folder icon. A [`LoadState::Stub`] uses only
+/// its name and directory flag; its kind is not yet valid. Loaded files
+/// use the `KindId` mapping. Applications can reuse this function when
+/// grouping rows by the displayed icon kind.
 #[must_use]
 pub fn kind_of(row: &RowView) -> IconKind {
     if row.flags.contains(RowFlags::IS_DIR) {
@@ -2703,17 +2507,7 @@ pub fn kind_of(row: &RowView) -> IconKind {
     }
 }
 
-/// What colour a row's icon is drawn in.
-///
-/// One function, called by both views, for the reason `kind_of` is one function: a folder
-/// that is amber in List and blue in Grid is two answers to one question.
-///
-/// Folders get `icon/folder`. They used to get `border/focus`, which was a token -- so it
-/// satisfied "not a literal" -- but the wrong one: `border/focus` is declared `role: border`
-/// and every contrast pair it appears in is `kind: boundary`, so the gate was holding a
-/// filled glyph to a focus ring's requirement and passing by coincidence. It also put the
-/// folder tint and the focus ring on the same colour, which is worst on the one row that most
-/// needs its ring seen.
+/// Icon tint used in both list and grid views. Folders use `icon/folder`.
 fn icon_tint(tokens: &Tokens, row: &RowView) -> Srgba {
     if row.flags.contains(RowFlags::IS_DIR) {
         tokens.color("icon/folder")

@@ -1,20 +1,9 @@
-//! Render the icon set with and without the symlink emblem, in both themes, and write a PNG.
+//! Save the icon set with and without symlink emblems in both themes.
 //!
 //! `cargo run -p qs-gpu --example emblem_strip -- out.png`
 //!
-//! chunk:icon-emblems criterion 1 is "distinguishable at 20 px, judged by looking rather than
-//! by asserting a draw count", and this is the looking. It exists because the first attempt
-//! passed every test in the crate while being wrong: at `EMBLEM_FRACTION` 0.5 the emblem ate
-//! the left bracket off `Code` and two rules off `Text`, so a symlinked source file was no
-//! longer identifiable as a source file. No assertion in this repository could have caught
-//! that, and none was added afterwards -- the constant carries the finding instead.
-//!
-//! # What this is not
-//!
-//! It rasterizes icon masks and composites them by hand. It is **not** the draw-list snapshot
-//! affordance: rendering a `DrawList` through `CpuRasterizer` to something a person can open
-//! is chunk:cpu-raster-snapshots, and this deliberately does not pre-empt its design. It is
-//! also not a gate -- nothing here asserts anything, by intent.
+//! This example rasterizes and composites the icon masks directly for visual
+//! inspection at their intended size.
 
 // A developer tool that renders a picture and exits. The crate's production lints are about
 // code that runs inside a frame: an out-of-range pixmap or an unwritable path here should stop

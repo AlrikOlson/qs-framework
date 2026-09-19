@@ -1,30 +1,11 @@
-//! Scroll state, fling integration, and viewport rebasing.
+//! Scroll offsets, fling integration and viewport-relative coordinates.
 //!
-//! # `f64` is load-bearing, and this is the one file where that is true
+//! Content offsets use `f64`: a million 28-pixel rows exceed the range where
+//! `f32` can represent each pixel. Positions are rebased against the viewport
+//! before conversion to `f32` for rendering.
 //!
-//! Research R5, restated because it is the single most likely source of a silent,
-//! hard-to-diagnose visual bug in this milestone:
-//!
-//! > `f32` represents integers exactly only to 2²⁴ = 16,777,216; a 1M-row list at 28 px is
-//! > 28,000,000 content pixels, where `f32` ULP is 2 px. Sub-pixel scrolling in `f32` at
-//! > the bottom of the corpus is not imprecise, it is visibly wrong.
-//!
-//! So: [`ScrollState::offset`] is `f64` in content space, and row positions are **rebased
-//! against the viewport origin on the CPU** before being narrowed to `f32` for the shader.
-//! After rebasing, every value is within a viewport height of zero -- a few thousand at
-//! most -- where `f32` has better than 1/1000 px precision. The narrowing is safe *because*
-//! of the rebasing, not despite it.
-//!
-//! The failure this prevents appears nowhere except the very bottom of a very long list,
-//! which is exactly the place a manual test never reaches.
-//!
-//! # The clamp is applied before the integrator writes
-//!
-//! The data model requires it, and the reason is worth keeping next to the code: if the
-//! fling integrator writes an out-of-range offset and the clamp runs afterwards, the
-//! velocity is never told it hit a wall. The next frame integrates from the clamped
-//! position with the old velocity, overshoots again, and the list oscillates at the end
-//! stop instead of settling.
+//! The fling integrator handles the scroll bounds before storing its next
+//! offset, so motion settles when it reaches either end of the list.
 
 use crate::fenwick::Heights;
 
@@ -36,9 +17,7 @@ pub struct FlingParams {
     /// Fraction of velocity retained per second. 0.001 means "1/1000 after one second",
     /// which reads as a firm, quick stop.
     pub friction: f64,
-    /// Below this speed (physical px/s) the fling is over. Without a floor, a fling
-    /// asymptotes forever and the frame loop never goes idle -- which is an SC-003 failure,
-    /// not merely an aesthetic one.
+    /// Speed below which a fling stops, in physical pixels per second.
     pub stop_speed: f64,
     /// Maximum speed, to stop a pathological input event from crossing the whole corpus.
     pub max_speed: f64,
@@ -180,9 +159,6 @@ impl ScrollState {
     }
 
     /// Reposition after the content height changes, keeping `anchor` in view.
-    ///
-    /// M1's directory enumeration streams, so `len()` grows while the user scrolls (RC-4).
-    /// Without this the view would drift as rows appear above it.
     pub fn rebase_for_content_change(
         &mut self,
         anchor_index: u64,
@@ -227,12 +203,9 @@ impl VisibleRange {
     }
 }
 
-/// Which rows are visible, and how far the first one is scrolled off the top.
+/// Visible row range and the clipped portion of its first row.
 ///
-/// The `+ 2` in the count bound is FR-002's definition of "virtualized": one extra row for
-/// the partially-visible one at the top, one for the partially-visible one at the bottom.
-/// A regression here silently destroys SC-001, which is why the recycler asserts it in
-/// debug builds rather than trusting this function.
+/// The count allows an extra row at each edge for partial visibility.
 pub fn visible_range(
     offset: f64,
     viewport_height: u32,
@@ -280,16 +253,10 @@ pub fn visible_range(
     (VisibleRange { first, count }, within)
 }
 
-/// Rebase a content-space position into viewport space and narrow to `f32`.
+/// Convert a content position to viewport-relative `f32` coordinates.
 ///
-/// **This is the function research R5 is about.** Every row position handed to the shader
-/// goes through here. The subtraction happens in `f64`, where it is exact for any offset
-/// this application can reach; the result is within a viewport height of zero, where `f32`
-/// has better than a thousandth of a pixel of precision.
-///
-/// Narrowing first and subtracting afterwards -- the obvious refactor -- reintroduces
-/// exactly the bug this exists to prevent, and it would only show at the bottom of a
-/// million-row list.
+/// Subtraction happens in `f64` before narrowing. Reversing that order
+/// loses subpixel precision near the end of a long list.
 #[inline]
 pub fn rebase_to_viewport(content_y: f64, scroll_offset: f64) -> f32 {
     (content_y - scroll_offset) as f32

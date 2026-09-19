@@ -1,23 +1,8 @@
-//! Building the scene the lighting pass reads, from the materials the draw list is already built
-//! from.
+//! Lighting scenes built alongside draw lists.
 //!
-//! # One source, two descriptions
-//!
-//! A surface is described twice: once as instances for the raster path, once as a slab for the
-//! lighting pass. Both come from the same [`crate::material::Material`] and [`crate::Surface`]
-//! pair, which is what makes the two descriptions agree *by construction* rather than by care.
-//!
-//! `specs/002-ray-traced-mode/contracts/scene-handoff.md` states the rule: a slab's rect and radius
-//! equal the corresponding instance's exactly, not within a tolerance. A slab that disagrees casts
-//! a shadow from a shape nobody can see, and the symptom shows up in the lit path while the cause
-//! is a disagreement between two descriptions of one thing — which is a genuinely hard bug to
-//! attribute and a trivial one to prevent.
-//!
-//! # Bounded by the viewport, not by the folder
-//!
-//! Virtualization already solved the hard part: a million-row folder puts the same few dozen
-//! surfaces on screen as a ten-row one. The scene is built from that same visible set, widened by
-//! [`max_reach`] so a surface just off-screen still casts into it.
+//! Slabs and drawing instances come from the same material and surface, so their
+//! rectangles and radii agree. The scene contains the visible rows plus the
+//! margin required by [`crate::scene::max_reach`] for shadows from nearby surfaces.
 
 use crate::material::{Material, Surface};
 use crate::tokens::FocusLightTokens;
@@ -57,7 +42,7 @@ pub fn occupies_scene(material: &Material) -> bool {
 /// How far a shadow travels per unit of caster height, for the key light's direction.
 ///
 /// The horizontal run over the vertical drop: a light straight overhead (`z` dominant)
-/// throws almost nothing sideways, a grazing light throws far. This is [`max_reach`]'s
+/// throws almost nothing sideways, a grazing light throws far. This is [`crate::scene::max_reach`]'s
 /// second input, derived from the rig rather than kept as a constant beside it.
 #[must_use]
 pub fn grazing(direction: [f32; 3]) -> f32 {
@@ -67,25 +52,11 @@ pub fn grazing(direction: [f32; 3]) -> f32 {
     run / direction[2].abs().max(0.05)
 }
 
-/// The focus lamp, hanging over the surface that has keyboard focus (T062).
+/// Build a focus lamp over the focused region.
 ///
-/// `rect` is the focused region's rect and `elevation` its top face, both in physical pixels
-/// and both taken from the surface that was actually painted — the same shared-origin rule
-/// [`SceneBuilder::add`] follows, for the same reason. A lamp positioned from a rectangle
-/// rebuilt here would drift from the focus ring, and a light that is not quite over the thing
-/// it is finding is worse than no light at all.
-///
-/// `gain` is [`crate::motion::InteractionMotion::focus_light_gain`]: the lamp coming up or
-/// going out. It scales **both** strengths, so a lamp at zero gain is arithmetically absent
-/// rather than present-but-dark — which is what makes the mode's two identity cases (no focus,
-/// and focus that has not arrived yet) the same arithmetic instead of two branches.
-///
-/// # Why the lamp is the row's whole rect and not a point on it
-///
-/// A bulb over a 790 px row lights its middle third: the ends of the focused row stay dark and
-/// the result reads as a blob sitting on the list rather than as the row being lit. Measured on
-/// the shipped list before this was a rect. It also avoids having to choose a point, and every
-/// choice available encodes a reading direction that is wrong in a right-to-left locale.
+/// `rect` and `elevation` come from the painted surface in physical pixels.
+/// `gain` scales both strengths; zero has no lighting contribution.
+/// The lamp covers the row's rectangle rather than a single point.
 #[must_use]
 pub fn focus_light(
     rect: [f32; 4],
@@ -119,7 +90,7 @@ pub struct SceneBuilder {
     scene: SceneList,
     /// `[w, h]`, physical pixels.
     viewport: [f32; 2],
-    /// Physical pixels. See [`max_reach`].
+    /// Physical pixels. See [`crate::scene::max_reach`].
     margin: f32,
 }
 

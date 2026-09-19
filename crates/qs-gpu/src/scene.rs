@@ -1,36 +1,11 @@
-//! The interface as the lighting pass sees it: rounded slabs at elevations, under a fixed
-//! square-on camera.
+//! Scene geometry for the lighting pass.
 //!
-//! # Why this is not on `Instance`
+//! Surfaces are rounded slabs with elevations, viewed by a fixed orthographic
+//! camera. Their rectangles and radii must match the corresponding draw-list
+//! instances.
 //!
-//! The raster path never reads an elevation. Only the lighting pass does. Putting one on the
-//! instance would spend the last field with room — the spare bits of [`crate::frame::Instance::kind`]
-//! — on a consumer that does not exist, and would force every `kind ==` comparison to mask in
-//! three places that must agree with each other: `shaders/instance.wgsl`,
-//! `cpu_raster::draw_instance`, and the `tier_parity` transcription. It would also break the
-//! set-equality test that parses `KIND_` constants out of the shader.
-//!
-//! Keeping the scene separate also makes the mode's cost structural rather than careful. With the
-//! mode off no scene is published, so there is nothing to skip and no branch to get wrong. See
-//! `specs/002-ray-traced-mode/research.md` R1.
-//!
-//! # The contract
-//!
-//! `specs/002-ray-traced-mode/contracts/scene-handoff.md` states six rules. Three of them are the
-//! reason this module exists at all:
-//!
-//! - **The scene agrees with the draw list.** A slab's rect and radius equal the instance's
-//!   *exactly*. A slab that disagrees casts a shadow from a shape nobody can see, and the symptom
-//!   appears in the lit path while the cause is a disagreement between two descriptions of one
-//!   thing. Both are built from the same `Material`/`Surface` pair, so agreement is achievable by
-//!   construction and any difference is a mistake rather than a rounding.
-//! - **Absent is not empty.** With the mode off a frame carries *no* scene. An empty scene means
-//!   the interface has nothing in it, which is a bug worth finding; collapsing the two makes the
-//!   first undiagnosable.
-//! - **One generation, one interface.** A scene carries the generation of the draw list it belongs
-//!   to and a mismatched pair is refused, or a dropped frame on one side would light this frame's
-//!   geometry with the last frame's shadows — which reads as latency and is nearly impossible to
-//!   attribute.
+//! A frame carries no scene when lighting is disabled. When lighting is enabled,
+//! the scene and draw list share a generation; mismatched pairs are rejected.
 
 use crate::color::Srgba;
 
@@ -103,16 +78,10 @@ impl Slab {
     }
 }
 
-/// The key light. Infinitely far away, so only its direction matters.
+/// A directional key light.
 ///
-/// # Why the focus lamp is not this type with a flag
-///
-/// It started as one: a `LightKind` enum with `Directional` and `Positional`, and a `vector`
-/// field that meant a direction for one and a position for the other. That is the shape this
-/// module's own comment warned against — "collapsing them into one type with unused fields is
-/// how a light ends up half-configured" — and US3 proved the warning right the moment the lamp
-/// needed [`FocusLamp::ambient`], a number that has no meaning at all for a light with no
-/// position. Two types, so neither can be built wrong.
+/// Its direction is independent of position. Positional lighting uses
+/// [`FocusLamp`].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Light {
     /// Direction *toward* the light, normalized at use.
@@ -126,28 +95,19 @@ pub struct Light {
     pub size: f32,
 }
 
-/// The focus lamp: a positional light over whatever has keyboard focus (US3).
+/// A positional light over the item with keyboard focus.
 ///
-/// No direction, because a positional light has none. No colour, because it contributes
-/// **attenuation only** and attenuation is a colourless multiply — the focused row is a text
-/// ground whose `addition_max` is zero, so lighting it by adding to it is forbidden by
-/// lit-contrast rule 1a, and what the lamp changes is the room around it.
+/// It changes attenuation without adding color to the focused row's background.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct FocusLamp {
-    /// The focused row's own rect, `[x, y, w, h]`, physical pixels. A **strip**, not a point.
-    ///
-    /// A bulb over a 790 px row lights its middle third and leaves the ends dark, which reads
-    /// as a blob rather than as the row being lit — measured on the shipped list before this
-    /// was a rect. `bounce` learned the same thing one light earlier and its comment states it:
-    /// the nearest point on the emitter is what the receiver sees.
+    /// Focused row bounds as `[x, y, width, height]` in physical pixels.
     pub rect: [f32; 4],
     /// How high the strip hangs above the canvas, physical pixels.
     pub height: f32,
     /// Angular size in degrees, as [`Light::size`].
     pub size: f32,
-    /// How much of the shading directly beneath it the lamp's own shadow ray owns, against the
-    /// key light's. Zero is the identity: the pass is then arithmetically what it was before
-    /// US3.
+    /// Weight of the lamp's shadow ray relative to the key light beneath it.
+    /// Zero leaves the key light's result unchanged.
     pub share: f32,
     /// How far the room dims at the edge of the lamp's reach.
     ///
@@ -157,10 +117,9 @@ pub struct FocusLamp {
     pub ambient: f32,
 }
 
-/// The surroundings a lit surface reflects. Two stops of an infinite sky.
+/// Horizon and zenith colors of the reflected environment.
 ///
-/// Both come from the palette, so the room changes with the theme. Authoring them in the renderer
-/// would be a second place colour is decided, which Principle VII forbids.
+/// The caller supplies both colors from its theme.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Environment {
     pub horizon: Srgba,

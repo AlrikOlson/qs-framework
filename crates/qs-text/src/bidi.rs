@@ -1,23 +1,8 @@
-//! Bidirectional resolution, with each name treated as its own isolated paragraph.
+//! Bidirectional text resolution for individual names.
 //!
-//! # This is a security control, not only a correctness one
-//!
-//! SDD §11 lists filename spoofing as a threat, and the bidi override attack is its
-//! sharpest form: a name containing U+202E RIGHT-TO-LEFT OVERRIDE renders
-//! `invoice\u{202E}cod.exe` as `invoiceexe.doc`, which is a real technique with real
-//! victims. Two defences are applied here, and neither is optional:
-//!
-//! 1. **Isolation.** Every name is resolved as its own paragraph with an explicit base
-//!    direction. A directional control inside one name cannot escape it and reorder the
-//!    size column, the next row, or the rest of the UI.
-//! 2. **Disclosure.** [`ResolvedText::has_directional_override`] reports whether the name
-//!    contained an override or embedding control at all. The row renderer uses it to mark
-//!    the name, because silently rendering a reordered filename as though it were ordinary
-//!    is the outcome the attack depends on. Constitution III: reduced trust is never silent.
-//!
-//! Stripping the controls outright was considered and rejected -- it would corrupt
-//! legitimate Hebrew and Arabic names, which is a real cost paid by real users to defend
-//! against a threat that isolation already contains.
+//! Each name is resolved as a separate paragraph so its direction controls cannot
+//! reorder nearby columns or rows. [`ResolvedText::has_directional_override`]
+//! reports embedding and override controls for the renderer to disclose.
 
 use std::ops::Range;
 

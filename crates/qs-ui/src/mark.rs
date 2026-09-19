@@ -1,33 +1,11 @@
-//! What the application knows about a row that the [`RowSource`] does not.
+//! Application-provided session indicators for rows.
 //!
-//! Today that is one thing: a directory row can have agent sessions filed under it, and the
-//! list says so. The type is deliberately narrow — a count, a confidence and a token name —
-//! because of where the boundary is.
+//! Marks carry a count, confidence and token name. The application resolves its
+//! session state before passing a mark to the list.
 //!
-//! # This crate does not learn what a session is, and that is the whole of the design
+//! Marks travel through [`Interaction`] to both rendering and accessibility,
+//! so the visible indicator and accessible name use the same state.
 //!
-//! `qs-ui` depends on `qs-gpu`, `qs-text` and `accesskit`. It does not depend on `qs-term`,
-//! so [`qs_term::lifecycle::Lifecycle`] is not nameable here and must not become nameable:
-//! the crate docs' boundary is that nothing below this crate knows what a file is and nothing
-//! above it knows what a glyph is, and "what a shell is doing" is squarely above.
-//!
-//! So the mark carries what `crate::terminal::Status` already carries one surface up — a
-//! **token name** rather than a colour, and the resolved state rather than the state machine.
-//! The mapping from a lifecycle to a rail is made exactly once, in `qs`, and both the terminal
-//! pane and this indicator read that one answer. A `Lifecycle` copied into this crate would be
-//! a second mapping, and the two would drift the first time a state was added.
-//!
-//! # Marks travel on [`Interaction`], and that is not an accident of convenience
-//!
-//! [`Interaction`] is the one per-frame value that reaches **both**
-//! [`ListRenderer::render`](crate::row::ListRenderer::render) and
-//! [`SemanticTree::for_frame`](crate::a11y::SemanticTree::for_frame). The indicator has to
-//! appear in both: a confidence rendered in ink and absent from the accessible name is a claim
-//! made to sighted users only, which is the half-published state ADR 014 refuses. Any other
-//! transport — a field on the renderer, an argument to `render` — reaches one consumer, and
-//! the second channel then gets an answer of its own.
-//!
-//! [`RowSource`]: crate::row_source::RowSource
 //! [`Interaction`]: crate::row::Interaction
 
 /// The sessions filed under one directory, as a row is allowed to state them.

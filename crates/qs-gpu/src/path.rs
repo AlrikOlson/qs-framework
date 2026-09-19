@@ -1,22 +1,10 @@
-//! Rendering tiers: choosing one, surviving a crash in one, and getting un-stuck.
+//! Rendering-tier selection and recovery from initialization crashes.
 //!
-//! Implements [`contracts/render-path.md`]. SDD R1 names GPU driver variance as the top
-//! technical risk; everything here is its mitigation.
+//! [`CrashCounter::begin_attempt`] persists the attempt count before device
+//! creation starts, so a crash during initialization is counted on the next run.
 //!
-//! # The ordering is the whole contract
-//!
-//! > read attempt_counter for the tier about to be initialized
-//! > increment and **PERSIST** it  ◄── before the risky work, not after
-//!
-//! A counter written after successful initialization cannot observe a crash *during*
-//! initialization, and a driver that faults inside device creation is precisely the failure
-//! being defended against. [`CrashCounter::begin_attempt`] therefore flushes to disk before
-//! returning, and the caller must not create a device until it has.
-//!
-//! # Resolution order: forced → pinned → probe
-//!
-//! Forced beats pinned so a user whose driver got fixed can have their GPU back. Pinned
-//! beats probe so a crash loop terminates instead of probing into the same fault forever.
+//! Selection checks a forced tier first, then a pinned tier, then the capability
+//! probe. A forced choice lets users retry a tier after fixing a driver problem.
 
 use std::fmt;
 use std::fs;
@@ -81,12 +69,9 @@ impl fmt::Display for RenderPath {
     }
 }
 
-/// Why the running tier is the running tier.
+/// Reason for selecting the current rendering tier.
 ///
-/// RP-6 requires this to be visible to the user and recorded in every bench report.
-/// Constitution III: reduced capability is never silent, and "silent" includes "shown
-/// without saying why", because a user who cannot tell a deliberate choice from a
-/// fallback cannot act on either.
+/// Applications can display it to explain a forced choice or fallback.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PathReason {
     /// `--force-render-path`, or configuration.
@@ -133,14 +118,10 @@ pub trait RenderPathSelector {
     fn pinned(&self) -> Option<RenderPath>;
 }
 
-/// The tier `QS_FORCE_TIER` names, if the variable is set and parseable.
+/// Parse the `QS_FORCE_TIER` environment variable.
 ///
-/// A test seam (tasks.md T008): the parity suites and the boot proofs need to put the
-/// application on *any* tier without a dialog or a flag threading through a harness. It is
-/// consulted by the application's selector **after** `--force-render-path`, so a command
-/// line is never silently overridden by a variable a shell exported an hour ago. An
-/// unparseable value is `None` rather than an error, for the reason `RenderPath::parse`
-/// already gives: a typo in an env var must not stop the application starting.
+/// Returns `None` if the variable is absent or invalid. Applications should
+/// give an explicit command-line choice precedence over this value.
 #[must_use]
 pub fn forced_from_env() -> Option<RenderPath> {
     std::env::var("QS_FORCE_TIER")
@@ -176,12 +157,6 @@ pub fn resolve(selector: &dyn RenderPathSelector) -> Resolution {
 }
 
 /// The conventional per-user state directory for this platform.
-///
-/// One function rather than one per thing that persists. SDD §13 gives this directory a
-/// SQLite store eventually; until then the two small files that live here (the crash counter
-/// and the window's split) at least agree about *where* here is — two functions deriving the
-/// platform directory separately is the drift that puts a user's state in two places, and
-/// only one of them gets migrated.
 #[must_use]
 pub fn state_dir() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
@@ -331,8 +306,7 @@ impl CrashCounter {
         }
     }
 
-    /// Forget everything. Exposed so `--force-render-path` can clear a pin the user has
-    /// decided is stale (RP-4).
+    /// Clear the attempt count and pinned tier.
     pub fn reset(&self) {
         let _ = fs::remove_file(&self.file);
     }
@@ -340,17 +314,12 @@ impl CrashCounter {
 
 // -- the lit mode's own attempt counter (T023, FR-020) --------------------------------
 
-/// Persisted attempt counter for the lit mode's risky initialisation.
+/// Persisted attempt counter for lighting initialization.
 ///
-/// Turning the lit mode on allocates targets and, when US1 lands, compiles a lighting
-/// pipeline — a second risky initialisation with the same failure mode as startup: a driver
-/// that faults there kills the process before any code after it runs. The discipline is
-/// therefore [`CrashCounter`]'s, deliberately copied rather than shared: **persist before
-/// attempting**, clear on the first lit frame that renders, and once the threshold is
-/// reached pin the mode *off* — permanently and reported, never silently. A separate file
-/// rather than a second key in `render-path.state`, because the two counters demote
-/// different things: one moves the tier, the other refuses a mode, and a torn write must
-/// not be able to damage both at once.
+/// Persist before allocating targets or compiling the pipeline, then clear
+/// the counter after the first successful lit frame. Repeated failures pin
+/// lighting off. A separate file keeps this state independent of rendering-tier
+/// recovery.
 #[derive(Clone, Debug)]
 pub struct LitCounter {
     file: PathBuf,
@@ -388,10 +357,7 @@ impl LitCounter {
             .unwrap_or(0)
     }
 
-    /// Whether previous faults have pinned the mode off.
-    ///
-    /// The caller reports the pin rather than silently ignoring the toggle — Constitution
-    /// III: reduced capability is never silent.
+    /// Whether repeated initialization failures have disabled lighting.
     #[must_use]
     pub fn pinned_off(&self) -> bool {
         self.attempts() >= DEMOTION_THRESHOLD

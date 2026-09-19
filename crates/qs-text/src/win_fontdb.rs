@@ -1,9 +1,7 @@
-//! Windows font locations and fallback ordering.
+//! Windows font directories and fallback preferences.
 //!
-//! The ordering below is the part of DirectWrite's behaviour that actually matters for
-//! SC-006 -- when Segoe UI lacks a codepoint, which face does Windows reach for? These
-//! lists encode that answer as data. See the [`crate::fontdb`] module docs for why this
-//! is a directory scan rather than an `IDWriteFontFallback` binding.
+//! The tables list the preferred UI, monospaced and script-specific fonts.
+//! See [`crate::fontdb`] for the lookup behavior.
 
 use std::path::PathBuf;
 

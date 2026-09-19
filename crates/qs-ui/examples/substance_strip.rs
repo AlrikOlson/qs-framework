@@ -1,35 +1,9 @@
-//! Does a fact encoded in a material actually read? Both themes, real shader, real adapter.
+//! Save row-material comparisons using the GPU renderer.
 //!
 //! `cargo run -p qs-ui --example substance_strip -- out.png`
 //!
-//! # The question this exists to answer
-//!
-//! `crates/qs-ui/src/substance.rs` puts three facts into a row's surface: time since modified
-//! into roughness, size into the bevel, permission into the environment. Every one of them is
-//! a [`qs_gpu::frame::Fidelity::Enhanced`] shading input, so `material_strip` cannot show any
-//! of it — `Instance::cpu_floor` drops the whole primitive before `tiny-skia` sees it, and
-//! what survives is the flat albedo, which is identical for every row by construction.
-//!
-//! So the encodings would have been unlookable-at, which is how the last four visual chunks
-//! shipped looks that measured correctly and sat wrong.
-//!
-//! # The specific thing to look for
-//!
-//! Whether the sweep is distinguishable **from the control block at the bottom**, which is the
-//! same rows with no substance at all. Research R6 measured the dark theme's surfaces near 3%
-//! reflectance, so anything multiplied by albedo renders as nothing there, and an encoding that
-//! survives only in the light theme is one Constitution VI refuses.
-//!
-//! This harness has already killed one encoding. Reflectivity-as-permission mapped onto the
-//! `Pbr` layer's `env` and rendered *inverted* — `env` is the key-light-versus-sky mix, not
-//! reflectivity, so the read-only rows came out brighter than their neighbours rather than
-//! duller. It also showed that `row/body` had been authored at `env: 1.0`, meaning "lit
-//! entirely by the sky", which in the dark theme is nearly black: every row rendered darker
-//! than the canvas it sat on. Neither defect is visible in any number.
-//!
-//! Each strip draws one fact swept across its range with the other two held at their
-//! mid-values, because a picture with three things varying at once cannot answer which of
-//! them is doing the work.
+//! Each strip varies one row property while holding the others fixed, with
+//! a control group for comparison in both themes.
 
 // A looking harness, not shipped code: a panic here is a developer seeing a stack trace
 // instead of a picture. Same set the other examples allow.

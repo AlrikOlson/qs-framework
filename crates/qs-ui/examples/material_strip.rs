@@ -1,26 +1,9 @@
-//! Render every shipped material against the real tokens, in both themes, and write two
-//! PNGs to look at.
+//! Save material samples beside their flat fills in both themes.
 //!
 //! `cargo run -p qs-ui --example material_strip -- out.png`
 //!
-//! chunk:material-library's criteria are all checkable and all green: the looks resolve from
-//! `design/tokens.json`, the hand-built stacks are gone, the contrast gate expanded from 31
-//! declared pairs to 31 plus 40 composites, and the per-entry primitive budget is measured.
-//! None of that answers whether a composed look *reads*, and this project has shipped a
-//! defect that only looking found in every visual chunk so far.
-//!
-//! Each material is drawn beside the flat fill it replaced, because the honest question
-//! about a subtle ramp is whether it is doing anything at all — the same comparison
-//! `gradient_strip` makes, now asked of the stacks rather than of the primitive.
-//!
-//! # What this picture cannot show
-//!
-//! The halo. `row/selected`'s glow layer is [`Fidelity::Enhanced`] with a floor of nothing,
-//! and this harness rasterizes on the CPU tier, so the selection band below is exactly what
-//! a machine with no usable GPU sees. That is worth looking at in its own right — the
-//! question a floor of "nothing" has to answer is whether the degraded look reads as a
-//! plainer theme rather than as a bug — but it means the GPU's selection is *this plus a
-//! halo*, and only the running application shows that.
+//! This uses the CPU renderer. GPU-only layers use their declared fallbacks,
+//! so effects such as the selection halo are absent.
 
 // A looking harness, not shipped code: a panic here is a developer seeing a stack trace
 // instead of a picture. Same set the other examples allow.

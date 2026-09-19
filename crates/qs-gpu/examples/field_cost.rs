@@ -1,35 +1,13 @@
-//! What a full-viewport fragment pass costs, per tier.
+//! Measure the cost of full-viewport color fields and conic sweeps.
 //!
 //! `cargo run --release -p qs-gpu --example field_cost`
 //!
-//! # Why this exists
+//! Compares a flat background, a field, a sweep, and both effects together.
+//! Results include their share of an 8.33-millisecond frame budget.
 //!
-//! `prim-field-wash`'s acceptance is explicit: *"frame time measured against the M0 budget on
-//! the low tier before this is called done, because a full-viewport fragment pass is the first
-//! effect here that could plausibly cost a frame"*. Every primitive before it was bounded by
-//! the component that asked for it — a row's halo costs a row's worth of fragments. The field
-//! covers the window, so its cost is fragment work, and fragment work at 1080p is two million
-//! invocations per pass whatever the instance count says.
-//!
-//! # What it measures
-//!
-//! The same scene four ways: with a flat ground, with the field's ground, with the conic sweep
-//! over it, and with both — which is what `surface/canvas` actually ships. The difference
-//! between the first and the last is the number the decision turns on, and it is reported
-//! against the 8.33 ms budget SC-001 gates rather than as a bare millisecond count, because
-//! "0.3 ms" means nothing without the frame it is a fraction of.
-//!
-//! Wall clock from `submit` to the queue going idle, over many frames, exactly as
-//! `offscreen_cost` does it and with the same honest limit: this includes submit overhead and
-//! driver scheduling, so treat the absolute numbers as an upper bound and the *differences*
-//! as the answer.
-//!
-//! The Reduced tier is reached by asking for its backends directly rather than through a
-//! forced-tier switch, for the reason `offscreen_cost` states — on a machine whose GL driver
-//! is a translation layer over the same hardware, "the low tier" here means the low *API* and
-//! not low-end hardware. The CPU tier is not measured and does not need to be: the field is
-//! `Fidelity::Enhanced` and `tiny-skia` draws its floor, a flat rectangle, which is what the
-//! ground cost before any of this.
+//! Timings include submission and driver scheduling. Reduced-backend results
+//! use the available GPU; they do not simulate low-end hardware. The CPU
+//! fallback draws a flat rectangle and is not measured here.
 
 #![allow(
     clippy::unwrap_used,
@@ -54,7 +32,7 @@ const WARMUP: u32 = 40;
 /// Timed passes over the whole set. See [`measure_all`] for why more than one.
 const ROUNDS: u32 = 3;
 
-/// The frame budget SC-001 gates, in milliseconds: 120 Hz.
+/// Frame budget at 120 Hz, in milliseconds.
 const BUDGET_MS: f64 = 8.33;
 
 /// Roughly what the shipped `surface/canvas` carries, so the numbers are about the palette
@@ -216,21 +194,10 @@ fn run(
     start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES)
 }
 
-/// Every ground on one tier, as the **minimum** over several interleaved rounds.
+/// Measure each background on a tier over interleaved rounds.
 ///
-/// Both halves of that are load-bearing, and the first version of this harness had neither.
-/// It built a fresh `Renderer` per ground and measured each one once, in order — so the first
-/// ground measured paid for a pipeline compile and whatever else the driver does once, and on
-/// the GL tier that one-off cost was larger than the thing being measured. The flat ground
-/// came out *slower* than the field, and a full-viewport pass appeared to cost -0.18 ms.
-///
-/// A negative cost is not a small cost, it is a broken measurement, and it would have been
-/// very easy to read as "the field is free on the low tier" — which is the conclusion this
-/// chunk's acceptance most wanted checked. So: one renderer shared by every ground, so the
-/// pipeline is compiled before any timing starts; round-robin, so a drift in clocks or thermals
-/// lands on all four rather than on whichever went first; and the minimum rather than the mean,
-/// because the quantity of interest is what the frame costs when nothing else interferes and
-/// every source of noise here is additive.
+/// All cases share a warmed renderer. The reported minimum reduces the
+/// influence of scheduling delays and other additive overhead.
 fn measure_all(ctx: &GpuContext, scenes: &[(Ground, DrawList)], rounds: u32) -> Vec<f64> {
     let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("field_cost surface"),

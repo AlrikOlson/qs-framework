@@ -1,19 +1,8 @@
-//! Glyph rasterization into R8 coverage bitmaps.
+//! Glyph rasterization into single-channel coverage masks.
 //!
-//! Research R8 fixes the format: an R8 coverage atlas with **three horizontal subpixel
-//! positions**, glyphs up to 48 px rasterized on the CPU and uploaded. Both halves of that
-//! matter.
-//!
-//! *Coverage, not subpixel RGB.* A three-channel LCD-filtered mask would look sharper on a
-//! desktop LCD and would be wrong everywhere else -- rotated displays, OLED subpixel
-//! layouts, and any composited surface with non-opaque background. One channel is the
-//! honest choice and it is also a third of the atlas bandwidth.
-//!
-//! *Three subpixel positions, not one and not sixteen.* Snapping every glyph to a whole
-//! pixel makes text visibly shimmer during a slow scroll, because each glyph jumps a full
-//! pixel at a different moment. Quantizing to 1/3 px removes the shimmer at 3x the atlas
-//! entries; going finer buys nothing a reader can see and multiplies atlas pressure, which
-//! is the exact resource the R8 thrash cliff is about.
+//! Glyphs use three horizontal subpixel positions, spaced one third of a pixel
+//! apart. Rasterization supports sizes up to 48 pixels. The coverage format
+//! works independently of a display's subpixel layout.
 
 use swash::FontRef;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
@@ -25,9 +14,7 @@ use crate::fontdb::{FontDb, FontId};
 /// Horizontal subpixel quantization. See the module docs.
 pub const SUBPIXEL_POSITIONS: u8 = 3;
 
-/// Glyphs larger than this are not atlased -- they would evict a meaningful fraction of
-/// the atlas for one character. M0 never produces one (row text tops out near 28 px even
-/// at 200% scale), so this is a guard against a future caller, not a live path.
+/// Maximum glyph size admitted to the atlas, in pixels.
 pub const MAX_ATLAS_PX: f32 = 48.0;
 
 /// Identity of one rasterized glyph. This is the atlas key.

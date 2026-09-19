@@ -1,8 +1,6 @@
-//! macOS font locations and fallback ordering.
+//! macOS font directories and fallback preferences.
 //!
-//! Encodes the ordering CoreText's cascade list produces for an en-US system. See the
-//! [`crate::fontdb`] module docs for why this is a directory scan rather than a
-//! `CTFontCreateForString` binding.
+//! Fonts are found by filename. See [`crate::fontdb`] for the lookup behavior.
 
 use std::path::PathBuf;
 
@@ -69,14 +67,12 @@ const PREFERENCE: &[(ScriptClass, &[&str])] = &[
     ),
 ];
 
-/// San Francisco's weights, by file.
+/// UI font weights by filename.
 ///
-/// Unlike Windows, macOS ships SF as variable fonts (`SFNS.ttf` carries a weight axis), so
-/// the honest position is that this table is a *partial* solution here: it names the
-/// separate Helvetica weights as a fallback and otherwise resolves everything to SF
-/// Regular. A machine with only `SFNS.ttf` therefore renders every role at 400 until
-/// variation-axis support lands, and `weight_coverage()` reports that truthfully rather
-/// than implying a hierarchy that is not being drawn.
+/// The table uses separate Helvetica faces where available. It does not
+/// select variation axes in `SFNS.ttf`, so a system with only that face
+/// resolves each role to regular weight. `weight_coverage()` reports the
+/// available classes.
 const WEIGHTS: &[(u16, &str)] = &[
     (400, "sfns.ttf"),
     (400, "sfnstext.ttf"),

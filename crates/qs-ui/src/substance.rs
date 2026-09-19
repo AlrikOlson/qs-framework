@@ -1,70 +1,9 @@
-//! Facts about a file, expressed as what its surface is made of.
+//! File-size bevels for row surfaces.
 //!
-//! # One encoding, and the rule that killed the other three
-//!
-//! **Bevel is size.** A big file is a thick object, and thickness is what a bevel reads as.
-//!
-//! The chunk proposed four. The founding premise was that "a material changes how a surface
-//! *responds* to light without changing how much light reaches the text on it", so none of it
-//! would be charged against the contrast allowance in
-//! `specs/002-ray-traced-mode/research.md` R13. **That premise is only true for
-//! edge-localised properties**, and finding out which ones took rendering them.
-//!
-//! The bevel qualifies structurally rather than by luck: `bevel_normal` perturbs the surface
-//! normal only within `bevel` of the edge, so while `2 x bevel < row_height` the row's centre
-//! — where the label is — shades **pixel-identically** whatever the file's size. It is the
-//! same argument `Material::composites` already makes for `Stroke` and `Rim`, which it skips
-//! because an edge is not a background.
-//!
-//! Each of the three drops is the acceptance criterion being satisfied rather than the idea
-//! being trimmed, and each has a reason that came from a picture or from the shader.
-//!
-//! **Metalness-as-kind**, dropped before being built, on a finding already in the record: metal
-//! in a dark room is dark, and that is not fixable inside the BRDF — the remedy is to author
-//! dielectrics. Kind is also the one fact of the four that already has two carriers, the
-//! per-kind icon and the extension ribbon, so a third would be the gratuitous case
-//! Constitution IX exists to refuse.
-//!
-//! **Reflectivity-as-permission**, dropped after `examples/substance_strip.rs` rendered it and
-//! it came out *inverted*. The idea was "a path you cannot enter reflects nothing", mapped onto
-//! the `Pbr` layer's `env`. But `env` is not reflectivity: `shade_pbr` documents it as the
-//! **fraction of illumination arriving from the sky rather than from the key light**, and the
-//! two sum to one. So `env = 0` is not a dull surface, it is a surface lit entirely by the key
-//! light — brighter, not darker — which is what the picture showed. And the deeper objection
-//! survives fixing the direction: `env` is a property of the *rig*, not of the material. Two
-//! rows in one list lit by different rigs is not a material encoding at all, it is two scenes.
-//!
-//! **Roughness-as-age**, dropped after `substance_strip` showed it swinging a row's whole
-//! brightness. Roughness is not an edge property: it feeds the GGX distribution, the Smith
-//! visibility term and the Fresnel-roughness environment lobe, all of which change how much
-//! light the **entire** surface returns — including the part under the label. Worse, no gate
-//! can see it: `cargo xtask contrast` checks the composite, which is the albedo, and the
-//! albedo does not move. So the encoding would ship a ground whose contrast varies with a
-//! file's age while the build stayed green, which is exactly the failure
-//! `contracts/lit-contrast.md` exists to prevent, reintroduced in the raster path. Age is
-//! still shown, in the modified column and in the a11y description. See roadmap chunk
-//! `pbr-shading-in-the-contrast-gate`, which is what would make this encoding admissible.
-//!
-//! Permission and age both still reach the user in words: `RowFlags::IS_READONLY` is now
-//! populated where it used to be dropped, and the a11y description announces size, date and
-//! read-only for every row.
-//!
-//! # Time since *modified*, not since accessed
-//!
-//! The idea was authored as "time since last access". There is no access time here to use:
-//! [`RowView`] carries `mtime` and nothing else, and an atime would not be worth carrying —
-//! Windows ships with `NtfsDisableLastAccessUpdate` on and most Linux mounts use `relatime`,
-//! so a browsed file's atime is frequently its mtime wearing a different name. Encoding the
-//! field that exists and is true beats encoding the one that was asked for and is not.
-//!
-//! # There is no clock here, and there must not be one
-//!
-//! Nothing in this module reads the time, because nothing left in it depends on the time. The
-//! dropped age encoding did, and it was threaded in as an explicit `now` argument sampled once
-//! per published listing rather than read per frame: the renderer has already refused a clock
-//! (see `crate::motion`), and reading one per frame would make two draws of one unchanged view
-//! disagree, which breaks both the golden images and the idle guarantee's "draw it twice and
-//! compare" check. Anything that revives age must revive that argument too, not a clock.
+//! Size changes bevel width near the edge while leaving the label's background
+//! unchanged. Material roughness, metalness and lighting remain fixed.
+//! Modification time and read-only status are available in row descriptions.
+//! This module does not read the clock.
 
 use serde::Deserialize;
 
@@ -99,11 +38,9 @@ impl Response {
         span: 1.0,
     };
 
-    /// Where `t` in `0..=1` lands between the two ends.
+    /// Interpolate between the endpoints with `t` in `0..=1`.
     ///
-    /// A **mix toward a bound**, never a multiplier — research R8, the mistake this codebase
-    /// has now made four times in four places. A factor would behave oppositely at the two
-    /// ends of a range whose direction the token file is free to choose.
+    /// The result stays between the bounds regardless of their order.
     #[must_use]
     pub fn at(self, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);

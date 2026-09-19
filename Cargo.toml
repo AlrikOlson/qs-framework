@@ -1,11 +1,4 @@
-# qs-framework — the GPU UI framework quicksilver-file-explorer is built on,
-# extracted so that quicksilver and magistr can both depend on it.
-#
-# Extracted from AlrikOlson/quicksilver-file-explorer at 6dd3d8b
-# (2026-08-30) with `git filter-repo`, so every file here carries its
-# original history. Nothing file-explorer-specific (qs-vfs, qs-shell,
-# qs-term, qs-command, qs-bench, the `qs` app) lives here, and nothing
-# here may come to depend on any of it.
+# Shared rendering, text and UI libraries.
 [workspace]
 resolver = "3"
 members = [
@@ -18,9 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# `wgpu` 30 declares `rust-version = "1.87"`; the floor is inherited from it
-# (quicksilver's docs/adr/011-msrv-1-87.md). Raise deliberately, never as a
-# side effect of adding a dependency.
+# wgpu 30 requires Rust 1.87 or later.
 rust-version = "1.87"
 license = "Apache-2.0"
 repository = "https://github.com/AlrikOlson/qs-framework"
@@ -30,9 +21,7 @@ publish = false
 # --- rendering -------------------------------------------------------------
 wgpu = "30.0"
 wgpu-hal = "30.0"
-# Dev-only, and deliberately the same major as `wgpu`: it is the compiler `wgpu` itself
-# puts `instance.wgsl` through, so validating with it at test time is the same check the
-# device does at startup, minus the device. A different version would be a second opinion.
+# Use the same shader compiler version as wgpu for validation tests.
 naga = { version = "30.0", features = ["wgsl-in"] }
 raw-window-handle = "0.6"
 bytemuck = { version = "1.19", features = ["derive"] }
@@ -41,10 +30,8 @@ bytemuck = { version = "1.19", features = ["derive"] }
 winit = "0.30"
 
 # --- accessibility ---------------------------------------------------------
-# accesskit_winit 0.33 is the adapter built against winit 0.30. These three
-# move together; bumping one without the others yields two winit versions in
-# the graph and a type mismatch at the adapter boundary. Every consumer of
-# this workspace (quicksilver, magistr) pins the same trio for the same reason.
+# Keep winit, accesskit and accesskit_winit versions aligned in applications
+# that also depend on these libraries.
 accesskit = "0.24"
 accesskit_winit = "0.33"
 
@@ -77,10 +64,8 @@ qs-gpu = { path = "crates/qs-gpu" }
 qs-text = { path = "crates/qs-text" }
 qs-ui = { path = "crates/qs-ui" }
 
-# Constitution: no blocking work and no silent panics on the frame path.
-# `unwrap`/`expect` are denied workspace-wide; tests and one-time initialisation
-# opt out locally with `#![allow(clippy::unwrap_used)]`, which makes every
-# exception greppable instead of ambient.
+# Keep panics out of the frame path.
+# Tests and initialization code can opt out locally where needed.
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
@@ -94,14 +79,13 @@ missing_debug_implementations = "warn"
 # replace std's atomics across the whole dependency graph of the test binary.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
-# The release profile is the profile that gets measured.
+# Release build settings.
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "unwind"
 debug = 1
 
-# Golden-image work is unusable at -O0; give dependencies real optimisation
-# even in dev builds.
+# Optimize dependencies for rendering in development builds.
 [profile.dev.package."*"]
 opt-level = 2

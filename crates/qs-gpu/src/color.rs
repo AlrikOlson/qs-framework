@@ -1,26 +1,8 @@
-//! Colour, converted once at draw-list build time.
+//! Conversion between sRGB and premultiplied linear color.
 //!
-//! # Why the conversion happens here and not in the shader
-//!
-//! Tokens are authored as sRGB hex, because that is what a designer can reason about and
-//! what every design tool emits. GPUs blend correctly only in linear space, and correct
-//! blending of a premultiplied source is `dst * (1 - a) + src`, which requires the colour
-//! to already carry its alpha.
-//!
-//! Doing that conversion per fragment would mean a `pow` per channel per pixel for a value
-//! that is constant across the whole primitive. Doing it per instance, on the CPU, at the
-//! moment the draw list is built, costs one conversion per *primitive* -- roughly 200 per
-//! frame rather than roughly two million. The instance buffer therefore carries
-//! premultiplied linear RGBA8 and the shader does no colour maths at all.
-//!
-//! # Why RGBA8 and not RGBA16F
-//!
-//! 8 bits of *linear* precision is visibly insufficient in dark greys -- banding shows up
-//! exactly where a dark theme lives. The mitigation is that the framebuffer is sRGB
-//! (`Bgra8UnormSrgb`), so the hardware converts back on write and the 8-bit quantization
-//! happens in perceptual space where it is invisible. The instance colour is only ever an
-//! input to blending, never a storage format, so 4 bytes is the right size and the
-//! precision argument does not apply.
+//! Draw-list construction converts colors once per instance. The GPU blends in
+//! linear space and writes to an sRGB surface. Instance colors are packed as
+//! RGBA8.
 
 /// A colour as authored: sRGB components, straight (non-premultiplied) alpha.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -43,11 +25,9 @@ impl Srgba {
         Self { r, g, b, a }
     }
 
-    /// Parse `#rgb`, `#rrggbb` or `#rrggbbaa`. The leading `#` is optional.
+    /// Parse `#rgb`, `#rrggbb` or `#rrggbbaa`; the leading `#` is optional.
     ///
-    /// Returns `None` rather than a default colour: a token file with a typo in it should
-    /// fail the build (Principle VII), and silently substituting magenta would let it
-    /// through.
+    /// Returns `None` for an invalid color.
     pub fn parse_hex(text: &str) -> Option<Self> {
         let hex = text.strip_prefix('#').unwrap_or(text);
         let byte = |i: usize| -> Option<f32> {

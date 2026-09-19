@@ -1,25 +1,9 @@
-//! What the ambient field actually looks like, full-bleed and drifting.
+//! Save the ambient field at four phases in both themes.
 //!
-//! ```bash
-//! cargo run --release -p qs-ui --example field_strip -- out.png
-//! ```
+//! `cargo run --release -p qs-ui --example field_strip -- out.png`
 //!
-//! # Why this is not `gpu_strip`
-//!
-//! `gpu_strip` renders the shipped materials with a list on top of them, which is the right
-//! instrument for a row and the wrong one for a ground: the rows cover most of the window, so
-//! the surface being judged is visible only in the margins. Every full-window effect has that
-//! problem, and `prim-field-wash` is the first of three — the backdrop blur and the refraction
-//! will want this too.
-//!
-//! So this draws the ground and nothing else, at four points in its cycle, in both themes. The
-//! four tiles are one field at four phases rather than four fields: what to look for is whether
-//! the colour *moves* between them, and whether any tile has a hard edge in it, which is what a
-//! centre reaching the end of its support looks like when the falloff is wrong.
-//!
-//! It is deliberately full-bleed and deliberately has no text on it. The question it answers is
-//! "is this ambience, or is it a competitor for the content", and the honest way to ask that is
-//! to look at the ground alone here and at `gpu_strip`, which has the content on it.
+//! The field fills each tile without foreground content, making movement and
+//! falloff visible. Use `gpu_strip` to inspect it behind rows.
 
 // A looking harness, not shipped code: a panic here is a developer seeing a stack trace
 // instead of a picture. Same set the other examples allow.

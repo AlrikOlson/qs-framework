@@ -1,32 +1,11 @@
-//! What the offscreen target costs, per tier, before anything is built on top of it.
+//! Measure direct rendering against an offscreen target and resolve pass.
 //!
 //! `cargo run --release -p qs-gpu --example offscreen_cost`
 //!
-//! # Why this runs before the first effect
-//!
-//! The roadmap chunk's acceptance asks for "a cost measurement on the low tier before
-//! anything is built on top", and the order is the point. Measured afterwards, the number is
-//! the blur's cost and the target's cost added together with no way to separate them, and the
-//! decision it would inform — whether a neighbourhood effect is affordable on the Reduced
-//! tier at all — has already been made.
-//!
-//! # What it measures, and what it does not
-//!
-//! Wall clock from `submit` to the queue going idle, over many frames, for the same draw list
-//! rendered both ways. The difference is one full-viewport render-target write plus one
-//! full-viewport textured triangle.
-//!
-//! It is **not** a GPU timestamp. `GpuTimer` reports the instance pass only, and the resolve
-//! deliberately does not carry a second timestamp pair — see `batcher.rs`. Wall clock around a
-//! synchronous poll includes submit overhead and driver scheduling, so treat the absolute
-//! numbers as an upper bound and the *difference between the two paths* as the answer, which
-//! is the quantity the decision actually turns on.
-//!
-//! The Reduced tier is reached by asking for its backends directly rather than through a
-//! forced-tier switch, because `QS_FORCE_TIER` does not exist yet (spec 002 T008). On a
-//! machine whose GL driver is a translation layer over the same hardware, "the low tier" here
-//! means the low *API*, not low-end hardware — an honest limit, and stated rather than
-//! buried.
+//! Both paths render the same draw list. Timings cover queue submission through
+//! completion, including driver overhead, so the difference between paths is
+//! more useful than the absolute values. Reduced-backend measurements use the
+//! available hardware and do not simulate a slower GPU.
 
 #![allow(
     clippy::unwrap_used,

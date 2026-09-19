@@ -1,14 +1,7 @@
-//! GPU timestamp queries, with graceful absence.
+//! GPU execution timing through timestamp queries.
 //!
-//! Research R3 splits the measurement in two and forbids conflating them. This module owns
-//! the half that is not portable: GPU execution time. When the backend has no timestamp
-//! query support -- which is common on GL and on some older D3D12 drivers -- every method
-//! here becomes a no-op and [`GpuTimer::take`] returns `None`.
-//!
-//! `None` propagating all the way into `FrameSample::gpu_ms` and then into the bench report
-//! as a null is the entire point. The alternative -- substituting the CPU frame span and
-//! labelling it `gpu_ms` -- would produce a report that compares cleanly against a machine
-//! where the number means something else, which is worse than having no number at all.
+//! On backends without timestamp support, timing is disabled and
+//! [`GpuTimer::take`] returns `None`. CPU frame time is measured separately.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

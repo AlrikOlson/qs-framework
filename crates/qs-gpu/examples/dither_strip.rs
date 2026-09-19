@@ -1,34 +1,11 @@
-//! Render a ramp too shallow for eight bits, with and without the dither, and write a PNG
-//! to look at.
+//! Save shallow gradients with and without dithering.
 //!
 //! `cargo run -p qs-gpu --example dither_strip -- out.png`
 //!
-//! chunk:prim-noise-dither's numeric criteria are all checkable and all green: the offset
-//! stays inside half a level, it averages to nothing, it tracks the sRGB encode's slope
-//! within three per cent at four probes, and the two tiers now produce identical bytes on
-//! every sharp gradient fixture. None of that answers whether the banding is gone, and this
-//! project has shipped a defect that only looking found in every visual chunk so far --
-//! including the one that produced this chunk, where two row ramps were authored, measured,
-//! passed every gate, and drew four hard edges.
-//!
-//! # Why this does not go through `CpuRasterizer`
-//!
-//! The other looking harnesses render a draw list, which is the right thing when the
-//! question is about a shape. The question here is about a *write*: the framebuffer is
-//! `Bgra8UnormSrgb`, so the hardware encodes to sRGB and quantizes to eight bits, and that
-//! is the only step at which banding exists. `CpuRasterizer` composites into a **linear**
-//! eight-bit pixmap and encodes once at the end, so its quantization is a different one --
-//! coarser in the darks, which is worth knowing but is not what this picture is about.
-//! Modelling the GPU's write directly is what makes the two halves comparable.
-//!
-//! Four bands, each split down the middle -- plain on the left, dithered on the right --
-//! because the honest comparison is side by side rather than remembered:
-//!
-//! - a dark ramp over four output levels, which is the case from the material-library close;
-//! - the same interval in the midtones, where a level is worth more in linear light;
-//! - a near-white ramp, where the encode's slope is steepest and the offset is largest;
-//! - a flat fill at the dark ramp's midpoint, which must come out **flat**: the dither is
-//!   supposed to dissolve a contour, not to add grain to a surface that has none.
+//! Each band shows plain output on the left and dithered output on the right.
+//! The bands cover dark, midtone and near-white gradients, plus a flat fill.
+//! The calculation models the GPU's sRGB output conversion directly; it does
+//! not use the CPU renderer's linear eight-bit buffer.
 
 // A looking harness, not shipped code: a panic here is a developer seeing a stack trace
 // instead of a picture. Same set the other examples allow.

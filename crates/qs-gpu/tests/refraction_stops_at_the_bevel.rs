@@ -1,50 +1,9 @@
-//! The two claims `PrimKind::Refract` makes that only a running GPU can settle.
+//! GPU checks for refraction at the bevel.
 //!
-//! # Why these are here and not in `tier_parity`
-//!
-//! `tier_parity` compares the CPU rasterizer against a Rust transcription of `instance.wgsl`.
-//! Both halves are Rust and the WGSL is never executed, so what it can hold about this
-//! primitive is exactly its floor: a refracting panel degrades to its albedo. That is worth
-//! holding and it is held there. It says nothing about either claim below, because both are
-//! properties of the shader's arithmetic on a real adapter.
-//!
-//! ## The contrast claim
-//!
-//! `refraction_never_reaches_the_middle_of_a_surface` is the load-bearing one. `qs_ui::substance`
-//! records the rule three refused encodings established: only **edge-localised** material
-//! properties are free against the contrast budget, because `cargo xtask contrast` checks the
-//! authored albedo and cannot see what a shader does to the middle of a surface. Refraction is
-//! allowed to exist at all because it is identically zero deeper than `bevel` inward — so the
-//! ground under a label on a glass panel is the ground the gate checked.
-//!
-//! Every part of that is invisible to every other gate in this repository. A `share` term that
-//! leaked a thousandth into the interior would leave the contrast gate green, `tier_parity`
-//! green, and the shipped inspector showing the file list faintly through its own labels. So
-//! this asserts **byte identity**, not a tolerance: a tolerance here is a budget for exactly
-//! the defect the rule exists to forbid, and the two frames are the same shader on the same
-//! adapter with one scalar different, so there is no rounding to allow for.
-//!
-//! ## The visibility claim
-//!
-//! `the_ray_reaches_content_the_fragment_cannot_see` is the inverse, and it exists because of
-//! research R15: a correct, bounded, four-ways-tested effect that moved 446,580 pixels by a peak
-//! of 7/255 and was worth nothing. A refraction that satisfied the contrast claim by doing
-//! nothing anywhere would pass the test above perfectly.
-//!
-//! **Its first version was itself an example of the failure it guards against, and the mutation
-//! run is what caught it.** It compared the band at strength 1 against strength 0 and asked
-//! whether the pixels differed — which they do enormously, because a transmitting panel shows
-//! the backdrop where an opaque one showed the panel. That difference is *transmission*, not
-//! *refraction*. Setting `GLASS_DEPTH` to 0.02, so the ray is bent exactly as before and then
-//! travels almost nowhere, left the test green: the assertion could not see the difference
-//! between glass and a hole.
-//!
-//! What it does instead is remove the alternative explanation. The only coloured thing behind
-//! the panel sits in its **interior**, inset by the full bevel, so every fragment of the band
-//! is over black and an undisplaced sample can only return black. Colour in the band is then
-//! proof that the ray reached content the fragment sits nowhere near, which is the one thing
-//! only a refraction does. See `masked` for which direction that turned out to be, and for the
-//! fixture that measured zero because it assumed the other one.
+//! Changing refraction strength must leave the panel's interior byte-identical.
+//! The bevel must sample displaced background content: a colored object lies
+//! inside the panel, while the background directly under the bevel is black.
+//! Color reaching the bevel therefore requires displacement.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the vocabulary of a
 // test, not a hazard in one.

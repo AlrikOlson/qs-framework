@@ -1,21 +1,8 @@
-//! T007: what the current palette costs under the worst-case-lit contrast rule.
+//! Measure lighting ranges that preserve text contrast in each theme.
 //!
-//! Reports the widest lighting range the shipped palette can carry with every text token still at
-//! its required ratio, so the tokens that govern shadow depth and bounce brightness are chosen
-//! against a measurement rather than by eye.
-//!
-//! # Why it bisects per theme and per direction
-//!
-//! R12 measured one global range and found it an order of magnitude narrower than the renders that
-//! motivated the feature. That number is the worst case of four separate questions collapsed into
-//! one, and collapsing them is what makes it look unaffordable: a shadow *helps* light-on-dark text
-//! and *hurts* dark-on-light text, and added light does the reverse. A single range has to survive
-//! whichever of the two is hostile in each theme, so it reports the intersection of two constraints
-//! that never bind at the same time.
-//!
-//! So this asks the four questions separately — {light, dark} x {shadow, addition} — and then asks
-//! the one that matters for the source/receiver split: with **all** addition kept off text-bearing
-//! grounds, how deep may the dark theme's shadow go?
+//! The example finds shadow and added-light limits separately for light and
+//! dark themes. It also measures the dark theme with added light excluded
+//! from text backgrounds.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 

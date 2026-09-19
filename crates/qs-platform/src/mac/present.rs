@@ -1,30 +1,8 @@
-//! macOS present tuning, and the `CVDisplayLink` / `CADisplayLink` version split.
+//! macOS presentation settings.
 //!
-//! # The correction this file exists to record
-//!
-//! SDD §7.1 names `CADisplayLink` for macOS phase alignment. **`CADisplayLink` is available
-//! for AppKit views only from macOS 14**, while SDD §1.5 sets the supported floor at
-//! macOS 13 Ventura. Using it unconditionally would mean the application does not run on a
-//! platform the spec says it supports.
-//!
-//! So M0 uses:
-//!
-//! | macOS | API | Note |
-//! |---|---|---|
-//! | 13 (Ventura) | `CVDisplayLink` | deprecated as of macOS 15, still functional |
-//! | 14+ | `CADisplayLink` | the API SDD §7.1 intended |
-//!
-//! The version split is a maintenance cost accepted to keep the stated minimum. It is
-//! recorded in `docs/adr/009-macos-display-link.md` rather than only here, because it is a
-//! decision that outlives this file.
-//!
-//! # Why it is not wired up yet
-//!
-//! Same reasoning as the Windows tuning: reaching `CAMetalLayer` through
-//! `wgpu_hal::metal` requires an `unsafe` block and a backend assumption, and the
-//! measurement that would justify it has not been taken. Reporting `not applied` with the
-//! reason is honest; a stub that claimed success would put a wrong `present_mode`-adjacent
-//! fact into every bench report from this platform.
+//! [`display_link_api`] selects `CVDisplayLink` for macOS 13 and `CADisplayLink`
+//! for macOS 14 or later. Presentation tuning is not connected to the Metal
+//! surface yet; the implementation reports that it was not applied.
 
 use crate::present_tuning::{PresentConfig, PresentTuning, PresentTuningOutcome};
 

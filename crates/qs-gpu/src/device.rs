@@ -1,12 +1,6 @@
-//! Adapter, device and surface management, plus the capability probe.
+//! Adapter selection, device creation, surface management and capability checks.
 //!
-//! # Nothing here panics on a bad driver
-//!
-//! Every function returns a `Result` or an `Option`, including the ones that "cannot
-//! fail". SDD R1 names driver variance as the top technical risk, and the specific way that
-//! risk materializes is a fault inside adapter enumeration or device creation on a machine
-//! nobody tested. A panic there is an application that will not start, on exactly the
-//! hardware that most needs the fallback tiers to exist.
+//! Failures are returned to the caller so it can choose another rendering tier.
 
 use std::sync::Arc;
 
@@ -24,12 +18,9 @@ pub enum GpuError {
     DeviceLost(String),
 }
 
-/// What this adapter can actually do, resolved once at startup.
+/// Adapter capabilities, queried at startup.
 ///
-/// Every field here exists because something downstream must degrade rather than assume.
-/// `timestamps` in particular is the reason `FrameSample::gpu_ms` is an `Option` -- research
-/// R3 requires the harness to say when it could not measure, instead of reporting a
-/// CPU-only number as though it included GPU time.
+/// Timestamp support determines whether GPU execution time can be measured.
 #[derive(Clone, Debug)]
 pub struct Capabilities {
     pub backend: wgpu::Backend,
@@ -39,8 +30,7 @@ pub struct Capabilities {
     /// Timestamp queries inside render passes are available.
     pub timestamps: bool,
     pub max_texture_dimension: u32,
-    /// Present modes the surface actually offers. Recorded per run because a `Fifo` run and
-    /// a `Mailbox` run are not comparable measurements (research R4).
+    /// Present modes offered by the surface. Record these when comparing frame timings.
     pub present_modes: Vec<wgpu::PresentMode>,
     pub surface_format: wgpu::TextureFormat,
 }
@@ -58,10 +48,8 @@ impl Capabilities {
         }
     }
 
-    /// Whether this adapter is a software implementation (WARP, lavapipe, SwiftShader).
-    ///
-    /// Not a failure -- research R9 makes these the headless CI path -- but a frame time
-    /// measured on one is not a frame time, and the report must say so.
+    /// Whether the adapter uses a software implementation such as WARP,
+    /// lavapipe or SwiftShader. Its timings include software rendering costs.
     pub fn is_software(&self) -> bool {
         self.device_type == wgpu::DeviceType::Cpu
     }
@@ -104,10 +92,9 @@ pub fn new_instance(tier: RenderPath) -> wgpu::Instance {
     wgpu::Instance::new(descriptor)
 }
 
-/// Probe for the best usable tier, without creating a window.
+/// Find the best usable rendering tier without creating a window.
 ///
-/// Returns [`RenderPath::Cpu`] when nothing else works, which satisfies RP-1: a machine
-/// with no usable adapter still opens a window and scrolls.
+/// Returns [`RenderPath::Cpu`] when neither GPU tier has a usable adapter.
 pub fn probe_tier() -> RenderPath {
     tier_from_adapter_counts(|tier| {
         let instance = new_instance(tier);
@@ -115,20 +102,10 @@ pub fn probe_tier() -> RenderPath {
     })
 }
 
-/// The tier decision, with adapter enumeration injected.
+/// Select a rendering tier using the supplied adapter counts.
 ///
-/// This is [`probe_tier`]'s body; the split exists because the branch that matters cannot
-/// otherwise be reached. `RenderPath::Cpu` is returned only when enumeration comes back
-/// empty for *both* GPU tiers, which never happens on a machine that has a GPU -- so on
-/// every machine this project is developed and tested on, the line that satisfies SC-009
-/// is the one line SC-009's evidence never executes. Passing the enumeration in makes
-/// "this machine has nothing" a state a test can put the real decision into, rather than a
-/// state that requires hardware nobody has.
-///
-/// The counting closure takes a tier and returns how many adapters that tier's backends
-/// offer. A software adapter counts: research R9 makes WARP and lavapipe the headless CI
-/// path, and refusing them would demote CI to the CPU rasterizer and stop exercising the
-/// real pipeline entirely.
+/// The closure returns the number of adapters for each tier, including
+/// software adapters. Zero adapters for both GPU tiers selects the CPU renderer.
 pub fn tier_from_adapter_counts(mut adapters_for: impl FnMut(RenderPath) -> usize) -> RenderPath {
     for tier in [RenderPath::Primary, RenderPath::Reduced] {
         if adapters_for(tier) > 0 {
@@ -249,9 +226,8 @@ impl GpuContext {
 
     /// Configure a surface, preferring `Mailbox` and falling back to `Fifo`.
     ///
-    /// `FifoRelaxed` is never chosen automatically (research R4): it is *defined* to tear
-    /// on a missed vblank, and a visible artifact should be something you opt into rather
-    /// than something you inherit from a default.
+    /// `FifoRelaxed` is not selected automatically because it can tear when a
+    /// frame misses vblank.
     pub fn configure_surface(
         &self,
         surface: &wgpu::Surface<'static>,
@@ -314,7 +290,7 @@ pub enum SurfaceRecovery {
     SkipFrame,
     /// Reconfigure the surface and retry.
     Reconfigure,
-    /// The device is gone. Rebuild every resource (FR-018).
+    /// The device was lost. Rebuild its resources.
     RebuildDevice,
 }
 
@@ -339,13 +315,10 @@ impl std::fmt::Debug for Acquired {
     }
 }
 
-/// Ask the surface for the next frame and classify the answer.
+/// Acquire the next surface frame and classify the result.
 ///
-/// FR-018 requires a device loss to rebuild resources rather than exit. Getting the
-/// classification right matters more than the rebuild itself: `Outdated` fires on every
-/// resize, constantly, and treating it as a device loss would rebuild the world on every
-/// window drag. `Occluded` fires whenever the window is minimized, and treating *that* as
-/// an error would spam a log with a condition that means "there is nothing to draw".
+/// An outdated surface needs reconfiguration; device loss needs resources
+/// rebuilt. An occluded window can skip rendering until it becomes visible.
 pub fn acquire(surface: &wgpu::Surface<'static>) -> Acquired {
     match surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture) => Acquired::Frame(texture),

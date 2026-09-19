@@ -1,38 +1,11 @@
-//! What is selected.
+//! Selection stored as sorted, disjoint index ranges.
 //!
-//! # Why this is a set of runs and not a set of indices
+//! Selecting all rows needs one range regardless of list size. Selection belongs
+//! to the view; applications map indices back to entries when needed.
 //!
-//! `Ctrl+A` in a folder of a million entries is one keystroke, and the two obvious
-//! representations both answer it badly: a `HashSet<u64>` allocates a million times and a
-//! bitset allocates 125 KB per pane per directory. A sorted, disjoint list of half-open
-//! ranges answers it with **one** run, and answers the gestures that produce it -- a range
-//! click, a marquee drag, an invert of a range selection -- with a handful more. The
-//! representation is chosen by the operations that are actually cheap in it, which is the
-//! same reason the directory cache stores an arena rather than a `Vec<String>`.
-//!
-//! # Why it lives here rather than in the shell
-//!
-//! Selection is view state, exactly like [`ScrollState`](crate::scroll::ScrollState): two
-//! panes showing the same directory have different selections, so it cannot live on the
-//! `RowSource` any more than hover can. And it is an **index** set, because this crate is
-//! not allowed to know what a file is. Making a selection outlive a navigation means
-//! mapping those indices back to entries, and that mapping needs names -- so it happens one
-//! layer up, in the application, where names already are.
-//!
-//! # The anchor is not the lead, and the base is neither
-//!
-//! A range click extends from the **anchor** -- the last row a plain or toggle click landed
-//! on -- to the row just clicked, which becomes the **lead**. Shift-clicking twice in a row
-//! must therefore re-range from the same anchor rather than growing from the previous
-//! shift-click, which is what every list on every platform does and what collapsing the two
-//! into one "current row" silently breaks.
-//!
-//! Replacing the whole selection with the new range gets that second shift-click right and
-//! a different case wrong: click 2, `Ctrl`-click 8, `Shift`-click 10 leaves 2 selected in
-//! both Explorer and Finder. So a range click is applied over a **base** -- everything that
-//! was committed before the range gesture began -- rather than over nothing or over the
-//! previous range. Every other gesture commits its result as the new base, which is why
-//! `range_to` is the one method that does not.
+//! Range gestures extend from an anchor to a lead over a saved base selection.
+//! Repeated Shift-clicks reuse that base and anchor instead of extending the
+//! previous range.
 
 use std::ops::Range;
 
@@ -372,7 +345,7 @@ impl Selection {
         self.commit_base();
     }
 
-    /// Replace the whole set with one run, keeping the generation honest.
+    /// Replace the selection with one range and update its generation.
     fn set_span(&mut self, span: Range<u64>) {
         let unchanged = self.runs.len() == 1 && self.runs.first() == Some(&span);
         if !unchanged {

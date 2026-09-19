@@ -53,28 +53,19 @@ use qs_gpu::path::RenderPath;
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
-/// Frames per run, and the count is a finding rather than a copy of `blur_cost`'s.
+/// Frames per measurement run.
 ///
-/// At `blur_cost`'s 120 the whole run is under 4 ms of wall clock on the primary tier, the
-/// differences being measured are 0.005 to 0.015 ms, and the report came back with the small
-/// panel costing MORE than the large one on the GL tier -- which is impossible under any model
-/// and is therefore the harness talking, not the shader. The blur could afford 120 because its
-/// chain is three full-screen passes and shows up immediately; refraction is a few thousand
-/// fragments and does not. `specs/001-gpu-list-spike/findings.md` records the same lesson at
-/// the other end of the repository: a difference below the harness's resolution is not a small
-/// difference, it is no measurement at all.
+/// Refraction changes frame time by only a few microseconds on the measured
+/// hardware. Longer runs reduce the scheduling noise that dominated runs of
+/// 120 frames.
 const FRAMES: u32 = 2000;
 const WARMUP: u32 = 200;
 /// How many interleaved sweeps. Odd, so the median is a sample rather than a mean of two.
 const REPS: u32 = 5;
 
-/// A run's panels: a grid of `cols` x `rows` of `w` x `h`, each with `bevel`.
+/// A grid of `cols` by `rows` panels, each `w` by `h` with the given bevel.
 ///
-/// A grid rather than one panel, and that is the whole experiment. One shipped-size panel puts
-/// a few thousand marching fragments against a frame the primary tier renders in 33 µs, and the
-/// difference lands under the harness's floor -- the first version of this example reported the
-/// large panel as *cheaper* than the small one, twice, on two tiers. Twenty-four panels put the
-/// same question 24x above the noise without changing what is being asked.
+/// Multiple panels make small differences easier to measure above timing noise.
 #[derive(Clone, Copy)]
 struct Grid {
     cols: u32,

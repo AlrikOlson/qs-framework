@@ -1,54 +1,11 @@
-//! The offscreen colour target, and the pass that puts it back on screen.
+//! Offscreen render targets for blur, bloom, refraction and lighting.
 //!
-//! # Why this is infrastructure and not a primitive
+//! The renderer creates targets when first needed, retains them across frames,
+//! and recreates them at the exact viewport size after a resize.
 //!
-//! Every primitive shipped so far is a function of **one fragment's own position**: a rounded
-//! box's distance field, a ramp's projection onto an axis, a microfacet BRDF evaluated at one
-//! normal. That is exactly why all of them fit one pass with no second target, and it is not a
-//! coincidence — it is the constraint that kept the pipeline one shader and one draw call per
-//! batch.
-//!
-//! Blur, bloom and refraction are functions of **neighbouring pixels**, and no amount of
-//! cleverness makes them fit. What they need is not a fifth `KIND_` constant but a target to
-//! render into, a way to sample what was already drawn, and a second pipeline to put it back.
-//! This module is that, separated from the first effect that uses it so its memory cost, its
-//! resize behaviour and its tier answer are decided in the open rather than under a visual
-//! feature — and so that bloom does not inherit them unreviewed.
-//!
-//! # Lifetime and resize
-//!
-//! The target is owned by the [`crate::batcher::Renderer`] and lives across frames. It is
-//! created **lazily**, on the first frame that asks for it, so an installation that never
-//! enables a neighbourhood effect never allocates it. It is recreated when the viewport
-//! changes size, and only then.
-//!
-//! Exact size, never rounded up and never kept larger than needed. A target smaller than the
-//! viewport samples outside itself at the edges; a larger one wastes the whole difference,
-//! and at 4K the difference is measured in tens of megabytes rather than in kilobytes. The
-//! cost of recreating it is paid on resize, which is already the frame nobody is measuring.
-//!
-//! # Format, and why the resolve is exactly a copy
-//!
-//! The target carries the **surface's own format**. That makes the resolve pass a straight
-//! round trip: an sRGB texture is decoded to linear when sampled and re-encoded on write to an
-//! sRGB surface, so a resolve of an untouched target is bit-identical to having drawn directly
-//! to the surface. `the_two_pass_path_is_pixel_identical_to_the_one_pass_path` is that claim as
-//! a test, and it is the whole reason acceptance's "nothing regresses" is checkable rather than
-//! asserted. Choosing a different format here — a wider one for headroom, say — would make the
-//! resolve a colour conversion, and every effect built on top would be authored against a
-//! subtly different image from the one the single-pass path produces.
-//!
-//! # The CPU tier's answer, decided here
-//!
-//! `tiny-skia` has no target chain and is not getting one. So the answer for the CPU tier is
-//! not "a slower version of this", it is [`Floor`](crate::frame::Floor) — the mechanism
-//! [`crate::frame::Fidelity`] already provides, and the same one `PrimKind::Glow` uses. Every
-//! effect built on this target **must** declare `Fidelity::Enhanced { floor }`, and the parity
-//! suite then holds the CPU tier to that floor exactly, rather than to whatever a missing pass
-//! happens to leave behind.
-//!
-//! Stating it here rather than in the blur chunk is the point. Deferred, the question gets
-//! answered three times, differently, by whoever is implementing each effect.
+//! The color target uses the surface format. Its resolve pass samples and writes
+//! that format without an additional color conversion. Effects that need an
+//! offscreen target declare a CPU fallback through [`crate::frame::Fidelity`].
 
 use crate::path::RenderPath;
 
@@ -179,33 +136,13 @@ impl OffscreenTarget {
     }
 }
 
-/// The lighting pass's own target: what one surface does to another, per pixel (T018).
+/// Offscreen target for the lighting pass.
 ///
-/// # Three channels, and why
+/// Uses `Rgba8Unorm`, requiring `width * height * 4` bytes: 8,294,400 at
+/// 1920×1080 or 33,177,600 at 3840×2160. The renderer allocates it on the
+/// first frame with a renderable scene and recreates it after a resize.
 ///
-/// Bounced light is chromatic — an amber selection spills amber, not grey — so a
-/// single-channel target cannot carry it (research R9's note, revising R11's single-channel
-/// estimate). The format is `Rgba8Unorm`: attenuation and addition are both bounded inside
-/// `0..=1` by the allowance tokens (`addition_max` ships at 0.35 linear), so 8 bits per
-/// channel suffice, and the fourth channel is padding — stated here so a reader does not go
-/// looking for what alpha means. It means nothing.
-///
-/// # Cost, stated before it is spent
-///
-/// `width x height x 4`: **8,294,400 bytes at 1920x1080 and 33,177,600 at 3840x2160** — the
-/// same figures as the colour target, because the format has the same stride. Counted
-/// against the same GPU allocation ceiling as everything else, and pinned by
-/// `the_lighting_targets_cost_is_the_one_that_was_stated` so a wider format for headroom is
-/// argued for rather than merged. Allocated **lazily**, on the first frame that carries a
-/// renderable scene, so an installation that never turns the mode on carries none of it.
-///
-/// # What does not exist yet
-///
-/// No pipeline reads or writes this target — the lighting shaders are US1's tasks. It is
-/// allocated here, ahead of them, because its memory cost and resize behaviour are exactly
-/// the decisions T018 wants made in the open rather than under a visual feature, and because
-/// `usage` is part of that decision: RENDER_ATTACHMENT for the pass that will fill it,
-/// TEXTURE_BINDING for the modulation that will read it.
+/// The texture supports both render attachment and texture binding use.
 pub struct LightingTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -306,13 +243,9 @@ impl LightingTarget {
 /// which is what moves the effect from "measure before shipping" to "measure and ship".
 pub const BLUR_DOWNSAMPLE: u32 = 4;
 
-/// The Gaussian's standard deviation, in **downsampled** texels.
+/// Gaussian standard deviation in downsampled texels.
 ///
-/// Four texels, which at [`BLUR_DOWNSAMPLE`] is **16 physical pixels** at 1x scale. That is the
-/// figure to argue with: it is a little over one row height at the comfortable density, so a
-/// popover shows the list behind it as bands of colour with no legible glyph left in them --
-/// which is UXDD 10.2's "legible as context" in the direction that matters, since context that
-/// can still be *read* competes with the panel's own text.
+/// Four texels at [`BLUR_DOWNSAMPLE`] correspond to 16 physical pixels.
 pub const BLUR_SIGMA_TEXELS: f32 = 4.0;
 
 /// Where the kernel is truncated, in downsampled texels: `2.5 * sigma`, rounded.

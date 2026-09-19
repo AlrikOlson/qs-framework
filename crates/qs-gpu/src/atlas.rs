@@ -1,82 +1,17 @@
-//! The R8 coverage glyph atlas.
+//! Glyph and image atlases with bounded uploads and CLOCK eviction.
 //!
-//! # The eviction problem, stated precisely
+//! Entries used in the current frame cannot be evicted. When no space can be
+//! freed, [`AtlasStats::overflow_events`] records the overflow.
 //!
-//! Research R8 flags this as the second-most-likely place M0 fails, and names the
-//! constraint: a CJK corpus with tens of thousands of distinct glyphs will exceed atlas
-//! capacity, and "eviction must not flicker rows still on screen".
+//! [`UploadClass::Structural`] and [`UploadClass::Content`] have separate upload
+//! budgets, so text cannot consume the space reserved for icons. Content requests
+//! collected by [`GlyphAtlas::want`] are admitted in demand order by
+//! [`GlyphAtlas::admit_demanded`]. Callers emit deferred glyph instances after
+//! admission.
 //!
-//! That sentence rules out the obvious implementation. Resetting the atlas when it fills
-//! is trivial and wrong -- it invalidates glyphs that the *current* frame has already
-//! emitted draw calls for, and the row they belong to renders as garbage for a frame. So
-//! eviction here has one hard rule: **an entry used in the current frame is never
-//! evicted.** When no entry is evictable, the working set genuinely exceeds the atlas, and
-//! that is the cliff R8 exists to locate. It is counted in
-//! [`AtlasStats::overflow_events`] and reported, not smoothed over.
-//!
-//! # Why CLOCK and not true LRU
-//!
-//! Eviction runs inside a frame that is already over budget, so it must be O(1) amortized.
-//! A true LRU needs an intrusive list; CLOCK (FIFO with a second chance) needs a queue and
-//! a bit, approximates LRU closely for this access pattern, and cannot degrade into a scan.
-//! Under thrash the difference between LRU and CLOCK is a few percent of hit rate; the
-//! difference between either and an O(n) scan is the frame budget.
-//!
-//! # Why a per-frame upload bound
-//!
-//! Rasterizing is CPU work and uploading is bandwidth. A fling that reveals two thousand
-//! new glyphs at once would spend the whole frame on them. The bound spreads that across
-//! frames: some glyphs are missing for a frame or two during a violent scroll, which is
-//! far less visible than a 40 ms stall, and it is recorded either way.
-//!
-//! # How the bound is spent, and why it is not first-come
-//!
-//! A bound alone says how much may be uploaded, not *what*. Spending it on whoever asked
-//! first means spending it in draw order, and draw order is top-to-bottom: a cold frame of
-//! realistic filenames wants around 73 distinct glyphs against the CPU tier's 64, so the
-//! first rows got their text and the last rows rendered shredded. That is not a budget
-//! problem -- the budget is nearly enough -- it is an *allocation* problem, and the atlas
-//! had no vocabulary for it. It has two now.
-//!
-//! **[`UploadClass`] separates the bounded from the unbounded.** Icons and emblems are
-//! [`UploadClass::Structural`]: there are at most a dozen of them in any frame, each one
-//! serves every row of its kind, and once resident they never cost anything again. Glyphs
-//! are [`UploadClass::Content`]: there is no bound on how many distinct ones a corpus can
-//! want, so they are the thing that has to be rationed. Rationing them against the *same*
-//! counter meant a page of text could starve the folder icon, which is why the row builder
-//! grew a hand-written prepass that resolved icons before asking for a single glyph. The
-//! two classes have separate bounds now, so that ordering is a rule here rather than a
-//! property of which loop a caller happened to run first.
-//!
-//! **Within content, admission is demand-ordered.** [`GlyphAtlas::want`] records that a
-//! draw wants a key without rasterizing it; [`GlyphAtlas::admit_demanded`] then spends the
-//! content bound on the keys the frame wanted *most*. A letter in forty filenames is
-//! admitted before a letter in one, so the first cold frame reads as text with a few
-//! characters missing rather than as the top half of a list. The caller pays for this by
-//! deferring the instances it could not emit until after `admit_demanded` -- see
-//! `qs_ui::ListRenderer::flush_text`, which is the only correct way to use `want`.
-//!
-//! # Two pages, one atlas
-//!
-//! A coverage mask has one channel and a picture has four, so they cannot share texels.
-//! They share everything else. [`AtlasPage::Coverage`] is the R8 texture this module was
-//! built around; [`AtlasPage::Colour`] is an RGBA8 texture beside it, and *beside* is the
-//! only thing about it that is separate: one [`GlyphAtlas`] owns both, one `resident` map
-//! addresses both, one CLOCK queue sweeps both, one [`AtlasStats`] reports both, and one
-//! [`ATLAS_CAP_BYTES`] is checked over both in [`AtlasBudget`].
-//!
-//! **The split is static, and that is stronger than a shared pool.** The failure worth
-//! preventing is a folder of photographs evicting the file list's glyphs -- the user sees
-//! scrolling get slow, a long way from anything they did. A byte pool shared between
-//! pictures and text permits exactly that. Two fixed pages make it unreachable: an image
-//! cannot occupy a coverage slot, so it cannot take one. What the single cap buys instead
-//! is that the two page sizes are chosen together, once, against one number, rather than
-//! one of them being added later without anybody re-deriving the total.
-//!
-//! **Eviction is one policy with a page filter.** [`GlyphAtlas::evict_until_room`] sweeps
-//! the same CLOCK queue with the same second chance and the same never-evict-in-use rule;
-//! a resident on the wrong page is put back untouched, exactly as an in-use one is. There
-//! is no second policy to keep in step with the first.
+//! Coverage masks use an R8 page and images use an RGBA8 page. Their sizes are
+//! fixed within one memory cap. Both pages share bookkeeping and eviction policy,
+//! but an image cannot occupy a coverage slot or evict a glyph to make room.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -156,11 +91,9 @@ impl RgbaImage {
     }
 }
 
-/// The whole atlas's memory ceiling, in bytes. SDD 7.3.
+/// Combined memory limit for the coverage and color atlas pages, in bytes.
 ///
-/// **One number over both pages**, which is the point: a colour cache sized on its own
-/// merits is a colour cache nobody added to the glyph budget, and the total is what the
-/// host actually pays. [`AtlasBudget::fits`] is the one place it is checked.
+/// [`AtlasBudget::fits`] checks their total allocation.
 pub const ATLAS_CAP_BYTES: u64 = 96 * 1024 * 1024;
 
 /// The default colour page edge, in texels.
@@ -318,12 +251,10 @@ pub struct AtlasEntry {
     pub top: i32,
     pub width: u32,
     pub height: u32,
-    /// The atlas generation this entry belongs to.
+    /// Atlas generation for this entry.
     ///
-    /// A caller that holds an entry across frames must compare this against
-    /// [`GlyphAtlas::generation`] before using the UVs. Nothing in M0 does -- the row
-    /// builder re-queries every frame -- but the field is the difference between "we
-    /// happen not to have that bug" and "that bug is detectable".
+    /// Before reusing an entry across frames, compare this value with
+    /// [`GlyphAtlas::generation`] to ensure its texture coordinates are still valid.
     pub generation: u64,
 }
 
@@ -498,10 +429,10 @@ impl Page {
     }
 }
 
-/// CPU-side atlas state. The GPU texture is owned by the caller and updated through
-/// [`GlyphAtlas::take_uploads`], which keeps this type free of any `wgpu` dependency and
-/// therefore testable without a device -- and usable unchanged by the CPU rasterizer,
-/// which is what makes RP-2 (all tiers consume the same draw lists) true for text as well.
+/// CPU-side atlas state shared by the GPU and CPU renderers.
+///
+/// The caller owns the textures and applies updates from
+/// [`GlyphAtlas::take_uploads`].
 #[derive(Debug)]
 pub struct GlyphAtlas {
     coverage: Page,
@@ -741,12 +672,10 @@ impl GlyphAtlas {
         self.insert_image(atlas_key, &image)
     }
 
-    /// Whether `key` is known to have no ink -- a space, or a mark that rendered empty.
+    /// Whether `key` is known to produce no ink, such as a space character.
     ///
-    /// Callers need this to tell the two harmless `None`s from [`GlyphAtlas::get_or_insert`]
-    /// apart from the harmful one. A blank is text that is *supposed* to be invisible;
-    /// counting it as a missing glyph would make the SC-006 signal fire on every line that
-    /// contains a space, which is every line.
+    /// Use this to distinguish a valid blank glyph from a failed or deferred
+    /// lookup when [`GlyphAtlas::get_or_insert`] returns `None`.
     pub fn is_blank(&self, key: impl Into<AtlasKey>) -> bool {
         self.resident
             .get(&key.into())

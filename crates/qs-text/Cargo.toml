@@ -1,6 +1,6 @@
 [package]
 name = "qs-text"
-description = "Shaping, shaped-run caching, glyph rasterization and bidirectional resolution."
+description = "Text shaping, font lookup, bidirectional text and glyph rasterization."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

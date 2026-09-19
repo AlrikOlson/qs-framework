@@ -1,9 +1,4 @@
-//! The `winit`-backed platform layer.
-//!
-//! This is the only file in the workspace that names a `winit` type in a signature the
-//! application uses, and that is the point of research R1's "behind a thin trait": when the
-//! hand-written per-OS layer arrives, this file is deleted and [`crate::PlatformWindow`]
-//! stays.
+//! `winit` implementation of the platform window and display interfaces.
 
 use std::sync::Arc;
 

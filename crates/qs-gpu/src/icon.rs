@@ -1,42 +1,18 @@
-//! Kind-based vector icons, rasterized into the glyph atlas.
+//! Vector icons rasterized into the coverage atlas.
 //!
-//! UXDD 10.4: a 20 px grid, a 1.5 px stroke, "drawn as vectors and rasterized at exact
-//! device resolution -- never scaled bitmaps". Both halves of that sentence decide the
-//! design here.
+//! Icons use a 20-pixel reference grid and a 1.5-pixel stroke. Rasterization runs
+//! at the requested device-pixel size, which also serves as the cache key.
 //!
-//! # Why icons live in the *glyph* atlas
-//!
-//! An icon is a glyph that isn't from a font. It is an 8-bit coverage mask that gets tinted
-//! at draw time and sampled through the same UV rectangle, so it wants exactly what
-//! [`crate::atlas::GlyphAtlas`] already provides: shelf packing, CLOCK eviction, the rule
-//! that an entry used this frame is never evicted, and the per-frame upload bound. Giving
-//! icons their own texture would duplicate all four and add a second bind group to the
-//! batcher; instead the atlas *key* widened to [`crate::atlas::AtlasKey`] and nothing else
-//! changed. The payoff is that icons ride the existing `Glyph` primitive, which is what
-//! makes them render identically on all three tiers without a single tier-specific line.
-//!
-//! # Why the key is device pixels, not (size, scale)
-//!
-//! A 20 px icon at 150 % and a 30 px icon at 100 % are the *same rasterization*. Keying on
-//! the pair would store both. Keying on the rounded device pixel size collapses them, which
-//! is also the only key that can honestly claim "rasterized at exact device resolution":
-//! there is one entry per distinct pixel grid, by construction.
-//!
-//! # Why no blank memoization
-//!
-//! [`GlyphAtlas::get_or_insert`](crate::atlas::GlyphAtlas::get_or_insert) memoizes glyphs
-//! that render with no ink, because a space is text that is *supposed* to be invisible.
-//! An icon that renders with no ink is a bug in this file. [`rasterize`] therefore returns
-//! `None` rather than an empty bitmap, so the failure reaches `glyphs_dropped` instead of
-//! being absorbed as "correctly blank".
+//! Icons share glyph packing, eviction and rendering. An empty icon bitmap is
+//! reported as a failure; unlike a space character, an icon should contain ink.
 
 use qs_text::RasterizedGlyph;
 use tiny_skia::{FillRule, LineCap, LineJoin, Mask, Path, PathBuilder, Stroke, Transform};
 
-/// The design grid every path in this file is drawn on. UXDD 10.4.
+/// Reference grid size for icon paths.
 pub const GRID: f32 = 20.0;
 
-/// Stroke weight, in grid units. UXDD 10.4.
+/// Stroke width in reference-grid units.
 pub const STROKE: f32 = 1.5;
 
 /// Icons below this many device pixels are refused: a 1.5-unit stroke on a grid this small
@@ -65,7 +41,7 @@ pub const EMBLEM_STROKE: f32 = 3.0;
 /// State-icon stroke weight, in grid units. Between [`STROKE`] and [`EMBLEM_STROKE`], for the
 /// same reason both of those exist: a state icon is asked for at the size chrome has room for
 /// -- around 12 device pixels in a tab -- where 1.5 units is 0.9 of a pixel. See
-/// [`state_path`].
+/// `state_path`.
 pub const STATE_STROKE: f32 = 2.1;
 
 /// The icon set. One variant per visually distinct silhouette, not one per file extension:
@@ -186,31 +162,11 @@ impl Emblem {
     }
 }
 
-/// The state of something that is running, as a shape rather than as a codepoint.
+/// Vector icons for activity states.
 ///
-/// # Why these are vectors, and why that is a fix rather than a feature
-///
-/// `qs::terminal::Status` carried its state in a `mark: &'static str` — U+25CF, U+25CB,
-/// U+25B2 — and its own doc records what that cost: the first build used U+26A0 for the
-/// failure states, and U+26A0 came out as a notdef box on this machine's fallback stack. The
-/// response at the time was to retreat to Geometric Shapes (U+25xx), "the one block a shot has
-/// confirmed this renderer resolves", which is an honest promise and a small one. It is still
-/// a promise about somebody else's font.
-///
-/// A shape in this module is drawn from a `PathBuilder` and rasterized by `tiny-skia`. There is
-/// no font in the path at all, so there is no machine on which it fails to resolve. That makes
-/// the *drawn* state channel unconditional, which is what FR-021 wanted and what a codepoint
-/// could not give it. The words stay: a reader who is not looking at the screen needs
-/// [`crate::icon`] to be silent and `Status::words` to carry the state, which is why the icon
-/// replaces the mark on the surface and never in the accessible name.
-///
-/// # Why the harness states are here and not in the harness crate
-///
-/// `qs-term` is a leaf that knows nothing about drawing, and `qs-gpu` knows nothing about
-/// terminals. The shapes are the renderer's; the *mapping* from a session's state to one of
-/// them is `qs`'s, at the one place that already turns a `Lifecycle` into ink
-/// (`qs::terminal::status`). A state enum in this module that named PTY conditions would be
-/// the renderer holding an opinion about processes.
+/// The application maps its state to an icon. Paths are rasterized directly,
+/// so they do not depend on font coverage. Supply a text description alongside
+/// the icon for accessibility.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum StateIcon {
     /// Alive, and nothing better is known. The floor's live state.
@@ -221,8 +177,7 @@ pub enum StateIcon {
     Failed,
     /// An identified harness that is doing something.
     Working,
-    /// An identified harness that is blocked on a person. The state ADR 014 calls the one a
-    /// supervisor most needs to see, which is why it is the loudest silhouette in the set.
+    /// A session waiting for a person to respond.
     AwaitingApproval,
     /// An adapter that was disbelieved. The session fell back to the floor, and this says so
     /// rather than showing the last thing the adapter claimed.

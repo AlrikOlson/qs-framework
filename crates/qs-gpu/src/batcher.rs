@@ -1,13 +1,7 @@
-//! The instanced pipeline: one shader, one vertex buffer, one draw call per batch.
+//! Instanced rendering with one instance upload and one draw call per batch.
 //!
-//! Passes 0-1 (rounded-rect fill and stroke) and pass 3 (text) all run through
-//! `shaders/instance.wgsl`. See that file for why the primitive kind is a branch inside one
-//! pipeline rather than three pipelines.
-//!
-//! Geometry is generated in the vertex shader from `vertex_index`, so the only per-frame
-//! upload is the instance buffer. At the fastest fling that is roughly 96 KB -- one
-//! `write_buffer` and one `draw` per batch, which is what keeps CPU submit time off the
-//! frame budget.
+//! `shaders/instance.wgsl` handles the primitive kinds. The vertex shader generates
+//! geometry from `vertex_index`, so each frame uploads only instance data.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -107,10 +101,9 @@ pub struct Renderer {
     /// recreated only on resize" is a claim about a thing that is otherwise invisible, and a
     /// per-frame reallocation of 33 MB looks exactly like a correct render.
     offscreen_allocations: u32,
-    /// The lighting pass's target (T018). Lazy for the same reason as `offscreen`, one
-    /// mode further out: allocated on the first frame that carries a renderable scene, so
-    /// the mode being off costs no memory as well as no work. See
-    /// [`crate::target::LightingTarget`] for the format, the three channels and the cost.
+    /// Lighting target, allocated on the first frame with a renderable scene.
+    ///
+    /// See [`crate::target::LightingTarget`] for its format and memory use.
     lighting: Option<LightingTarget>,
     /// Counted for the same reason as `offscreen_allocations`.
     lighting_allocations: u32,
@@ -1066,34 +1059,17 @@ impl Renderer {
         }
     }
 
-    /// Encode one frame.
+    /// Encode a frame into `target`.
     ///
-    /// # Two paths, and the first one is still the normal one
+    /// Frames without backdrop effects render directly. Effects that sample
+    /// earlier output use an offscreen target and a resolve pass.
     ///
-    /// With no primitive asking to sample its neighbourhood, this renders straight to
-    /// `target` exactly as it always has: one pass, one command buffer, no extra allocation.
-    /// With one, the instance pass renders into an offscreen colour target and a resolve pass
-    /// puts it back. `the_two_pass_path_is_pixel_identical_to_the_one_pass_path` asserts the
-    /// two produce the same image when nothing has actually sampled the backdrop, which is
-    /// what keeps the addition from being a silent regression.
+    /// The lighting pass runs between the leading untextured surface batches
+    /// and the first atlas-sampled batch. All later batches retain their order,
+    /// including untextured overlays, so text and icons are drawn after lighting.
     ///
-    /// # The surface/content split (T019)
-    ///
-    /// The batch sequence is drawn in two halves around [`surface_content_split`]: the
-    /// leading run of untextured batches — the **surfaces** — and everything from the first
-    /// atlas-sampled batch on — the **content**. The lighting pass, when it lands (US1),
-    /// slots exactly between them, which is what makes "text is drawn after lighting and
-    /// never lit" (lit-contrast rule 1) a property of this function's shape rather than of
-    /// anyone's care. The split is a *cut*, never a re-sort: batches keep their order on both
-    /// sides, so composition is untouched and an overlay ground drawn above earlier text
-    /// stays above it — unlit, which rule 1 permits; reordered, which it does not, is the
-    /// version [`crate::batcher::tests::the_split_is_a_cut_at_the_first_textured_batch`]
-    /// goes red on.
-    ///
-    /// `scene` is the frame's lit-mode geometry, from [`crate::frame::Consumer::scene`].
-    /// Today it drives exactly one thing: a renderable scene allocates the lighting target
-    /// (T018), so the mode's memory cost appears when the mode does. No pass reads the
-    /// target yet.
+    /// `scene` supplies the frame's lighting geometry. Targets are allocated
+    /// when the frame first needs them.
     pub fn render(
         &mut self,
         ctx: &GpuContext,
@@ -1582,15 +1558,10 @@ impl Renderer {
     }
 }
 
-/// Where the batch sequence divides into surfaces and content (T019).
+/// Index of the first atlas-sampled batch.
 ///
-/// The index of the first atlas-sampled batch: everything before it is a surface the
-/// lighting pass may modulate, everything from it on is content — drawn after lighting,
-/// never lit (lit-contrast rule 1). A **cut, not a partition by flag**: an untextured batch
-/// *after* the first textured one stays in the content half, because moving it would
-/// reorder composition — an overlay's ground drawn above a lower layer's text has to stay
-/// above it. The price is that such a ground goes unlit, which rule 1 permits; the
-/// alternative prices are a reordered frame or lit glyphs, and both are defects.
+/// The lighting pass runs before this batch. Later untextured batches stay
+/// in place to preserve compositing order, so those surfaces are not lit.
 fn surface_content_split(batches: &[Batch]) -> usize {
     batches
         .iter()
@@ -1617,32 +1588,11 @@ fn instance_is_blur(instance: &Instance) -> bool {
     instance.kind == PrimKind::Blur as u32
 }
 
-/// Where the batch sequence stops being **the backdrop**.
+/// Index of the first instance that samples the backdrop, or the list's end.
 ///
-/// The index of the first batch carrying a primitive that samples what is behind it, or the
-/// end of the list when none does. Everything before this index is drawn into the offscreen
-/// target and blurred; everything from it on is drawn afterwards, over the resolved surface,
-/// with that blur bound.
-///
-/// A **cut, not a partition**, for exactly [`surface_content_split`]'s reason and with a
-/// sharper consequence: a later instance that samples nothing stays on the far side of the
-/// cut, because it was authored to sit *above* the panel and moving it under would reorder
-/// composition. The price is that such an instance is not part of any panel's backdrop — which
-/// is correct, since it is drawn after the panel and a backdrop is what is behind.
-///
-/// # An INSTANCE index, and the first version was a batch index
-///
-/// A batch is a run sharing a scissor rect and a texture binding, and **nothing groups
-/// instances by kind** — so a panel is very often in the same batch as the rows behind it. Cut
-/// at the batch, that panel's backdrop is everything before its batch, which for a list drawn
-/// in one batch is *nothing at all*: the target holds the clear colour, the chain blurs a flat
-/// field, and the panel renders as its own tint over a uniform ground.
-///
-/// That is not a hypothetical. The first build cut at the batch, and `blur_panel` — one
-/// `end_batch` at the end, like any small draw list — produced two panels three levels apart
-/// out of 255 and a chain that had allocated, run three passes and been given a blank image to
-/// blur. Every test was green. The failure mode is exactly research R15's: an effect that is
-/// correct, bounded, allocated, executed, and invisible.
+/// Earlier instances form the offscreen backdrop. This is an instance index
+/// because a panel can share a batch with the content behind it. Cutting at
+/// the batch boundary would omit that content from the backdrop.
 fn backdrop_split(list: &DrawList) -> u32 {
     list.instances
         .iter()

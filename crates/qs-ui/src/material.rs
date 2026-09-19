@@ -1,55 +1,13 @@
-//! Named looks: the component half of the shader/component pairing.
+//! Materials defined as ordered stacks of drawing layers.
 //!
-//! A [`crate::tokens::Tokens`] answers "what colour is this" and "how much space is that".
-//! A **material** answers "what does a selected row look like", and it answers it from
-//! `design/tokens.json` rather than from a function. Before this existed, `row.rs` decided
-//! its own radii, its own washes and its own layering; `chrome.rs` decided the bar's; the
-//! grid path decided a third copy of the first. Each new surface copied whichever it was
-//! sitting next to, and there was no single place a look could be changed.
+//! `design/tokens.json` supplies colors, spacing, radii and effect settings.
+//! Each material lists the backgrounds it can appear over and the foregrounds
+//! drawn on it. [`Material::composites`] evaluates those layer combinations for
+//! contrast checks.
 //!
-//! # A material is a stack of layers, and a layer is one [`PrimKind`]
-//!
-//! ```json
-//! "row/selected": {
-//!   "over": ["surface/base", "surface/row-alt"],
-//!   "text": ["content/primary", "content/secondary", "content/tertiary"],
-//!   "layers": [
-//!     { "effect": "glow", "color": "border/focus", "alpha": 0.45, "reach": "lg" },
-//!     { "effect": "fill", "color": "surface/row-selected" }
-//!   ]
-//! }
-//! ```
-//!
-//! Every value in it is already a token: a colour name, a step from the space scale, a
-//! radius class. There is no number in a material that widget code could have hard-coded
-//! instead, which is Constitution VII applied to a *look* rather than to a colour.
-//!
-//! # `over` and `text` are what make the contrast gate see a composite
-//!
-//! Text does not sit on a token; it sits on whatever the layer stack composited to at that
-//! fragment. `cargo xtask contrast` could not see that before, which is why the ordering
-//! rule "the halo goes **under** the fill" was a comment in `row.rs` rather than a gate: a
-//! glow drawn on top would deepen the selected row's background by whatever the accent
-//! contributes and quietly cost the secondary and tertiary text the 4.5:1 their token is
-//! authored to preserve, and every check would stay green.
-//!
-//! A material states the surfaces it is drawn `over` and the foregrounds drawn on it, and
-//! [`Material::composites`] walks every in-shape stop combination of the stack. Moving the
-//! glow above the fill now changes a colour the gate is looking at.
-//!
-//! # Fidelity does not leak into call sites
-//!
-//! A layer names an effect kind, and [`PrimKind::fidelity`] already says what the CPU tier
-//! owes that kind. So [`Material::fidelity`] is derived, not declared, and the tier decision
-//! stays in `qs-gpu`: [`Material::compile`] emits the enhanced instance and
-//! [`qs_gpu::frame::Instance::cpu_floor`] resolves it to the floor. A call site asking for
-//! `row/selected` on the CPU tier gets the fill without the halo and never learns which tier
-//! it is on.
-//!
-//! Forced-colours mode is the one thing resolved here rather than there, because it is a
-//! *token-layer* fact and not a tier one: [`crate::tokens::Tokens::effects_enabled`] is
-//! false, so enhanced layers are dropped and a gradient collapses to the stop it names as
-//! its `flat`.
+//! [`Material::compile`] emits instances. Their primitive kinds determine CPU
+//! fallbacks through [`qs_gpu::frame::Instance::cpu_floor`]. Forced-colors mode
+//! disables enhanced effects and uses the declared flat colors for gradients.
 
 use std::collections::BTreeMap;
 
@@ -67,11 +25,7 @@ use crate::tokens::TokenError;
 use crate::substance::Substance;
 
 pub mod name {
-    /// The window's ground, painted before anything else.
-    ///
-    /// The one material whose surface is the whole viewport. It replaces nothing a call site
-    /// used to build by hand, because there was nothing: the ground was the draw list's clear
-    /// colour, which is a single value and cannot be lit.
+    /// Background material covering the viewport, drawn before other surfaces.
     pub const SURFACE_CANVAS: &str = "surface/canvas";
     /// A row's own body on an unbanded row, and the surface
     /// [`crate::substance::Substance`] varies. Albedo `surface/base`.
@@ -88,8 +42,7 @@ pub mod name {
     pub const CHROME_CHIP_HOVER: &str = "chrome/chip-hover";
     /// The status shelf's backing and its hairline.
     pub const CHROME_SHELF: &str = "chrome/shelf";
-    /// A popover, and the inspector's panel: glass over a blurred backdrop, with the opaque
-    /// `surface/raised` UXDD 10.7 chose as its floor.
+    /// A panel over a blurred backdrop, with an opaque `surface/raised` fallback.
     pub const CHROME_POPOVER: &str = "chrome/popover";
 
     /// Every material a call site in this workspace names.
@@ -141,12 +94,7 @@ impl Surface {
     }
 }
 
-/// Which edge band of the surface a layer occupies.
-///
-/// A hairline and a specular top light are the same idea with a different sign, and both
-/// are geometry a *material* should be able to state — the command bar's hairline used to be
-/// a second `Instance::rect` pushed by `chrome.rs` immediately after the gradient, which is
-/// exactly the hand-built stack this chunk exists to remove.
+/// The edge band occupied by a layer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {
@@ -423,29 +371,18 @@ pub enum LayerDef {
         #[serde(flatten)]
         geometry: GeometryDef,
     },
-    /// Glass: a tint over a blurred copy of whatever is behind the shape.
+    /// A tint over a blurred backdrop.
     ///
-    /// The layer that lets a material ask for **depth** rather than a call site assembling a
-    /// blur. What a surface using this is saying is "I am in front of things", and the two
-    /// colours it names are the two answers to that on the two kinds of machine.
-    ///
-    /// [`Fidelity::Enhanced`] with a floor of the plain fill, and the floor is `floor` rather
-    /// than `color` -- which is the opposite of every other layer here and the whole point.
-    /// UXDD 10.7 fixed this effect's fallback as **opaque `surface/raised`** before the effect
-    /// existed, and named a translucent unblurred panel as the wrong answer. `color` is the
-    /// glass, which is translucent by definition; degrading to it is exactly the wrong answer.
-    /// So the two are separate fields with separate names, and [`PrimKind::Blur`] records what
-    /// the tempting single-colour spelling ships instead.
+    /// `color` is the translucent glass tint. `floor` is the opaque fill used
+    /// by the CPU renderer and contrast checks.
     Backdrop {
         /// The glass: what is composited over the blurred backdrop. Translucent, or the blur
         /// is invisible and this is a fill with extra passes.
         color: String,
         #[serde(default)]
         alpha: Option<f32>,
-        /// The opaque panel a machine that cannot blur shows instead, and the colour the
-        /// contrast gate reads. Required, not defaulted: an effect with no floor cannot ship
-        /// (UXDD 10.7), and defaulting it to `color` would make every backdrop material ship
-        /// the fallback the table forbids.
+        /// Required opaque fallback color for rendering without blur.
+        /// Contrast checks use this color.
         floor: String,
         /// How this layer responds to the material's drive. See [`SwellDef`].
         #[serde(default)]
@@ -496,29 +433,12 @@ pub struct FieldCentreDef {
     pub phase: f32,
 }
 
-/// What a material is being told about the moment it is being painted in.
+/// Animation input for a material.
 ///
-/// Two numbers that answer two different questions, which is why they are one type rather
-/// than one float:
-///
-/// - `intensity` is **how loud**. It comes from a [`crate::motion::MotionPlan`] that is
-///   running, falls to zero as that plan settles, and is what [`SwellDef`] factors against.
-/// - `phase` is **where in a cycle**. A swell can make a halo twice as bright; it cannot say
-///   that a highlight is three-quarters of the way around a border, and no amount of
-///   factoring toward a swell target expresses a position.
-///
-/// # The phase is not a clock, and that is structural
-///
-/// It is advanced inside [`crate::motion::InteractionMotion::advance`], which the frame loop
-/// already calls once per frame while some *other* animation holds a ticket open — and it is
-/// deliberately not part of what that function returns. So the phase rides wakefulness the
-/// application already had and can never manufacture any, which is the property
-/// `frame-pacing-bound` exists to protect. Reading a wall clock here instead would advance
-/// the phase while the loop slept and jump the picture on the first frame after, which is a
-/// sweep that teleports.
-///
-/// See `think:52` for why a shader uniform lost, and `think:59` for why this is the only
-/// source that neither wakes the loop nor discontinues across a sleep.
+/// `intensity` controls swell and falls to zero as an animation settles.
+/// `phase` gives the position in a cycle. It advances through
+/// [`crate::motion::InteractionMotion::advance`] while the frame loop is
+/// already active, so a material does not start its own timer.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Drive {
     /// How hard the material is being driven, `0.0..=1.0`.
@@ -557,18 +477,10 @@ impl Drive {
     }
 }
 
-/// What the material's **phase** does to one layer.
+/// How a material's phase changes a layer.
 ///
-/// Zero everywhere means the layer is phase-inert, which is the default and what every
-/// shipped material is today: [`Layer::driven`] then returns the layer untouched, so a
-/// material with no phase-consuming layer compiles to bit-identical instances whatever the
-/// phase is. `a_material_with_no_phase_consuming_layer_is_untouched_by_one` is what says so.
-///
-/// One field, and it is spelled on a primitive that already existed rather than on one that
-/// was waiting: a ramp whose axis rotates is a drifting light, drawn by the gradient the
-/// pipeline has drawn since M0. [`PrimKind::Sweep`] arrived later and needed nothing added
-/// here — it states its travel through the same `rotate`, applied to the same `angle` field —
-/// which is what settling the contract before the shader was for.
+/// Zero values leave the layer unchanged. Rotation changes the angle of
+/// a gradient or sweep through [`Layer::driven`].
 #[derive(Clone, Copy, PartialEq, Debug, Default, Deserialize)]
 pub struct PhaseDef {
     /// Whole turns this layer's ramp axis rotates over one cycle.
@@ -583,44 +495,20 @@ pub struct PhaseDef {
     /// and `rotate: 1.0` carries it around the shape exactly once per cycle.
     #[serde(default)]
     pub rotate: f32,
-    /// How hard this layer's **emission** shimmers over one cycle, as a fraction.
+    /// Fractional amplitude of the emission shimmer.
     ///
-    /// A real lamp is never perfectly steady: mains ripple, filament thermals and the
-    /// convection over a tube all put a small aperiodic wobble on the light. `0.06` is a
-    /// six per cent peak-to-peak shimmer, which is about what a person reads as "alive"
-    /// without reading as "faulty".
-    ///
-    /// It rides the same **phase** the canvas field and the chrome sweeps ride, and that is
-    /// the whole reason it is affordable: `InteractionMotion::advance` moves the phase only
-    /// while some other animation is already holding the frame loop open, so the lamp
-    /// shimmers through a scroll, a selection move or a navigation and is a still picture
-    /// between them. A lamp that flickered forever would render forever, and SC-003 — zero
-    /// rendering work at rest — is a gate this project measures rather than hopes for.
-    ///
-    /// The shimmer's own peak is folded into [`Material::LAMP_PEAK`]'s companion
-    /// [`Material::FLICKER_PEAK`], so the contrast gate bounds the brightest instant rather
-    /// than the average one.
+    /// It uses the material cycle, which advances while another animation
+    /// keeps the frame loop active. It stays still at rest.
+    /// [`Material::flicker_peak`] reports its maximum for contrast checks.
     #[serde(default)]
     pub flicker: f32,
 }
 
-/// How much louder a layer gets while its material is being driven.
+/// Layer multipliers at full animation intensity.
 ///
-/// A material is painted with a **drive** in `0..=1` that a call site reads off a
-/// [`crate::motion::MotionPlan`] — the selection's halo flares while the region is
-/// travelling and settles when it lands. Each factor is what the parameter is multiplied by
-/// at full drive, interpolated from `1.0` at rest, so a layer that states no swell is
-/// unaffected by the drive and a material with no swells is a still picture.
-///
-/// Factors rather than absolute values, for the reason [`crate::tokens::Tokens`] scales an
-/// animated state's alpha rather than setting it: the authored value stays the thing the
-/// design system says, and the animation is a proportion of it.
-///
-/// This is the whole of "animated materials". There is no clock: the drive arrives per
-/// frame from the same plan machinery that already moves hover, press, selection and
-/// density, so an animated material retires exactly when that plan does and Reduce Motion
-/// switches it off at the source — a reduced plan is instant, so its progress is immediately
-/// 1, so the drive is 0, so nothing swells. See `think:52` for why a uniform clock lost.
+/// Each factor interpolates from one at rest to its configured value at
+/// full drive. Reduced motion makes layout transitions instant, leaving
+/// their drive at zero.
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
 pub struct SwellDef {
     /// Multiplies the layer's opacity. Clamped at full opacity, not beyond it.
@@ -697,28 +585,18 @@ pub struct MaterialDef {
     /// Foregrounds drawn on top of this material, for the contrast gate.
     #[serde(default)]
     pub text: Vec<String>,
-    /// The foregrounds this material carries **when it is drawn lit**.
+    /// Foregrounds used when the material emits light.
     ///
-    /// A surface that emits changes the ground under its own label, so the ink that works
-    /// on it unlit is not the ink that works on it lit — an emissive panel wants dark
-    /// lettering the way a lightbox sign does. Declaring the second set is what lets the
-    /// gate check BOTH states instead of one: `text` against the albedo composite, these
-    /// against the same composite plus the emission's closed-form peak.
-    ///
-    /// Empty means the material's ink does not change, which is every material that does
-    /// not emit. A material that declares emission and no lit ink is checked at its lit
-    /// extreme with its ordinary ink, and fails there if the lamp washes it out — which is
-    /// the honest outcome rather than a special case.
+    /// Contrast checks evaluate these colors against the composite plus its
+    /// peak emission. An empty list keeps the ordinary foregrounds.
     #[serde(default)]
     pub text_lit: Vec<String>,
     #[serde(default)]
     pub description: String,
-    /// A step from the elevation scale, or absent for a surface that lies on the canvas.
+    /// Named elevation step for the whole material.
     ///
-    /// A property of the **material**, never of a layer: every layer of one material sits at
-    /// the same height, or the material would describe an object with two of them
-    /// (specs/002-ray-traced-mode/data-model.md). A step name rather than a number, exactly
-    /// as `radius` is a class and `reach` is a space step — Principle VII.
+    /// Absent means the surface lies on the canvas. All layers share the
+    /// same elevation.
     #[serde(default)]
     pub elevation: Option<String>,
 }
@@ -778,7 +656,7 @@ pub struct Layer {
     ///
     /// Carried on the layer even though the *instance* does not carry it, and that is the
     /// whole point: this is the one copy, read twice. [`crate::tokens::Tokens::field`] takes it
-    /// to the draw list for the shader, and [`Layer::in_shape_stops`] takes it to the contrast
+    /// to the draw list for the shader, and `Layer::in_shape_stops` takes it to the contrast
     /// gate. A field authored anywhere else would be a second place colour is decided.
     pub field: FieldWash,
     /// How much of the field's colour reaches its ground, `0..=1`.
@@ -867,11 +745,10 @@ impl Layer {
         }
     }
 
-    /// The shimmer factor at `phase`, for an amplitude of `amount`.
+    /// Shimmer factor at `phase` with amplitude `amount`.
     ///
-    /// Bounded by construction: the three components sum to at most `amount`, so the factor
-    /// lies in `1 ± amount` and [`Material::FLICKER_PEAK`] can state the brightest instant
-    /// in closed form — which is what the contrast gate needs to bound a lamp that moves.
+    /// The result lies in `1 ± amount`. [`Material::flicker_peak`] provides
+    /// the maximum for contrast checks.
     #[must_use]
     pub fn shimmer(phase: f32, amount: f32) -> f32 {
         flicker(phase, amount)
@@ -1018,12 +895,10 @@ pub struct Material {
 }
 
 impl Material {
-    /// The strongest fidelity any layer needs.
+    /// The strongest rendering requirement among the layers.
     ///
-    /// Derived from [`PrimKind::fidelity`] rather than declared in the token file, so a
-    /// material cannot claim a tier promise the pipeline does not keep. A material with no
-    /// enhanced layer is [`Fidelity::Exact`], which is the honest answer for a stack of
-    /// fills.
+    /// Derived from [`PrimKind::fidelity`]. A material without enhanced layers
+    /// is [`Fidelity::Exact`].
     #[must_use]
     pub fn fidelity(&self) -> Fidelity {
         self.layers
@@ -1281,24 +1156,12 @@ impl Material {
             .max(0.0)
     }
 
-    /// This material as the lighting pass sees it: one slab, the shape of its body layer.
+    /// Build a lighting slab from the material's body layer.
     ///
-    /// The geometry comes from [`layer_shape`] on the same [`Layer`] that
-    /// [`Material::compile`] turns into the body instance — scene-handoff rule 1's exact
-    /// agreement is this shared origin, not a comparison somebody remembers to run. The body
-    /// is the first full-coverage surface layer: not a halo (drawn outside the shape), not an
-    /// edge band, not a displaced contact shadow, because a shadow cast by any of those would
-    /// come from a shape that is not the surface.
-    ///
-    /// `None` for a material that is fully transparent — an invisible surface that casts a
-    /// shadow is a shadow from nothing (see [`crate::scene::occupies_scene`]) — or one with
-    /// no full-coverage layer, which today does not exist and would be a stack of hairlines.
-    ///
-    /// The albedo is the body's `flat` stop: the colour the CPU floor and forced-colours mode
-    /// already collapse this surface to, so the three degraded descriptions of one thing
-    /// agree instead of being three guesses. Emission stays zero here — authoring it is US2's
-    /// task (T050), and a slab that emitted before the tokens could say so would be a light
-    /// nobody can turn off.
+    /// Uses the same geometry as [`Material::compile`]. Halos, edge bands
+    /// and displaced shadows do not define the body. Returns `None` for
+    /// transparent materials or materials without a full-coverage layer.
+    /// The body's flat stop supplies the albedo.
     #[must_use]
     pub fn slab(&self, surface: Surface) -> Option<qs_gpu::scene::Slab> {
         if !crate::scene::occupies_scene(self) {
@@ -1386,7 +1249,7 @@ impl Material {
     pub const LAMP_PEAK: f32 = 1.30;
 
     /// The brightest instant of the lamp's shimmer, as a multiplier on its authored
-    /// emission — `1 + amplitude`, since [`flicker`]'s three components sum to at most one.
+    /// emission — `1 + amplitude`, since `flicker`'s three components sum to at most one.
     ///
     /// Folded into [`Material::emission_peak`] so the contrast gate bounds the lamp at its
     /// PEAK rather than at its resting value. A gate that checked the average would pass a

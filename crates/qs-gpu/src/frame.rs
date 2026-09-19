@@ -1,26 +1,10 @@
-//! Draw lists, the UI→Render handoff, and the thread-affinity guards.
+//! Draw lists and the handoff between UI and render threads.
 //!
-//! # The handoff is the architecture
+//! The UI thread publishes an owned draw list through a triple buffer. The render
+//! thread takes the newest available frame; intermediate frames may be dropped.
+//! Each thread owns a separate slot, so rendering does not hold up frame building.
 //!
-//! Constitution II forbids `Arc<Mutex<AppState>>` and requires frames to render from
-//! immutable snapshots. This module is where that stops being a principle and becomes a
-//! data structure: the UI thread builds a [`DrawList`] and publishes it; the render thread
-//! takes the most recent one. Neither ever waits for the other.
-//!
-//! A triple buffer is the right shape for exactly this. Two buffers would force the
-//! producer to wait whenever the consumer holds one. Three means the producer always owns
-//! a slot it can write, the consumer always owns a slot it can read, and the third is
-//! wherever the handoff currently sits. The cost is one extra draw list of memory; the
-//! benefit is that a slow frame on the GPU can never stall input handling, which is the
-//! entire point.
-//!
-//! A queue was the alternative and is worse here: if the renderer falls behind, a queue
-//! grows and the user sees stale frames drain out after they stop scrolling. A triple
-//! buffer drops intermediate frames instead, which is what you want -- nobody wants to
-//! watch the scroll they already finished.
-//!
-//! The ordering claims in [`DrawListChannel`] are checked by `tests/loom_handoff.rs` under
-//! `loom`, not asserted in a comment and hoped for.
+//! `tests/loom_handoff.rs` checks the handoff's memory ordering.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -66,17 +50,12 @@ pub enum PrimKind {
     /// in linear sRGB -- see [`crate::color::linear_rgb_to_oklab`] for why that is a
     /// correctness question rather than a preference.
     Gradient = 3,
-    /// Pass 0's shape with a soft outer falloff: the shape, solid, surrounded by a halo
-    /// that fades to nothing over [`Instance::param`] pixels.
+    /// A filled shape with a halo that fades outside its edge.
     ///
-    /// [`Instance::color`] is the tint at the shape's edge, [`Instance::uv`] the tint at the
-    /// falloff limit as premultiplied linear RGBA, and [`Instance::param`] the falloff
-    /// distance in physical pixels. The distance comes from the same `sd_rounded_box` the
-    /// fill uses -- no blur pass, no second render target, no derivative, which is the only
-    /// reason a halo is reachable from a single-pass pipeline at all.
-    ///
-    /// The first [`Fidelity::Enhanced`] primitive: `tiny-skia` cannot approximate it at any
-    /// tolerance, so the CPU tier draws nothing (UXDD 10.7).
+    /// [`Instance::color`] is the edge tint, [`Instance::uv`] is the outer tint
+    /// in premultiplied linear RGBA, and [`Instance::param`] is the falloff
+    /// distance in physical pixels. The shader uses the rounded-box distance
+    /// field. The CPU fallback draws nothing.
     Glow = 4,
     /// Pass 0's shape again, read with the opposite sign: a soft light that is brightest at
     /// the boundary and vanishes [`Instance::param`] pixels *inward*.
@@ -91,27 +70,15 @@ pub enum PrimKind {
     /// what separates it from [`PrimKind::Glow`]: the quad needs no extra padding, and the
     /// shape's own one-pixel coverage is what stops the light at the edge.
     Rim = 5,
-    /// Pass 0's shape given a **surface**: a bevelled edge shaded by a Cook-Torrance
-    /// microfacet BRDF.
+    /// A beveled surface shaded with a Cook-Torrance microfacet BRDF.
     ///
-    /// [`Instance::color`] is the albedo. [`Instance::uv`] is `[bevel, roughness, metallic,
-    /// environment]` -- the bevel in physical pixels, the other three in `0..=1`.
-    /// [`Instance::param`] is unused.
+    /// [`Instance::color`] is the albedo; [`Instance::uv`] stores bevel width
+    /// in physical pixels, roughness, metallic fraction and environment weight.
+    /// [`Instance::param`] carries emission.
     ///
-    /// The normal is **analytic**, not sampled: `sd_rounded_box` has a closed-form gradient,
-    /// so the distance the fill already computes plus the direction of the nearest edge is a
-    /// normal exactly, with no `fwidth` and no neighbouring fragment. That is the only reason
-    /// a microfacet model is reachable from a single pass that forbids derivatives, and it is
-    /// also what lets `tier_parity` transcribe it rather than give up on it.
-    ///
-    /// Hardware ray tracing was considered for the reflection and refused: it wants an
-    /// acceleration structure over scene geometry that a list of rectangles does not have, and
-    /// buying it would cost the Reduced tier, the CPU tier and SC-009. The ray tracing that is
-    /// here is the part with a closed form -- the reflected ray against an infinite
-    /// environment, which needs nothing traversed and no second pass.
-    ///
-    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)`: unlit, the surface is its own
-    /// albedo, which is a plainer version of the same thing rather than a broken one.
+    /// The shader derives the normal from the rounded-box distance field and
+    /// samples an analytic environment. It needs no scene acceleration structure.
+    /// The CPU fallback is a rectangle filled with the albedo.
     Pbr = 6,
     /// Pass 0's shape with the ramp taken **around** it rather than across it: a conic sweep,
     /// offset by a phase, so a highlight can travel around a border.
@@ -133,146 +100,41 @@ pub enum PrimKind {
     /// See [`PrimKind::fidelity`] for why declaring a floor would have been a claim rather than
     /// a concession.
     Sweep = 7,
-    /// The ambient colour field: several coloured centres, drifting, composited over a base.
+    /// A drifting color field composited over a base color.
     ///
-    /// The only primitive whose subject is the **window** rather than a component, and the only
-    /// one that reads a scene property instead of carrying its own data. [`Instance::color`] is
-    /// the base the field is composited over — and therefore what the CPU tier draws instead of
-    /// it — [`Instance::uv`] is `[amplitude, 0, 0, 0]`, and [`Instance::param`] is the phase in
-    /// radians. The centres themselves are on the [`DrawList`] as a [`FieldWash`], for the
-    /// reason [`Environment`] is: four centres are roughly 190 bytes, the stride is 48, and a
-    /// field is a property of the scene rather than of each object.
-    ///
-    /// One instance covers the viewport, which makes this the first primitive whose cost is
-    /// **fragment work rather than instance count**. That is why the falloff has bounded
-    /// support: a centre past its reach contributes exactly nothing, so the per-fragment cost
-    /// is four `max`es and not four unbounded tails.
-    ///
-    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)`, which resolves to the base colour
-    /// alone — a flat ground, which is the plainer version of the same window that UXDD 10.7
-    /// asks for and is what the field converges to anyway where no centre reaches.
+    /// [`Instance::color`] is the base, [`Instance::uv`] is `[amplitude, 0, 0, 0]`,
+    /// and [`Instance::param`] is the phase in radians. The centers come from the
+    /// draw list's [`FieldWash`]. Centers contribute only within their reach.
+    /// The CPU fallback draws a rectangle in the base color.
     Field = 8,
-    /// A picture: an RGBA sub-rectangle of the atlas's colour page, blitted into the
-    /// instance's rectangle.
+    /// An image sampled from the atlas's RGBA color page.
     ///
-    /// [`Instance::uv`] is `[u0, v0, u1, v1]` in normalized colour-page coordinates, the same
-    /// way [`PrimKind::Glyph`]'s is for the coverage page. [`Instance::color`] is a **tint**,
-    /// multiplied through: opaque white leaves the picture alone, and a lower alpha is how a
-    /// thumbnail fades in without a second primitive. [`Instance::radius`] and
-    /// [`Instance::param`] are unused -- a rounded picture wants the shape's coverage
-    /// multiplied into the sample, which is a second thing this does not do yet and would be
-    /// a change to the fragment stage rather than to the instance.
-    ///
-    /// **The second primitive that samples a texture, and it needed a second one.** A glyph
-    /// samples one channel and multiplies by a colour, which is why the tempting version of
-    /// this chunk was a greyscale thumbnail through `KIND_GLYPH` and no renderer change at
-    /// all. That was refused deliberately: it lets the texture's format decide what the
-    /// product is allowed to show. See `colour-atlas-for-images`.
-    ///
-    /// [`Fidelity::Exact`]. `tiny-skia` blits an RGBA pixmap, and both tiers read the same
-    /// atlas coordinates from the same [`crate::atlas::GlyphAtlas`], so declaring a floor
-    /// would be a concession nothing forces -- the same argument [`PrimKind::Sweep`] records.
+    /// [`Instance::uv`] holds normalized `[u0, v0, u1, v1]` coordinates.
+    /// [`Instance::color`] multiplies the sample; opaque white preserves it.
+    /// `radius` and `param` are unused. The image has square corners.
+    /// Both GPU and CPU renderers support this primitive.
     Image = 9,
-    /// Pass 0's shape filled with a **blurred copy of what is behind it**, tinted: the glass
-    /// a popover and the inspector sit behind, UXDD 10.2's "depth via real blur".
+    /// A tinted, blurred copy of the content behind the shape.
     ///
-    /// The first kind whose [`PrimKind::needs_backdrop`] is `true`, and therefore the first
-    /// that cannot be drawn from its own fragment alone. What it samples is the frame's own
-    /// prior output, blurred by [`crate::target::BlurChain`] -- so the renderer cuts the batch
-    /// sequence at the first batch carrying one of these, draws everything before it into the
-    /// offscreen target, blurs *that*, and only then draws this. A blur that sampled a target
-    /// containing the whole frame would be sampling the panel itself.
+    /// The renderer captures the backdrop before the first sampling instance
+    /// and blurs it through [`crate::target::BlurChain`].
     ///
-    /// # Which field carries what, and why it is this way round
-    ///
-    /// [`Instance::color`] is the **opaque floor** -- what the panel is on a tier that cannot
-    /// blur -- and [`Instance::uv`] is the glass tint composited over the blurred backdrop, as
-    /// premultiplied linear RGBA the way [`PrimKind::Gradient`]'s far stop is.
-    /// [`Instance::param`] is unused.
-    ///
-    /// The obvious encoding is the other way round, and it fails UXDD 10.7 in exactly the way
-    /// the table names. [`Instance::cpu_floor`] keeps `color` and drops `uv`, so a translucent
-    /// scrim in `color` degrades to *a translucent unblurred panel* -- the answer 10.7 calls
-    /// out by name as wrong. Inverted, `Floor::Plain(Rect)` resolves to the opaque panel the
-    /// table asks for through machinery that already exists, and the contrast gate reads the
-    /// floor rather than a tint over content nothing can predict.
-    ///
-    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)`, which is the opaque
-    /// `surface/raised` UXDD 10.7 chose before the effect existed.
+    /// [`Instance::color`] holds the opaque CPU fallback. [`Instance::uv`]
+    /// holds the premultiplied glass tint, and [`Instance::param`] is unused.
+    /// All blur instances in a frame share the blurred backdrop.
     Blur = 10,
-    /// [`PrimKind::Pbr`]'s surface with its **bevel made of glass**: the view ray is bent
-    /// through the same analytic normal and marched into a sharp copy of what is behind the
-    /// panel, so the edge magnifies and displaces the content beyond it.
+    /// A PBR surface with refraction along its bevel.
     ///
-    /// The second kind whose [`PrimKind::needs_backdrop`] is `true`, and the one that made
-    /// "the backdrop" two things rather than one. A blur wants the *blurred* copy, at a
-    /// quarter resolution, because destroying the high frequencies is the effect; refraction
-    /// wants the **sharp** one at full resolution, because displacing the high frequencies is
-    /// the effect. Both are bound -- the blurred chain at group 2, the offscreen target itself
-    /// at group 3 -- and they hold the same content, cut at the same place.
+    /// [`Instance::color`] is the albedo. [`Instance::uv`] stores bevel width,
+    /// roughness, metallic fraction and environment weight. [`Instance::param`]
+    /// is refraction strength in `0..=1`; zero gives the non-emissive PBR surface.
     ///
-    /// # The fields are [`PrimKind::Pbr`]'s, field for field
+    /// The shader samples a sharp, full-resolution backdrop. Refraction falls
+    /// to zero at the inner edge of the bevel, leaving the label background
+    /// unchanged. Index of refraction, depth and dispersion are shader constants.
     ///
-    /// [`Instance::color`] is the albedo, [`Instance::uv`] is `[bevel, roughness, metallic,
-    /// environment]`, and [`Instance::param`] is the **refraction strength** in `0..=1` where
-    /// the PBR surface's carries emission. That is not economy, it is the floor: at a strength
-    /// of zero this kind is bit-identical to a non-emissive [`PrimKind::Pbr`], which is what
-    /// makes "the surface without the glass is the surface" a measurement rather than a claim.
-    ///
-    /// The index of refraction, the slab's depth and the dispersion spread are **not here**.
-    /// They are constants in `shaders/instance.wgsl`, for the reason `LIGHT_DIR` is: glass is
-    /// glass, and a per-instance IOR lets one panel author a physically fine surface that
-    /// disagrees with the panel beside it. It is also what keeps [`Instance`] at 48 bytes,
-    /// which four more scalars would not.
-    ///
-    /// # Why it stops at the bevel
-    ///
-    /// The transmitted term is weighted by the rim's profile -- full at the boundary,
-    /// identically zero `bevel` pixels inward -- and that single decision answers three
-    /// separate questions at once.
-    ///
-    /// *Contrast.* `qs_ui::substance` records the rule three refused encodings established:
-    /// only **edge-localised** material properties are free against the contrast budget,
-    /// because the gate checks the albedo and cannot see what the shader does to the middle of
-    /// a surface. A panel that transmitted across its whole face would show the file list
-    /// through the inspector, with the inspector's own labels on top of it, under a green
-    /// `cargo xtask contrast`. Stopped at the bevel, the ground under every label is
-    /// bit-identical to the PBR surface's, and
-    /// `refraction_never_reaches_the_middle_of_a_surface` measures that rather than asserting
-    /// it -- the same shape `emission_never_reaches_the_middle_of_a_surface` already has.
-    ///
-    /// *Cost.* The march early-outs where the profile is zero, so the fragments that march are
-    /// the bevel band -- roughly perimeter times bevel -- and never the panel's interior. That
-    /// much is structural: `share` is exactly zero there and the branch is not taken.
-    ///
-    /// **What it buys in milliseconds was measured and is smaller than the claim this
-    /// paragraph originally made.** `examples/refract_cost` runs a full-width panel and then
-    /// three grids of twenty-four, arranged so that area and band move independently. A
-    /// full-width refracting panel costs **+0.015 ms/frame** on Vulkan and **+0.005 ms** on GL
-    /// against the two-pass control -- 0.18% and 0.06% of the 8.33 ms budget -- and
-    /// twenty-four panels carrying **4.4x** the band cost +0.014 ms, which is the same number.
-    /// So the frame-time cliff the chunk's acceptance was written against does not appear in
-    /// any configuration measured, and the early-out is not why: the march is simply cheap
-    /// where it runs.
-    ///
-    /// Whether the remaining cost is the band or the panel's own shading is **unresolved**, and
-    /// the harness says so rather than guessing. Ratios of 1.28 and 1.66 came back as 1.81 and
-    /// 1.99 from the identical run immediately afterwards; with five interleaved repeats the
-    /// per-configuration spread (0.004 ms) is the same size as the difference being attributed
-    /// (0.004 ms). `specs/001-gpu-list-spike/findings.md` records the same shape of mistake at
-    /// the other end of the repository. See `docs/refraction/cost.md`.
-    ///
-    /// *Physics.* It is also simply what a bevelled slab looks like. The deviation is where the
-    /// surface is turned away from the viewer; the flat middle of a pane refracts a ray
-    /// straight through and displaces nothing.
-    ///
-    /// [`Fidelity::Enhanced`] with a floor of `Plain(Rect)` -- **[`PrimKind::Pbr`]'s own
-    /// floor, reused verbatim**. `Plain(Pbr)` is the tempting answer and is refused by
-    /// `a_floor_is_always_a_primitive_the_cpu_tier_actually_draws`: a floor names a kind the
-    /// CPU tier really draws, and [`Instance::cpu_floor`] resolves exactly one level on
-    /// purpose. The two degradations the chunk asks for are therefore two mechanisms, not one
-    /// chain -- the CPU tier gets the albedo through `Floor`, and a frame with no backdrop
-    /// bound gets the PBR shading path in the shader, which already exists.
+    /// Without a backdrop, the shader uses PBR shading. The CPU fallback draws
+    /// a rectangle in the albedo color.
     Refract = 11,
     /// Pass 1's band drawn as dashes: the same inside-aligned stroke, its coverage cut by
     /// an on/off pattern walked along the shape's perimeter.
@@ -375,38 +237,12 @@ impl PrimKind {
         }
     }
 
-    /// What the CPU tier is held to for this primitive.
+    /// The CPU rendering requirement for this primitive.
     ///
-    /// The third exhaustive match, and the one that decides which question `tier_parity`
-    /// asks.
-    ///
-    /// [`PrimKind::Glow`] was the first [`Fidelity::Enhanced`] kind. Its floor was decided
-    /// before the effect existed -- UXDD 10.7 -- and it is `Nothing` rather than a plain fill
-    /// because a hard rectangle standing in for a halo reads as a bug, where an absent halo
-    /// reads as a plainer theme. The information the glow carries is carried anyway by the
-    /// selection fill and the focus ring, which is the constraint 10.7 imposes on any effect
-    /// that wants a floor of nothing.
-    ///
-    /// [`PrimKind::Rim`] is the second, and its floor is `Nothing` for a different reason
-    /// than the glow's. `Plain(Stroke)` is the tempting answer -- a rim is an edge treatment
-    /// and a stroke is the plain version of one -- and it fails on a detail of
-    /// [`Instance::cpu_floor`]: `param` is dropped on the way down to a plain floor, so the
-    /// rim's width cannot come along, and the CPU tier's stroke arm then draws whatever its
-    /// own `max(0.1)` guard produces from a zero width. That is not the plainer design 10.7
-    /// asks for, it is an accident at the rim's own low opacity. A floor that could carry a
-    /// width needs a [`Floor`] variant that says so, which is a larger decision than one
-    /// primitive. `Nothing` is legitimate here for the same reason it was for the glow: the
-    /// rim carries no information alone. On `chrome/chip-hover` the hover state is said by
-    /// the fill and by the outline stroke, both `Exact`, both drawn on every tier.
-    ///
-    /// [`PrimKind::Sweep`] is `Exact`, and it is the one kind here whose chunk asked for a
-    /// floor and did not get one. A floor is a concession -- *the fallback tier cannot draw
-    /// this* -- and it would have been false. A sweep is the gradient with a different `t`:
-    /// the same two stops, the same Oklab walk, the same dither, the same fill coverage, and
-    /// `cpu_raster::ramp_colour` already takes a `t` rather than deriving one. Declaring a
-    /// floor would have deleted a travelling accent from exactly the tier where a focus or
-    /// working state has the least else saying it, in exchange for about twenty lines nobody
-    /// had to save. See `think:69`.
+    /// Exact primitives are compared with the shader output. Enhanced primitives
+    /// declare a simpler fallback. Glow and rim effects draw nothing on the CPU;
+    /// their associated state must also be conveyed by a fill or outline.
+    /// Sweeps are rendered on both paths.
     #[must_use]
     pub const fn fidelity(self) -> Fidelity {
         match self {
@@ -472,28 +308,11 @@ impl PrimKind {
         }
     }
 
-    /// Whether this primitive is a function of **its neighbours** rather than of its own
-    /// fragment, and so needs the frame drawn into an offscreen target it can sample.
+    /// Whether the primitive needs to sample previously rendered content.
     ///
-    /// The fourth exhaustive match. The target infrastructure (`crate::target`) landed before
-    /// the first effect that uses it, deliberately, so its memory cost, resize behaviour and
-    /// tier answer were decided in the open rather than under a visual feature.
-    /// [`PrimKind::Blur`] is the first arm to flip and [`PrimKind::Refract`] is the second.
-    ///
-    /// **There is no third, and the prediction that there would be is worth keeping as a
-    /// correction rather than deleting.** This sentence used to name bloom as well. Bloom is
-    /// not a primitive: the instance pipeline's layout already binds four groups and four is
-    /// what WebGPU guarantees, so there is nowhere to put a bloom texture and a bloom that
-    /// shared group 2 with the blur would bind one of two images per draw span, silently. It
-    /// composites in the resolve pass instead and is a frame property — see [`Bloom`]. A
-    /// primitive is a thing *at a place*; the reason both survivors here are primitives and
-    /// bloom is not is that a panel has a rect and "the bright parts of this window" does not.
-    ///
-    /// A `true` here obliges two things. The renderer takes its two-pass path for the whole
-    /// frame, which costs one full-viewport target — 8.3 MB at 1080p, 33.2 MB at 4K. And the
-    /// primitive **must** be [`Fidelity::Enhanced`] with a real [`Floor`], because `tiny-skia`
-    /// has no target chain and is not getting one; `no_backdrop_primitive_claims_the_cpu_tier_can_draw_it`
-    /// is what turns that obligation into a build failure rather than a review comment.
+    /// Blur and refraction require an offscreen backdrop and declare CPU
+    /// fallbacks. Bloom is handled separately in the resolve pass through
+    /// [`Bloom`].
     #[must_use]
     pub const fn needs_backdrop(self) -> bool {
         match self {
@@ -560,18 +379,11 @@ impl PrimKind {
     }
 }
 
-/// How much of a primitive the CPU tier is required to reproduce.
+/// How closely the CPU renderer must reproduce a primitive.
 ///
-/// `tier_parity` transcribes `shaders/instance.wgsl` into Rust and holds [`CpuRasterizer`]
-/// to the same pixels, which is the right rule for a rounded rect and an impossible one for
-/// a glow: `tiny-skia` has no blur, no per-pixel noise and no fresnel, at any tolerance. The
-/// two ways out of that both fail. Restricting the shader to what `tiny-skia` can match
-/// rules out most of what makes an interface feel modern; letting an effect diverge and
-/// raising the bounds to cover it breaks SC-005 *quietly*, and quietly is the part that
-/// matters -- a suite that tolerates an unstated difference cannot tell it from a bug.
-///
-/// So an effect names what it becomes when it cannot be drawn, and the suite checks that
-/// instead. The divergence stops being discovered and starts being specified.
+/// Exact primitives are compared with a Rust evaluation of the shader.
+/// Enhanced primitives declare a fallback that the CPU renderer can draw;
+/// tests compare against that fallback.
 ///
 /// [`CpuRasterizer`]: crate::cpu_raster::CpuRasterizer
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -614,16 +426,13 @@ pub enum Floor {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
 pub struct Instance {
-    /// `[x, y, width, height]` in physical pixels, already rebased against the scroll
-    /// offset on the CPU (research R5 -- the rebasing is what makes `f32` safe here).
+    /// `[x, y, width, height]` in physical pixels, rebased against the scroll
+    /// offset before conversion to `f32`.
     pub rect: [f32; 4],
-    /// Four kind-specific floats.
+    /// Four primitive-specific values.
     ///
-    /// For [`PrimKind::Glyph`] they are `[u0, v0, u1, v1]` in normalized atlas coordinates,
-    /// which is what the name is for. Every other kind samples no texture, so the field is
-    /// four floats of headroom rather than four wasted ones: [`PrimKind::Gradient`] spends
-    /// them on its far stop, as premultiplied linear RGBA. A kind that wants neither leaves
-    /// them zero.
+    /// Glyphs and images use normalized atlas coordinates. Other primitives
+    /// use the values for colors or effect parameters; see [`PrimKind`].
     pub uv: [f32; 4],
     /// Premultiplied linear RGBA8 -- see [`crate::color`]. The near stop, for a gradient.
     pub color: u32,
@@ -756,23 +565,10 @@ impl Instance {
         }
     }
 
-    /// The ambient field, composited over `base`, across the whole of `rect`.
+    /// Draw the ambient field over `base` across `rect`.
     ///
-    /// The centres are **not** here: they are on the [`DrawList`] as a [`FieldWash`], because
-    /// four of them do not fit in 48 bytes and a field is a property of the scene. What this
-    /// carries is what varies per draw.
-    ///
-    /// `amplitude` is how much of the field's colour reaches the base, `0..=1`. It is the one
-    /// number that decides whether this is ambience or a competitor for the content in front
-    /// of it, and it is clamped here rather than trusted: the contrast gate checks each centre
-    /// at the full amplitude a material authored, so a value past one would be a surface the
-    /// gate measured and the renderer then exceeded.
-    ///
-    /// `phase` is in radians, like [`Instance::sweep`]'s, and comes from the material drive.
-    ///
-    /// `base` is what the field is composited over, and therefore also what the CPU tier draws
-    /// in place of the whole thing — see [`PrimKind::Field`]. Those being the same colour is
-    /// the reason the floor is honest rather than a guess.
+    /// Centers come from the draw list's [`FieldWash`]. `amplitude` is clamped
+    /// to `0..=1`, and `phase` is in radians. The CPU fallback draws `base`.
     pub fn field(x: f32, y: f32, w: f32, h: f32, amplitude: f32, phase: f32, base: Srgba) -> Self {
         Self {
             rect: [x, y, w, h],
@@ -853,36 +649,14 @@ impl Instance {
         }
     }
 
-    /// A bevelled surface shaded by a real microfacet BRDF.
+    /// Create a beveled surface with microfacet shading.
     ///
-    /// `bevel` is in **physical** pixels, like every other distance in `rect`. `roughness`,
-    /// `metallic` and `environment` are `0..=1`: a roughness near zero is a mirror and near
-    /// one is chalk, a metallic of one removes the diffuse lobe and tints the reflection with
-    /// the albedo, and the environment scales how much of the surrounding sky the surface
-    /// picks up.
+    /// `bevel` is in physical pixels. `roughness`, `metallic` and `environment`
+    /// range from zero to one. The shader clamps roughness away from zero to
+    /// avoid a singular specular lobe.
     ///
-    /// Roughness is clamped away from exactly zero in the shader rather than here, because
-    /// the floor is a property of the BRDF -- a perfect mirror has a specular lobe of zero
-    /// width and infinite height, which is a division by zero rather than a very shiny
-    /// surface.
-    ///
-    /// `emission` makes the surface a **light** rather than only a thing that is lit: it
-    /// returns its own albedo on top of what it reflects. It is spent in [`Instance::param`],
-    /// which this kind previously left unused, so the 48-byte stride does not move.
-    ///
-    /// It is **localised to the bevel**, and that is the entire reason it is allowed to exist.
-    /// The profile is the rim's: full at the boundary, identically zero `bevel` pixels inward.
-    /// Contract rule 1a (`specs/002-ray-traced-mode/contracts/lit-contrast.md`) lets a
-    /// meaning-bearing element emit and forbids it to light **the ground directly behind
-    /// itself**, and it puts that boundary at the bevel. A row is much taller than twice its
-    /// bevel, so the ground under its filename is not dimmed or nearly-unchanged -- it is
-    /// bit-identical, and `emission_never_reaches_the_middle_of_a_surface` measures that
-    /// rather than asserting it.
-    ///
-    /// A uniform emissive surface was the obvious alternative and is the same class of
-    /// encoding `qs_ui::substance` refused three times: it changes what the whole surface
-    /// returns, the contrast gate checks the albedo, and it would ship a moving ground under
-    /// a green build.
+    /// `emission` adds the albedo along the bevel. Its contribution reaches
+    /// zero at the inner edge, leaving the background under the label unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn pbr(
         x: f32,
@@ -979,7 +753,7 @@ impl Instance {
     /// computed against `GlyphAtlas::size()` addresses the wrong texels. Take it from the
     /// [`crate::atlas::AtlasEntry`] and the arithmetic is already done.
     ///
-    /// `tint` multiplies the sample. [`crate::color::Srgba::WHITE`] leaves the picture as it
+    /// `tint` multiplies the sample. An opaque white tint leaves the picture as it
     /// was decoded; a lower alpha fades it, which is how a thumbnail arrives without a
     /// second primitive to cross-fade with.
     pub fn image(x: f32, y: f32, w: f32, h: f32, uv: [f32; 4], tint: Srgba) -> Self {
@@ -993,23 +767,11 @@ impl Instance {
         }
     }
 
-    /// A pane of glass: `tint` over a blurred copy of whatever is behind `w x h`.
+    /// Draw a tinted panel over a blurred backdrop.
     ///
-    /// The argument order is the encoding, and it is deliberately not the one every other
-    /// constructor here has. `floor` comes last but it is what lands in [`Instance::color`],
-    /// because `color` is what [`Instance::cpu_floor`] carries down to `Floor::Plain(Rect)` --
-    /// so `floor` is the opaque panel a machine without the effect sees, and it is the colour
-    /// the contrast gate reads. `tint` is the glass, and it goes to `uv` beside the gradient's
-    /// far stop.
-    ///
-    /// Passing them the other way round compiles, renders correctly on a GPU, and ships the
-    /// exact fallback UXDD 10.7 names as wrong. That is why they are named rather than being a
-    /// `near`/`far` pair, and why `the_floor_is_the_opaque_panel_and_not_the_glass` measures
-    /// which one survives the degradation rather than trusting the argument list.
-    ///
-    /// The blur's radius is **not** here. One blurred copy of the backdrop serves every blur
-    /// instance in the frame -- see [`crate::target::BlurChain`] -- so a per-instance radius
-    /// would be a parameter that silently does nothing to the second panel on screen.
+    /// `floor` is the opaque CPU fallback stored in [`Instance::color`].
+    /// `tint` is the glass color stored in [`Instance::uv`]. Every panel uses
+    /// the frame's shared blur radius and backdrop from [`crate::target::BlurChain`].
     pub fn blur(x: f32, y: f32, w: f32, h: f32, radius: f32, tint: Srgba, floor: Srgba) -> Self {
         Self {
             rect: [x, y, w, h],
@@ -1099,10 +861,8 @@ pub struct Batch {
 pub struct DrawStats {
     pub rows_laid_out: u32,
     pub glyphs_rasterized: u32,
-    /// Glyphs wanted this frame that the atlas could not supply, almost always because the
-    /// per-frame upload bound deferred them. A non-zero value is text that is missing from
-    /// the screen right now (SC-006), so it is a counter that has to be *shown* somewhere;
-    /// the diagnostics overlay is where.
+    /// Requested glyphs the atlas could not supply this frame, usually because
+    /// the upload budget deferred them. Expose this counter in diagnostics.
     pub glyphs_dropped: u32,
     /// Icons wanted this frame that the atlas could not supply.
     ///
@@ -1192,13 +952,10 @@ pub fn shadow_direction() -> [f32; 2] {
     [x / length, y / length]
 }
 
-/// How many centres a [`FieldWash`] carries.
+/// Number of centers stored in a [`FieldWash`].
 ///
-/// Fixed rather than variable, because the field lives in a uniform block and a uniform's
-/// layout is decided when the pipeline is compiled. Four is what the chunk asked for and is
-/// the number at which a window stops reading as a gradient and starts reading as a field;
-/// an unused centre costs a `max(0, ...)` that resolves to zero, which is cheaper than the
-/// branch that would skip it.
+/// The count is fixed by the uniform-buffer layout. Unused centers have
+/// zero contribution.
 pub const FIELD_CENTRES: usize = 4;
 
 /// One coloured centre of a [`FieldWash`].
@@ -1333,12 +1090,10 @@ pub struct DrawList {
     /// Monotonic; the render thread uses it to tell a re-presented frame from a new one.
     pub generation: u64,
     pub stats: DrawStats,
-    /// Time from the input event that caused this frame to the moment the list was
-    /// committed. This is the quantity SC-002 gates (FR-023) and it is measured here, at
-    /// the handoff, because that is the last instant that is unambiguously ours -- past it
-    /// the numbers belong to the driver and the compositor.
+    /// Time from the triggering input event to draw-list publication.
     ///
-    /// `None` for a frame not caused by input (a resize, a first paint).
+    /// Excludes driver and compositor time. `None` for frames without a
+    /// triggering input event, such as the initial paint.
     pub input_to_commit: Option<Duration>,
 }
 
@@ -1545,11 +1300,10 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    /// Take the newest published draw list, if there is one that has not been taken.
+    /// Take the newest draw list that has not already been consumed.
     ///
-    /// `None` means nothing new since the last call -- the correct response is to
-    /// re-present the previous frame, or to do nothing at all, which is what keeps an idle
-    /// window at 0 Hz (SC-003).
+    /// `None` means no new frame is available. The caller can keep the previous
+    /// frame or leave the window idle.
     pub fn acquire(&mut self) -> Option<&DrawList> {
         if self.channel.state.load(Ordering::Acquire) & FRESH == 0 {
             return None;
@@ -1628,15 +1382,10 @@ impl DrawListChannel {
 
 // -- thread affinity ---------------------------------------------------------------
 
-/// Debug-build guards asserting which thread is running.
+/// Debug assertions for UI and render thread affinity.
 ///
-/// FR-016 and Constitution I say no blocking work on the UI or Render thread. That is
-/// unenforceable as a code review rule at any real size -- the violation is usually three
-/// call levels below the function anyone reviewed. These guards make the *thread* checkable
-/// at the boundary, so a helper that grew a file read shows up as a failing debug assertion
-/// rather than as a p99 someone notices two milestones later.
-///
-/// Compiled out entirely in release: the frame path pays nothing.
+/// Use these guards to detect blocking operations on a frame thread.
+/// They are compiled out in release builds.
 pub mod affinity {
     use std::sync::OnceLock;
     use std::thread::ThreadId;
@@ -1689,10 +1438,9 @@ pub mod affinity {
         );
     }
 
-    /// Assert that a blocking operation is *not* happening on a frame thread.
+    /// Assert that a blocking operation is not running on a frame thread.
     ///
-    /// Call this from anything that does file I/O, takes a contended lock, or waits. It is
-    /// the one guard that catches the class of bug FR-016 is actually about.
+    /// Call before file I/O, a potentially contended lock, or a blocking wait.
     #[inline]
     pub fn assert_may_block(what: &str) {
         debug_assert!(

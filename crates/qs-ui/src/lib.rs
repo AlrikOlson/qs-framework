@@ -1,10 +1,8 @@
-//! Layout, row recycling, scroll state, densities, tokens and the accessibility tree.
+//! List layout, scrolling, selection, materials and accessibility.
 //!
-//! The boundary this crate defends is that **nothing below it knows what a file is, and
-//! nothing above it knows what a glyph is**. Rows arrive through [`row_source::RowSource`]
-//! and leave as a `qs_gpu::DrawList`. Whether the rows came from a synthetic corpus, a
-//! filesystem, or a search index is not visible here -- which is the test of whether the
-//! `RowSource` boundary is drawn in the right place.
+//! Rows come from [`row_source::RowSource`] and are drawn into a
+//! `qs_gpu::DrawList`. The crate also builds an accessibility tree from the
+//! same row and interaction state.
 
 pub mod a11y;
 pub mod density;

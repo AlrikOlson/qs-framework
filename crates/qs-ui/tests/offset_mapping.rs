@@ -1,13 +1,7 @@
-//! T048 — `proptest` over the offset↔index mapping across the full 1M range.
+//! Property tests for row-index and offset round trips.
 //!
-//! Research R5 names this the verification for the `f64` scroll decision:
-//!
-//! > Verified by: `proptest` over the offset↔index mapping across the full corpus range.
-//!
-//! The property being tested is a round trip. `offset_of(index)` and `index_at(offset)` are
-//! inverses, and they must remain inverses at 28 million content pixels, where `f32` cannot
-//! even represent consecutive integers. A test that only sampled the first few thousand
-//! rows would pass with a completely broken implementation.
+//! The generated cases cover a million rows, including offsets large enough
+//! to lose integer precision in `f32`.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the
 // vocabulary of a test, not a hazard in one. The workspace lints deny them for
@@ -110,12 +104,8 @@ proptest! {
         }
     }
 
-    /// The bottom of the corpus, specifically.
-    ///
-    /// Research R5: "Sub-pixel scrolling in `f32` at the bottom of the corpus is not
-    /// imprecise, it is visibly wrong." This narrows the generator to the last thousand
-    /// rows, which is where a `f32` implementation would fail and a random sample over the
-    /// whole range would almost never reach.
+    /// Check subpixel offsets in the final thousand rows of the list,
+    /// where premature conversion to `f32` loses precision.
     #[test]
     fn the_bottom_of_the_corpus_is_exact(back in 0u64..1000) {
         let heights = uniform();

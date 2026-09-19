@@ -1,28 +1,8 @@
-//! Present tuning, behind a trait with a no-op default.
+//! Platform presentation settings and their reported outcomes.
 //!
-//! Research R4 specifies exactly two platform tunings and nothing else:
-//!
-//! * **Windows**: `IDXGISwapChain2::SetMaximumFrameLatency` plus the waitable object.
-//! * **macOS**: `CAMetalLayer.displaySyncEnabled` and display-link phase alignment.
-//!
-//! Both reach past `wgpu` into `wgpu-hal`, which is the only place in this codebase that
-//! does. The trait exists so that reaching is contained: `qs` calls
-//! [`PresentTuning::configure`] and does not know whether anything happened.
-//!
-//! # The default is a no-op, deliberately
-//!
-//! Linux has no equivalent tuning to apply -- Wayland's presentation model already does
-//! what the Windows waitable object is for -- and a platform where the tuning is
-//! unavailable must behave identically to one where it is unimplemented. Making the default
-//! a no-op rather than an error means a new platform works on day one and gets tuned later,
-//! which is the opposite of the usual arrangement where an unimplemented platform panics.
-//!
-//! # A correction worth recording (research R4)
-//!
-//! SDD §7.1 names `CADisplayLink` for macOS phase alignment. `CADisplayLink` is available
-//! for AppKit views only from **macOS 14**, while SDD §1.5 sets the floor at **macOS 13
-//! Ventura**. M0 therefore uses `CVDisplayLink` on 13 and `CADisplayLink` on 14+. See
-//! `docs/adr/009-macos-display-link.md`.
+//! The Windows and macOS implementations currently report that tuning was not
+//! applied. [`NoopPresentTuning`] provides the same default for other platforms.
+//! Callers can inspect [`PresentTuningOutcome`] for details.
 
 /// What the application asks the platform to do about presentation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,11 +24,7 @@ impl Default for PresentConfig {
     }
 }
 
-/// What the platform actually did.
-///
-/// Returned rather than discarded because Constitution III applies to our own telemetry:
-/// a run where the tuning silently did not apply is not comparable to one where it did,
-/// and the bench report should be able to say so.
+/// Presentation settings that were applied, with reasons for any omissions.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PresentTuningOutcome {
     pub frame_latency_applied: bool,

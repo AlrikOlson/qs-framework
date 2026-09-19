@@ -1,18 +1,9 @@
-//! Render grid cells at three sizes through the CPU rasterizer and write a PNG.
+//! Save grid cells at three sizes using the CPU renderer.
 //!
 //! `cargo run -p qs-ui --example grid_badge -- out.png`
 //!
-//! chunk:icon-extension-label's first two criteria are about whether the badge reads and
-//! whether it collides with the symlink emblem, and neither is settled by a draw-list
-//! assertion — chunk:icon-emblems shipped a wrong geometry past a full green suite one chunk
-//! ago. This is the looking.
-//!
-//! # What this is not
-//!
-//! It is the **fourth** hand-rolled harness for the same job, and the second still in the
-//! tree. chunk:cpu-raster-snapshots is the chunk that makes DrawList-to-a-viewable-image a
-//! supported affordance; when it lands it should absorb this and
-//! `qs-gpu/examples/emblem_strip.rs` and delete both. Nothing here asserts anything, by intent.
+//! Use the image to inspect extension labels and their spacing beside symlink
+//! emblems.
 
 // A developer tool that renders a picture and exits; the crate's production lints are about
 // code that runs inside a frame.

@@ -1,35 +1,9 @@
-//! Render every token as a swatch, in both themes, and write two PNGs.
+//! Save palette swatches in both themes.
 //!
 //! `cargo run -p qs-ui --example palette_strip -- out.png`
 //!
-//! chunk:oklch-color-ramps regenerates every colour in the file. Three of its four criteria
-//! are checkable — the contrast gate, the hue measurement, the no-literals gate — and the
-//! fourth is not: whether the palette still *works*. A contrast ratio is a function of
-//! luminance and is blind to hue and chroma by construction, so the entire class of defect
-//! this chunk is about is invisible to it. A selected row that has quietly become the same
-//! colour as a hovered one passes all 64 checks.
-//!
-//! The comparisons that matter are laid out adjacently on purpose:
-//!
-//! - the four row surfaces in ramp order, so the step between them can be seen to be even;
-//! - **row-hover directly beside row-selected**, which is the pair the chunk turned on: in
-//!   the light theme they differ by 5 per-mille of lightness and essentially nothing but
-//!   chroma, so an authoring mistake collapses them while every gate stays green;
-//! - the focus ring drawn over a selected row with its outline, which is the case UXDD 10.5
-//!   added the outline for;
-//! - the four chromatic tokens together, since three of them are status and must not be
-//!   confusable with each other.
-//!
-//! # Why a swatch and not a row
-//!
-//! This began as a render of the real list through `ListRenderer`, which would have been
-//! better. It does not work from an example: a cold frame is bounded by the per-frame atlas
-//! upload ceiling, and warming it by rendering twice makes things worse rather than better,
-//! because `render` calls `atlas.begin_frame()` and reassigns slots, so pixels uploaded on
-//! the first pass end up at the wrong coordinates. That is a limitation of the harness, not
-//! of the palette, and it is what chunk:cpu-raster-snapshots exists to fix — when it lands
-//! it should absorb this file, `grid_badge.rs` and `qs-gpu/examples/emblem_strip.rs`, and
-//! delete all three. Nothing here asserts anything, by intent.
+//! The image places related row colors side by side, including hover and
+//! selection. It also shows the focus outline and status colors.
 
 // A developer tool that renders a picture and exits; the crate's production lints are about
 // code that runs inside a frame.

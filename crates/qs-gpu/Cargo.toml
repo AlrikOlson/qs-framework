@@ -1,6 +1,6 @@
 [package]
 name = "qs-gpu"
-description = "Device and surface management, draw lists, instanced pipelines, glyph atlas, render-path tiering."
+description = "GPU and CPU rendering, draw lists, effects and glyph atlases."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

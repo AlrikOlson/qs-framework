@@ -1,17 +1,8 @@
-//! Shaping: text plus a font plus a size becomes positioned glyphs.
+//! Text shaping into positioned glyphs and cluster offsets.
 //!
-//! # Two paths, one implementation
-//!
-//! Task ordering split this work: US1 needs "just enough shaping to render real file
-//! names", US2 needs full script coverage. The temptation is two functions. That would be
-//! a mistake -- the US1 frame-time measurement would then be a measurement of the *fast*
-//! path, and US2 would silently make it wrong.
-//!
-//! So there is one [`Shaper::shape`], with an internal short-circuit: text that is pure
-//! ASCII and fully covered by the requested face skips bidi resolution and font
-//! segmentation, because for that input both are provably identity operations. The
-//! measured path and the correct path are the same path; the short-circuit only skips work
-//! that would have no effect.
+//! [`Shaper::shape`] handles both simple and complex scripts. ASCII text fully
+//! covered by the requested face skips bidirectional resolution and font
+//! segmentation; other text follows the full shaping path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,8 +36,7 @@ pub struct ShapedRun {
     pub glyphs: Vec<ShapedGlyph>,
     /// Total advance width in pixels.
     pub width: f32,
-    /// Clusters for which no installed face had a glyph. Non-zero is the SC-006 failure
-    /// and is reported per frame rather than discovered in a screenshot.
+    /// Number of clusters for which no available font supplied a glyph.
     pub missing_glyphs: u32,
     /// The source text contained an explicit bidi override -- see [`crate::bidi`].
     pub has_directional_override: bool,
@@ -76,12 +66,10 @@ pub struct FontMetrics {
     pub x_height: f32,
 }
 
-/// Owns the parsed faces and the scratch buffer.
+/// Parsed font faces and reusable shaping buffers.
 ///
-/// `&mut self` on [`Shaper::shape`] is deliberate. Shaping mutates a face cache and reuses
-/// one `UnicodeBuffer` allocation across calls, and a `Shaper` is therefore owned by
-/// exactly one thread. That is Constitution II expressed in a signature: there is no
-/// interior mutability here to make sharing look safe when it would not be cheap.
+/// [`Shaper::shape`] takes `&mut self` because it updates the face cache
+/// and reuses a `UnicodeBuffer` across calls.
 pub struct Shaper {
     db: Arc<dyn FontDb>,
     faces: HashMap<FontId, rustybuzz::Face<'static>>,

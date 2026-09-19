@@ -1,11 +1,7 @@
-//! T050 / SC-008 — the automated accessibility audit.
+//! Accessibility checks for virtualized lists.
 //!
-//! From the quickstart:
-//!
-//! > Expected: zero focusable nodes without a role, name, and state; and the list reports
-//! > `set_size == 1_000_000` with correct `index_in_set` -- **not** the ~60 recycled rows.
-//! > That specific assertion is the one worth reading the test for; it is the canonical
-//! > virtualized-list accessibility bug.
+//! Focusable nodes must have roles, names and state. List counts and item
+//! positions refer to the full list, including a million-row fixture.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the
 // vocabulary of a test, not a hazard in one. The workspace lints deny them for

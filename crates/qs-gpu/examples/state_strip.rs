@@ -1,25 +1,9 @@
-//! Render the state-icon set at the sizes chrome asks for, in both themes, and write a PNG.
+//! Save state icons at three sizes in both themes.
 //!
 //! `cargo run -p qs-gpu --example state_strip -- out.png`
 //!
-//! chunk:harness-adapters puts six states on screen — four from the PTY floor and two only an
-//! adapter can see — and the criterion that matters for them is not a draw count. It is whether
-//! a person scanning a tab strip can find the one session that is blocked on them without
-//! reading a word. That is settled by looking, so this is the looking, in the tradition of
-//! `emblem_strip`.
-//!
-//! # Three sizes, not one
-//!
-//! The kind icons live in a 20 px column and are judged there. A state icon does not: it sits
-//! in a tab, on a directory row beside a kind icon, and in the overview's session lines, so it
-//! is asked for at around 12 px and the set has to survive that. Rendering only at 20 would
-//! photograph the size at which every one of these looks fine.
-//!
-//! # What this is not
-//!
-//! It rasterizes masks and composites them by hand, exactly as `emblem_strip` does, and it
-//! asserts nothing. The tests in `qs_gpu::icon` hold the set to measurable floors; this is for
-//! the judgement no measurement makes.
+//! The example rasterizes and composites masks directly. Use the image to check
+//! that the states remain distinguishable in tabs and beside list rows.
 
 // Same allowance, and the same reason: this renders a picture and exits.
 #![allow(

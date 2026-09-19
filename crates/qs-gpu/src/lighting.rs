@@ -1,34 +1,11 @@
-//! The lighting pass: what one surface does to another.
+//! Lighting from scene geometry, applied after surfaces and before text.
 //!
-//! # Why this is a second pass and not a branch in the first one
+//! The pass multiplies surface colors by attenuation and adds light. Text and
+//! icons are drawn afterward. Bounds on attenuation and addition allow callers
+//! to check foreground contrast against the resulting surfaces.
 //!
-//! Every primitive the renderer has drawn since M0 is a function of one fragment's own position.
-//! That is exactly why one pass and one target sufficed, and it is not a coincidence — it is what
-//! made the CPU tier reproducible and the parity suite meaningful.
-//!
-//! Shadows, occlusion and bounced light are functions of *other* surfaces. There is no formulation
-//! of them that reads only the fragment being shaded, so a branch in the existing pass cannot
-//! express them: the fragment would have to know about geometry it cannot see. This is the one
-//! place where a second pass is not architectural preference but arithmetic. See
-//! `specs/002-ray-traced-mode/research.md` R2 and the plan's Complexity Tracking.
-//!
-//! # Modulate, do not replace
-//!
-//! The surface passes render as they always have. This pass multiplies attenuation into the result
-//! and adds light. Text and icons are drawn **afterwards** and are never lit.
-//!
-//! That ordering is what makes the contrast obligation solvable at all. A lit glyph's contrast
-//! against its background varies per pixel with the geometry, and no build-time gate can bound
-//! that. Drawn after, a glyph always sits on `surface x attenuation + addition`, both terms
-//! bounded, so the worst case is a closed-form expression rather than a sample. See
-//! `specs/002-ray-traced-mode/contracts/lit-contrast.md`.
-//!
-//! # Nothing accumulates
-//!
-//! This pass is a pure function of the scene and the surface image. There is no accumulator, so
-//! there is nothing to converge and nothing to terminate, and a frame is a complete picture the
-//! moment it is drawn. That is a stronger guarantee than "the refinement stops on its own", and it
-//! is what keeps the zero-work-at-rest obligation untouched by this feature.
+//! Each frame is computed from its scene and surface image. The pass has no
+//! temporal accumulator or convergence step.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -83,12 +60,10 @@ pub struct LitSceneUniform {
     props: [[f32; 4]; LIT_SLABS],
 }
 
-/// The contact-hardening constant for a light of `size_deg` degrees: `1 / tan(size / 2)`.
+/// Contact-shadow constant for an angular light size: `1 / tan(size / 2)`.
 ///
-/// The inverse of the angular size, which is the whole of research R4: `min(k * h / t)`
-/// along the shadow ray *is* the penumbra, and a larger light (smaller `k`) softens it.
-/// Clamped away from zero so an absurd authored size degrades to a soft shadow rather than
-/// a division by zero.
+/// A larger light gives a smaller constant and softer shadows. The denominator
+/// is clamped away from zero.
 #[must_use]
 pub fn hardness(size_deg: f32) -> f32 {
     1.0 / (size_deg.to_radians() * 0.5).tan().max(1e-4)
@@ -202,11 +177,7 @@ pub enum SceneEffect {
 /// Named after [`crate::frame::Floor`] and meaning the same thing, at a different scale.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SceneFloor {
-    /// Nothing at all. The interface is plainer, not partial.
-    ///
-    /// The right answer more often than it looks. An approximation of bounced light is a coloured
-    /// wash somebody has to invent, and an invented wash is decoration — which Principle IX
-    /// refuses. Absent reads as a plainer theme.
+    /// Omit the effect on this rendering tier.
     Nothing,
     /// The same effect with stated, bounded parameters.
     ///
@@ -273,11 +244,7 @@ impl SceneEffect {
         self.floor(tier).is_none()
     }
 
-    /// The name the `qs-bench` scenario for this effect answers to.
-    ///
-    /// A third exhaustive match, and the one that makes Principle IX.6 a field rather than a line
-    /// in a checklist: an effect that names no scenario cannot be measured, and an effect that
-    /// cannot be measured is not complete.
+    /// Benchmark scenario name for this effect.
     #[must_use]
     pub const fn scenario(self) -> &'static str {
         match self {

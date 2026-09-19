@@ -1,21 +1,8 @@
-//! T094 / RP-3, RP-4 — crash-loop demotion, with an injected startup failure.
+//! Rendering-tier recovery after failed startup attempts.
 //!
-//! From the quickstart:
-//!
-//! > Expected: two injected startup crashes demote exactly one tier, and the pinned choice
-//! > is overridable by `--force-render-path`.
-//!
-//! # What "injected startup crash" means here
-//!
-//! A real crash inside device creation cannot be simulated in-process -- the process is
-//! gone, which is the entire difficulty the crash counter exists to handle. What *can* be
-//! simulated faithfully is the observable consequence: a run that calls `begin_attempt` and
-//! then never calls `mark_success`, because it died in between.
-//!
-//! That is exactly what [`crashed_startup`] does, and it is a faithful model precisely
-//! because the counter is persisted to disk *before* the risky work. If the implementation
-//! ever moved the write to after device creation, this test would still pass on the first
-//! crash and fail on the demotion -- which is the failure mode being defended against.
+//! The tests persist an attempt without marking success to model a process
+//! that exits during device creation. Two failures must demote one tier;
+//! a forced selection must still override the pinned choice.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the
 // vocabulary of a test, not a hazard in one. The workspace lints deny them for

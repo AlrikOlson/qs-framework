@@ -1,17 +1,11 @@
-//! Render the ray-tracing proposal against the real palette, and write PNGs to look at.
+//! Save lighting previews with a separate experimental shader.
 //!
 //! `cargo run -p qs-ui --example rt_preview -- out.png`
+//!
 //! `QS_RT=shadow,ao,bounce,focus cargo run -p qs-ui --example rt_preview -- out.png`
 //!
-//! A LOOKING SPIKE. It shares no code with the shipped renderer and is not meant to: the
-//! question it answers is whether an orthographic 3D scene is worth building, and the honest
-//! way to answer that is to look at one rather than to describe it.
-//!
-//! What it is faithful about: the palette (every colour comes from `design/tokens.json`), the
-//! microfacet model (the same GGX/Smith/Schlick the shipped shader runs), and the geometry
-//! (the same rectangles, at the same screen positions, because the camera is orthographic).
-//!
-//! What it is not: fast, tiled, or hardware-traced. See the shader's header.
+//! The preview uses theme colors and material geometry. It is not the main
+//! renderer and does not use hardware ray tracing.
 
 #![allow(
     clippy::unwrap_used,
@@ -103,13 +97,10 @@ fn slab(
     }
 }
 
-/// One window's worth of interface, from the REAL scene (T005).
+/// Build a window's slabs from the material definitions.
 ///
-/// Promoted from the hand-built spike: the slabs now come from `qs_ui::scene::SceneBuilder`
-/// over the shipped materials, so the elevations are the authored scale in
-/// `design/tokens.json` and the allowances ride along — the preview can no longer drift
-/// from what the application actually publishes. What is still local: the conversion into
-/// this shader's own slab layout, and one **US2 preview** override marked below.
+/// Converts [`qs_ui::scene::SceneBuilder`] output into the preview shader's
+/// layout. The preview applies its own emission override.
 fn build(tokens: &Tokens) -> Vec<Slab> {
     use qs_ui::material::{Surface, name};
     use qs_ui::scene::SceneBuilder;
@@ -340,7 +331,7 @@ fn tile_row(i: usize, n: usize, elevation: f32, thickness: f32) -> ([f32; 3], [f
     )
 }
 
-/// Every tile the harness can honestly render, as (file stem, slabs).
+/// Preview tiles as pairs of file stems and slab lists.
 #[allow(clippy::too_many_lines)]
 fn tiles(tokens: &Tokens) -> Vec<(&'static str, Vec<Slab>)> {
     let base = linear(tokens, "surface/row-alt");

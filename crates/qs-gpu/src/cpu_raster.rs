@@ -1,29 +1,10 @@
-//! The no-acceleration tier: `tiny-skia` consuming **the same draw lists**.
+//! CPU rendering of [`DrawList`]s with `tiny-skia`.
 //!
-//! # RP-2 is the guarantee worth defending
+//! The renderer consumes the same instances and atlas uploads as the GPU path.
+//! Effects it cannot reproduce use their declared CPU fallback.
 //!
-//! > All three tiers consume the same draw lists.
-//!
-//! The moment this file grows its own layout, its own colour handling, or its own idea of
-//! what a row looks like, parity stops being checkable and the CPU fallback quietly becomes
-//! a second renderer with its own bugs -- which is exactly the outcome the reference-image
-//! suite exists to prevent. So this module takes a [`DrawList`] and a set of
-//! [`PendingUpload`]s and nothing else. It cannot know what a row is, because it is never
-//! told.
-//!
-//! # Colour space
-//!
-//! The pixmap holds **linear** premultiplied RGBA8 while compositing, and is converted to
-//! sRGB once at the end. That mirrors what the GPU does: blend in linear, apply the
-//! transfer function on write to an sRGB surface. Compositing in sRGB directly -- the
-//! obvious thing, since tiny-skia does not care -- would make every antialiased edge and
-//! every translucent fill differ from the GPU tiers by more than any sane perceptual
-//! tolerance, and the parity suite would fail for a reason that has nothing to do with
-//! rasterization.
-//!
-//! The cost is 8 bits of linear precision during compositing, which bands in very dark
-//! greys. It is recorded here rather than discovered: if the parity suite ever fails only
-//! in dark-theme shadows, this is why.
+//! Compositing uses linear premultiplied RGBA8, followed by an sRGB conversion.
+//! The eight-bit linear buffer can produce banding in dark gradients.
 
 use tiny_skia::{
     BlendMode, FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, PremultipliedColorU8,
@@ -727,29 +708,11 @@ fn sweep_t(local: [f32; 2], half_size: [f32; 2], phase: f32) -> f32 {
     1.0 - (f * 2.0 - 1.0).abs()
 }
 
-/// The ramp evaluated at every pixel it can reach, plus where that block sits.
+/// A per-pixel gradient or sweep and its bounds.
 ///
-/// This used to be a `LinearGradient` of 33 stops, which was a chord approximation of an
-/// Oklab curve and the whole reason `gradient/*` carried a bound at all. It cannot survive
-/// the dither: `tiny-skia` interpolates *between* the stops it is handed and has nowhere to
-/// put a per-pixel offset, so a dithered shader and a stop-list CPU tier would differ by up
-/// to a level everywhere, and the only way to keep the suite green would be to widen the
-/// bound over a difference nobody wrote down.
-///
-/// Evaluating per pixel removes both problems at once. `tiny-skia` still owns coverage and
-/// antialiasing, which is the part it is better at than a hand-rolled loop; the colour it
-/// covers with is now the same arithmetic the shader runs, so the tiers agree by
-/// construction rather than by tolerance.
-///
-/// The cost is one pixmap the size of the gradient per gradient per frame. On the fallback
-/// tier that is the right trade -- it is the tier that already accepts being slower -- but a
-/// full-window wash would allocate a full-window pixmap, which is worth knowing before one
-/// exists.
-///
-/// Both ramps come through here. What differs between a [`PrimKind::Gradient`] and a
-/// [`PrimKind::Sweep`] is one line -- where `t` comes from -- and keeping them in one function
-/// is the same argument the shader's `ramp_at` makes: a second copy is how the two would come
-/// to disagree about the palette rather than about the parameter.
+/// Color evaluation uses the shader's Oklab and dithering arithmetic.
+/// `tiny-skia` supplies coverage and antialiasing. This allocates one pixmap
+/// the size of the gradient for each gradient in a frame.
 fn ramp_pixmap(instance: &Instance) -> Option<(Pixmap, (i32, i32))> {
     let [x, y, w, h] = instance.rect;
     let (half_w, half_h) = (w * 0.5, h * 0.5);

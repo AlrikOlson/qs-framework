@@ -1,18 +1,8 @@
-//! The token set: every visual value, resolved for a theme.
+//! Colors, spacing, type settings and materials resolved for a theme.
 //!
-//! Constitution VII makes `design/tokens.json` authoritative and forbids hard-coded visual
-//! values in widget code. This module is the only place that reads that file, and
-//! [`Tokens::color`] is the only way to obtain a colour. A widget that wants a shade not in
-//! the file adds a token; it does not add a literal.
-//!
-//! # Forced colours
-//!
-//! High-contrast and forced-colours modes are not "a third theme". The operating system
-//! supplies a small, fixed palette and the correct response is to use *only* those colours
-//! and to switch effects off -- a shadow or a translucent overlay in forced-colours mode
-//! defeats the entire point of the mode, which is that the user has told the system exactly
-//! which colours they can see. [`Tokens::forced`] maps every token onto that palette and
-//! sets [`Tokens::effects_enabled`] to false.
+//! [`Tokens`] reads the values in `design/tokens.json`. In forced-colors mode,
+//! [`Tokens::forced`] maps them to the operating system's palette and disables
+//! effects through [`Tokens::effects_enabled`].
 
 use std::collections::BTreeMap;
 
@@ -23,14 +13,7 @@ use serde::Deserialize;
 use crate::material::{Drive, Material, MaterialDef, Surface};
 use crate::substance::{Substance, SubstanceTokens};
 
-/// One colour family: a fixed hue, and optionally the chroma curve its neutral stops take.
-///
-/// A ramp owns the hue and nothing else owns it. That is the whole mechanism behind "the
-/// greys hold a constant hue": there is no per-token hue to drift, because a token names a
-/// ramp and a lightness rather than a colour. Before this existed the single grey family
-/// spanned 264.5° to 285.8° — the light theme near 268°, the dark *surfaces* at 285.6° and
-/// the dark *text* at 269–279°, so one theme contained two different greys and nothing in
-/// the file recorded which was intended.
+/// A color ramp with a fixed hue and an optional chroma curve.
 #[derive(Clone, Copy, Debug, Deserialize)]
 pub struct Ramp {
     /// Hue angle in degrees. Every stop on this ramp uses it, in both themes.
@@ -52,13 +35,10 @@ impl Ramp {
     }
 }
 
-/// How one theme's value of a token is authored.
+/// A token value for one theme.
 ///
-/// Ramp-relative is the form the shipped file uses; `check_every_token_is_ramp_relative`
-/// refuses a bare hex in it. `Hex` stays supported because test fixtures need a literal and
-/// because a token file is a public artifact that should not fail to parse over a form it
-/// used to accept — but a hex literal in the shipped palette is exactly the hand-picking
-/// this ramp model exists to remove, so it is a build failure rather than a style note.
+/// Supports a ramp-relative value or a literal hex color. The bundled palette
+/// uses ramp-relative values.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ColorValue {
@@ -151,7 +131,7 @@ pub struct TokenDef {
 /// careful. The ceiling cannot rise to meet an emissive because it never sees one.
 /// [`Tokens::color`] cannot reach one, so no call site can paint a fill or set a glyph in it
 /// by typo. And "not meaning-bearing" stops being prose in a design document: it is refused
-/// at load time by [`crate::material::resolve_all`], which admits an emissive only on a layer
+/// at load time by `crate::material::resolve_all`, which admits an emissive only on a layer
 /// that declares an `edge` — the band geometry [`crate::material::Material::composites`]
 /// already excludes — and never in a material's `text`, `text_lit` or `over`.
 ///
@@ -179,12 +159,10 @@ pub struct ContrastPair {
     pub kind: PairKind,
 }
 
-/// One of the five type roles from UXDD §10.1.
+/// A text role's logical size and OpenType weight class.
 ///
-/// Size is in **logical** pixels at the default density; it is multiplied by the device
-/// scale and the OS text-size setting at use, never baked. Weight is an OpenType weight
-/// *class*, not a font file — which face satisfies it is a platform question, and on
-/// Windows the answer is a different font family per weight (see `qs_text::fontdb`).
+/// Device scale and the operating system's text scale are applied at use.
+/// The font database selects the face for the requested weight.
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
 pub struct TypeRole {
     pub size: f32,
@@ -206,7 +184,7 @@ fn sane_scale(scale: f32) -> f32 {
     }
 }
 
-/// Focus-indicator widths, in logical pixels (UXDD 10.5).
+/// Focus-indicator widths in logical pixels.
 #[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
 pub struct FocusTokens {
     pub ring_width: f32,
@@ -282,10 +260,10 @@ pub struct TokenFile {
     /// Corner radii by surface class, in logical pixels.
     #[serde(default)]
     pub radius: BTreeMap<String, f32>,
-    /// The elevation scale, in logical pixels: how far a surface stands off the canvas, as a
-    /// closed set of named steps. Defaulted so a token file predating the lit mode still
-    /// loads; a material naming a step then fails resolution, which is the honest outcome —
-    /// the file authored a height against a scale it does not carry.
+    /// Named elevation steps in logical pixels.
+    ///
+    /// An absent scale is empty. Materials referring to an undefined step
+    /// fail resolution.
     #[serde(default)]
     pub elevation: BTreeMap<String, f32>,
     #[serde(default)]
@@ -594,9 +572,7 @@ impl Tokens {
         }
     }
 
-    /// The tallest step on the elevation scale, in logical pixels. Zero when the file has no
-    /// scale, which is also the honest margin: nothing can stand up, so nothing can cast
-    /// past the viewport edge.
+    /// Tallest elevation step in logical pixels, or zero for an empty scale.
     #[must_use]
     pub fn elevation_max(&self) -> f32 {
         self.elevation.values().copied().fold(0.0_f32, f32::max)
@@ -868,28 +844,11 @@ impl Tokens {
         self.materials.keys().map(String::as_str)
     }
 
-    /// The ambient field a named material declares, for [`qs_gpu::frame::DrawList::set_field`].
+    /// Get a material's ambient field for the draw list.
     ///
-    /// `None` when the material has no field layer, and `None` is the honest answer rather
-    /// than an empty wash: a draw list whose field was never set draws no field, and a call
-    /// site that asked the wrong material should find that out here instead of getting a
-    /// window painted with nothing in it.
-    ///
-    /// # Why this reads back off the material
-    ///
-    /// The centres cannot ride the instance — four of them are roughly 190 bytes against a
-    /// 48-byte stride — so they have to reach the shader through the draw list, exactly as the
-    /// environment does. The question was then where they are *authored*, and the answer that
-    /// keeps one copy is: on the layer that draws them. The contrast gate reads that same
-    /// layer through [`Material::composites`], so the numbers the gate checks and the numbers
-    /// the shader draws cannot drift apart, which a separate scene-level block in the token
-    /// file would have allowed on the first edit that touched one and not the other.
-    ///
-    /// The cost of that choice is that a field is a scene property authored per material, so
-    /// two materials could each declare one and only the one a call site names would be drawn.
-    /// That is a real question — a window with two fields — and it is left as one rather than
-    /// answered by a rule nobody needs yet. The call site names its material, so which field
-    /// is the scene's is explicit at the point it is decided.
+    /// Returns `None` when the material has no field layer. The renderer and
+    /// contrast checks read the same layer values. The caller chooses which
+    /// material supplies the scene's field.
     #[must_use]
     pub fn field(&self, material: &str) -> Option<qs_gpu::frame::FieldWash> {
         self.materials
@@ -900,60 +859,10 @@ impl Tokens {
             .map(|layer| layer.field)
     }
 
-    /// The frame's bloom, both numbers derived from the palette, for
-    /// [`qs_gpu::frame::DrawList::set_bloom`].
+    /// Maximum added light for bloom, in linear units.
     ///
-    /// # The threshold clears every colour the palette can name
-    ///
-    /// Not a constant, and the criterion this chunk was accepted against says so: "a threshold
-    /// stated in luminance against the token ramps rather than as a magic constant". The
-    /// statement is that a pixel blooms when it is brighter than **every token in this theme**,
-    /// whatever its role — because a pixel brighter than any colour a designer could have
-    /// written down is not a fill. It is light the *renderer* made: a glow's falloff, a sweep's
-    /// travelling highlight, a rim, the lit mode's addition to a receiver. Those are what "let
-    /// bright accents bleed light" means, and they are exactly what a token-derived ceiling
-    /// separates from flat colour.
-    ///
-    /// **The first version of this took the brightest `Background` token, and it was wrong in a
-    /// way worth recording.** In the dark theme the brightest background is `icon/badge` at
-    /// 0.618 relative luminance, while `content/primary` — body text — sits at 0.817. So that
-    /// threshold bloomed *every glyph on screen*, which is not a look; it lifts the ground
-    /// around each mark and reduces exactly the contrast Principle VI protects, invisibly to
-    /// `cargo xtask contrast`, which reads tokens and not frames. Clearing every token instead
-    /// makes that structurally impossible: no authored colour can bloom, so the gate's world is
-    /// untouched and only rendered light is affected.
-    ///
-    /// Relative luminance is [`Srgba::relative_luminance`], the same WCAG function the contrast
-    /// gate uses and the same three coefficients `blur.wgsl` applies per fragment. Measuring
-    /// brightness two different ways on the two sides of this number would select a different
-    /// set of pixels from the one it was chosen against.
-    ///
-    /// # The light theme blooms nothing, and that is the answer rather than a gap
-    ///
-    /// Several light-theme tokens resolve to white, so the threshold is 1.0, nothing in an
-    /// 8-bit target exceeds it, and [`qs_gpu::frame::Bloom::is_active`] reads that as off. The
-    /// light theme pays for no passes and shows no bloom.
-    ///
-    /// That is the same finding research R13 recorded for the lit palette, arriving again from
-    /// a different direction: *the light theme has no emitter*. There the page is the source
-    /// and dark marks are absorbers, so added light has nothing to come from. A bloom forced on
-    /// anyway would have to bleed the page into the text, which is the one direction the
-    /// contrast budget cannot afford.
-    ///
-    /// # The strength is the measured lit allowance
-    ///
-    /// A bloom *adds light to a receiver*, which is exactly the quantity
-    /// `lighting.allowance.receiver.addition_max` bounds — measured by the `lit_probe` example
-    /// and recorded in research R13, not chosen here. Reusing it rather than authoring a second
-    /// number keeps one answer to "how much light may this palette add", so a future probe run
-    /// that moves it moves the bloom too.
-    /// How much light a bloom would add, in linear light: the receiver's measured allowance.
-    ///
-    /// Deliberately the **receiver's** and never the text ground's, which is 0.0 in both themes
-    /// precisely because a mark's ground may not take light. Beside [`Tokens::bloom_ceiling`]
-    /// rather than folded into [`Tokens::bloom`] for the same reason that one is: the number is
-    /// derived, checkable and ready, and the decision about whether to *spend* it is separate
-    /// from where it comes from.
+    /// Uses the current theme's receiver allowance. The text-background
+    /// allowance is separate.
     #[must_use]
     pub fn bloom_strength(&self) -> f32 {
         self.lighting
@@ -1007,67 +916,15 @@ impl Tokens {
             .any(|light| light.relative_luminance() > ceiling)
     }
 
-    /// The frame's bloom, for [`qs_gpu::frame::DrawList::set_bloom`].
+    /// Bloom settings for the current theme.
     ///
-    /// **Active on the shipped dark theme and off on the light one, and both answers are
-    /// derived rather than chosen.** The mechanism is costed at +0.021 ms on Vulkan and
-    /// +0.171 ms on GL (`cargo run --release -p qs-gpu --example bloom_cost`). For three
-    /// chunks it had no source: nothing the product drew exceeded the palette's own ink
-    /// ceiling. `emissive/sweep-peak` is that source — see [`EmissiveDef`] for why it is not
-    /// a token, and `chrome/bar` in `design/tokens.json` for why the command bar's travelling
-    /// hairline is the one band in the window that can carry it.
+    /// The threshold comes from [`Tokens::bloom_ceiling`] and the strength
+    /// from [`Tokens::bloom_strength`]. Bloom is disabled when effects are
+    /// off or the materials provide no source above the threshold.
     ///
-    /// # The two numbers
-    ///
-    /// The threshold is [`Tokens::bloom_ceiling`]: brighter than every colour this theme can
-    /// name. Above that line a pixel is light the *renderer* made — a glow's falloff, a sweep's
-    /// highlight, the lit mode's addition — and below it, it is a fill somebody authored.
-    ///
-    /// Nothing *composited from the palette* can reach that line, and that is structural rather
-    /// than a gap waiting on content. Every primitive composites authored colours, so none can
-    /// exceed the brightest authored colour; and the lit mode's addition is bounded to
-    /// **receivers** by `lighting.allowance`, which are grounds sitting two orders of magnitude
-    /// below the ink. Before the emissive existed, the shipped dark theme through `--shot-gpu`
-    /// peaked at 0.8969 relative luminance against a ceiling of 0.8986 — short by one 8-bit
-    /// step, because the ceiling is the ideal value of a token whose quantized form is what
-    /// actually lands. That measurement is why the source had to come from *outside* the
-    /// palette rather than from a brighter entry inside it.
-    ///
-    /// # Why the threshold is not simply lowered
-    ///
-    /// Because that blooms the ink, and blooming ink was measured: in `bloom_cost`'s
-    /// `contrast_cost_of_blooming_a_mark`, a mark at 0.817 on a ground at 0.011 goes from
-    /// **14.34:1 to 8.21:1 against its own ground — a 42.8% loss** — and `cargo xtask contrast`
-    /// sees none of it, because it reads tokens and not frames. A pair with less headroom than
-    /// body text would cross 4.5:1. This is `specs/002-ray-traced-mode/contracts/lit-contrast.md`
-    /// rule 1a arriving from a third direction: a mark may emit, but the ground behind it may
-    /// never receive, and bloom from a glyph lands on exactly that ground.
-    ///
-    /// **The first version of this took the brightest `Background` token, and it was wrong in a
-    /// way worth recording.** In the dark theme the brightest background is `icon/badge` at
-    /// 0.618 while body text sits at 0.817, so that threshold bloomed every glyph on screen —
-    /// the 42.8% above, everywhere, under a green build.
-    ///
-    /// # What the threshold cannot see, and what does
-    ///
-    /// The bright pass selects by luminance; it has no idea which pixels are grounds behind
-    /// text. So the threshold buys one guarantee only — no *authored* colour is a source — and
-    /// says nothing about where the light it does select **lands**. A text ground's allowance
-    /// is `lighting.allowance.text_ground.addition_max`, which is 0.0 in both themes, and this
-    /// function cannot check it because a token file has no frame in it.
-    ///
-    /// `cargo run --release -p qs -- --bloom-reach` is what checks it: one frame rendered
-    /// twice in one process, bloom present and bloom absent, reporting the worst lift on a
-    /// ground behind text. That is why the spend site is a one-logical-pixel edge band with no
-    /// text within reach of it rather than an argument about where a glow looks nice.
-    ///
-    /// # The other route, still open
-    ///
-    /// Sourcing the bright pass from the **surface half** of the frame only, using the
-    /// `surface_content_split` seam the lighting pass already uses, so ink is not in the
-    /// source at all and the threshold could drop below it. That is a second render target
-    /// rather than a threshold change — the offscreen target holds the whole frame and a pass
-    /// cannot sample the attachment it is writing — and it is what would let a *mark* bloom.
+    /// The threshold excludes ordinary palette colors as sources. It does
+    /// not limit where bloom lands; callers must also check that nearby text
+    /// backgrounds retain their required contrast.
     #[must_use]
     pub fn bloom(&self) -> qs_gpu::frame::Bloom {
         // Forced colours switch effects off entirely, and a bloom is the loudest possible
@@ -1185,31 +1042,10 @@ impl ContrastResult {
     }
 }
 
-/// Every check one theme's materials imply, as composites rather than as token pairs.
+/// Bounds on the lighting applied to a surface.
 ///
-/// A declared pair asks "is this foreground legible on that token". A material asks the
-/// question text actually faces: **is this foreground legible on whatever the layer stack
-/// composited to**. Those are different questions whenever a look is more than one flat
-/// fill, and the second is the one that catches a halo moved above the fill it belongs
-/// under — a change that alters no token and would leave every declared pair green.
-///
-/// Each material contributes `text × over × composites`, and the composites are the
-/// cartesian product of its layers' in-shape stops. That is where "checked against its
-/// worst stop" comes from: every stop is checked, and the worst one is the one that fails.
-///
-/// The `PairKind` is derived from the foreground's own role, so a boundary listed on a
-/// material is held to 3:1 and text to 4.5:1 without the material restating it.
-/// How far lighting can move a surface, as a closed-form range.
-///
-/// The heart of `specs/002-ray-traced-mode/contracts/lit-contrast.md`. Once a surface is lit, the
-/// colour text sits on is no longer the token it was authored from — it is
-/// `surface x attenuation + addition`, varying across the surface with the geometry. A gate that
-/// checks the authored colour reports green while a label sits at 3:1 in a shadow, which is exactly
-/// the failure Principle VI's build-time validation exists to make impossible.
-///
-/// Both bounds are derived arithmetically from token values. Obtaining them by rendering and
-/// measuring is forbidden: a sampled bound is a claim about the frames someone happened to render,
-/// and the frame that violates it is the one nobody rendered.
+/// The resulting color is `surface * attenuation + addition`. Bounds
+/// come from the token values and are used to check worst-case contrast.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct LitBounds {
     /// Least and greatest multiplication the lighting pass can apply. Shadow and occlusion only
@@ -1315,12 +1151,9 @@ impl LitRange {
     }
 }
 
-/// A [`LitRange`] per theme, which is what contract rule 3a requires.
+/// Separate lighting ranges for light and dark themes.
 ///
-/// A shadow darkens a ground: that *helps* light-on-dark text and *hurts* dark-on-light text, and
-/// added light does the reverse. So the affordable direction flips with the theme, and one range
-/// for both reports the intersection of two constraints that never bind at the same time. Research
-/// R13 measured the cost of collapsing them at roughly an order of magnitude.
+/// Shadows and added light affect text contrast differently in each theme.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub struct ThemedLitRange {
     pub light: LitRange,
@@ -1342,13 +1175,10 @@ impl ThemedLitRange {
     }
 }
 
-/// What the lighting pass is permitted to **do to a surface**, by class and by theme.
+/// Lighting allowances by surface class and theme.
 ///
-/// The two classes come from `specs/002-ray-traced-mode/contracts/lit-contrast.md` rule 1a: a
-/// meaning-bearing element may emit but must never receive, and the exclusion extends to the
-/// ground directly behind it. So a **text ground** takes almost nothing and a **receiver** takes
-/// everything — which is also where the drama physically lands, since the gaps and the canvas are
-/// what a grazing light actually reaches.
+/// Text backgrounds have stricter limits on added light than receivers
+/// such as the canvas and gaps between rows.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LitAllowance {
@@ -1374,17 +1204,11 @@ impl Default for LitAllowance {
     }
 }
 
-/// The token file's `lighting` block.
+/// The token file's lighting settings.
 ///
-/// Two halves that answer different questions and must not be confused. The **allowance** is what
-/// the pass may do to a surface: a contrast question, and gated. The **rig** — key light,
-/// environment — is where the light is: an art-direction question, and not gated. They share one
-/// key because they are one subject, and sit in separate fields because a value from one is never
-/// a valid answer for the other.
-///
-/// The rig lands here under `tasks.md` T010. Every exposure control it gains must be a **mix
-/// toward a bound** and never a multiplier — research R8, a mistake this codebase has made four
-/// times in four places.
+/// `allowance` bounds the changes permitted by contrast checks. `rig`
+/// describes the light and environment. Exposure controls mix toward
+/// those bounds.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LightingTokens {
@@ -1395,9 +1219,7 @@ pub struct LightingTokens {
     pub rig: RigTokens,
 }
 
-/// The rig: where the light is, as authored (tasks.md T010). An art-direction question, not
-/// a contrast one — the allowance beside it is what is gated, and a value from one is never
-/// a valid answer for the other.
+/// Key-light and environment settings; contrast limits are stored separately.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RigTokens {
@@ -1410,9 +1232,7 @@ pub struct RigTokens {
 }
 
 impl Default for RigTokens {
-    /// The authored rig, not "no rig": a token file predating the rig still lights the way
-    /// the shipped file does, and the mode is off by default anyway (FR-002), so the default
-    /// is never seen until someone turns the light on.
+    /// Default key-light and environment settings.
     fn default() -> Self {
         Self {
             key: KeyLightTokens::default(),
@@ -1428,12 +1248,11 @@ impl Default for RigTokens {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct KeyLightTokens {
-    /// Toward the light. Normalized at use, and doubling as the reduced-motion resting
-    /// position (FR-029): under Reduce Motion the light sits exactly here.
+    /// Direction toward the light, normalized at use.
+    /// Also used as the fixed direction under reduced motion.
     pub direction: [f32; 3],
-    /// The key light's fraction of an exposure budget that sums to one; the environment gets
-    /// the remainder. A **mix toward a bound, never a multiplier** (research R8) — there is
-    /// no spelling of this field that pushes total exposure past the bound.
+    /// Key-light share of the exposure budget.
+    /// The environment receives the remainder.
     pub share: f32,
     /// Angular size in degrees. What makes a shadow soften with distance; a light with no
     /// size casts the hard offset shadow this feature exists to replace.
@@ -1463,59 +1282,31 @@ impl KeyLightTokens {
     }
 }
 
-/// The focus lamp: a positional light that sits over whatever has keyboard focus.
+/// Settings for the positional light over keyboard focus.
 ///
-/// # Why there is no direction, and no colour
-///
-/// A positional light has no single direction — that is why [`qs_gpu::scene::FocusLamp`] is a
-/// separate type from `Light`, and a field for one here would be a value nothing reads.
-/// Colour is absent for the reason the key light's is `[1, 1, 1]`: this lamp contributes
-/// **attenuation only**, and attenuation is a colourless multiply. A tint authored here
-/// would be dead metadata that looks like it does something.
-///
-/// # Why it cannot brighten anything past its unlit colour
-///
-/// The lamp's shadow term and the key light's are both in `0..=1`, and the pass mixes them
-/// convexly, so the result is in `0..=1` too. A lamp can therefore *lift* a shadow the key
-/// light cast — which is what makes focus visible — and can never push a surface past the
-/// colour it has with no lighting at all. That is why this is art direction with no gate
-/// obligation: the contrast gate's worst case is the allowance floor, and nothing here
-/// moves it. See `contracts/lit-contrast.md` and research R8.
+/// The lamp mixes attenuation terms within `0..=1`, so it can lift a
+/// shadow without making a surface brighter than its unlit color.
+/// It adds no color.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct FocusLightTokens {
-    /// The lamp's fraction of the shading budget **directly beneath it**, falling off with
-    /// distance. A **mix toward a bound, never a multiplier** (research R8): at `0.0` the
-    /// pass is arithmetically what it is today, and at `1.0` the lamp owns the shading of
-    /// the pixel under it outright. There is no spelling of this field that darkens a frame.
+    /// Lamp share of shading directly beneath it, falling with distance.
+    /// Zero preserves the key-light result; one gives the lamp the full share.
     pub share: f32,
-    /// How far the room dims at the edge of the lamp's reach, `0..=1`. The half of the lamp
-    /// a person actually sees.
+    /// Dimming at the edge of the lamp's reach, in `0..=1`.
     ///
-    /// [`FocusLightTokens::share`] redistributes the shading between two lights, and on a
-    /// list of rows at one elevation the two lights agree everywhere, so it changes almost
-    /// nothing: measured at a peak of 7/255 and a mean of 3/255 across a shipped 1200x700
-    /// window with focus moved eight rows. That is a feature that is arithmetically present
-    /// and perceptually absent. This is what makes focus *lit*: brightest under the lamp,
-    /// dimming with distance, so focus is found by where the light is.
-    ///
-    /// Bounded by the same allowance clamp the key light's shadow is, so the light theme's
-    /// 0.87 text-ground floor holds it to a shallower gradient than the dark theme's 0.55 —
-    /// the theme asymmetry research R13 measured, handled by the clamp that already exists
-    /// rather than by a second rule.
+    /// The theme's lighting allowance clamps the result, including the
+    /// stricter floor for text backgrounds.
     pub ambient: f32,
     /// Angular size in degrees, exactly as [`KeyLightTokens::size_deg`]. Large on purpose:
     /// a focus lamp hanging a few pixels above a row is physically a broad source, and a
     /// small one would cast a hard second shadow that reads as a rendering fault rather
     /// than as light.
     pub size_deg: f32,
-    /// How far above the focused surface's top face the lamp hangs, in **logical** pixels
-    /// (scaled where it is built, like every other authored length).
+    /// Lamp height in logical pixels, scaled when the scene is built.
     ///
-    /// This is the closest thing the lamp has to a resting position, and FR-029 is satisfied
-    /// by a different mechanism: under Reduce Motion the lamp does not travel between rows,
-    /// it is simply *at* the focused row — an authored place, not wherever an interrupted
-    /// animation stopped. See [`crate::motion::MotionPattern::FocusLight`].
+    /// Reduced motion places the lamp at the focused row immediately.
+    /// See [`crate::motion::MotionPattern::FocusLight`].
     pub height: f32,
 }
 

@@ -1,11 +1,7 @@
-//! Device and surface management, draw lists, the instanced pipeline, the glyph atlas,
-//! and the rendering-tier machinery.
+//! GPU setup, draw lists, glyph atlases and rendering.
 //!
-//! The boundary this crate defends is that **nothing above it knows what a pipeline is**.
-//! `qs-ui` produces a [`frame::DrawList`] of [`frame::Instance`]s and hands it over; which
-//! tier consumes it, and whether that tier is D3D12 or a software rasterizer, is not
-//! visible from above. That is what makes RP-2 -- all three tiers consume the same draw
-//! lists -- something the type system helps with rather than a rule people remember.
+//! The GPU and CPU renderers consume the same [`frame::DrawList`]. Rendering
+//! tiers select capabilities and resource limits without changing the layout.
 
 pub mod atlas;
 pub mod batcher;
@@ -15,7 +11,7 @@ pub mod device;
 pub mod frame;
 pub mod gl_tier;
 pub mod icon;
-/// The lighting pass and its per-tier degradation. See `specs/002-ray-traced-mode/`.
+/// Lighting effects and their rendering-tier fallbacks.
 pub mod lighting;
 pub mod path;
 /// The interface as geometry, for the lighting pass to read.

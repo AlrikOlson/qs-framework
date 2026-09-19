@@ -1,25 +1,52 @@
 # qs-framework
 
-The GPU UI framework under [quicksilver-file-explorer](https://github.com/AlrikOlson/quicksilver-file-explorer),
-extracted so that quicksilver and [magistr](https://github.com/magistr-dev/magistr) can both build on it.
+Rust libraries for drawing desktop interfaces. They handle windows, GPU and CPU
+rendering, text, and virtualized lists. They are used by
+[Quicksilver](https://github.com/AlrikOlson/quicksilver-file-explorer) and
+[Magistr](https://github.com/AlrikOlson/magistr).
 
-| crate | what it is |
-|---|---|
-| `qs-platform` | windowing, input, display enumeration and present tuning behind traits (winit 0.30) |
-| `qs-gpu` | device + surface management, draw lists, instanced pipelines, glyph atlas, three render tiers (wgpu / GL / CPU), lighting (wgpu 30) |
-| `qs-text` | shaping (rustybuzz), glyph raster (swash), bidi, per-platform font handling |
-| `qs-ui` | tokens, motion, density, the accesskit tree, scene, row recycler |
+| Crate | Contents |
+| --- | --- |
+| `qs-platform` | Windows, input, monitor information, and presentation settings using winit |
+| `qs-gpu` | GPU setup, draw lists, glyph and image atlases, effects, and a CPU renderer |
+| `qs-text` | Text shaping, font lookup, bidirectional text, and glyph rasterization |
+| `qs-ui` | List layout, scrolling, selection, materials, animation, and accessibility |
 
-Extracted from quicksilver at `6dd3d8b` (2026-08-30) with `git filter-repo`, so every
-file carries its original history. Nothing file-explorer-specific lives here and nothing
-here may come to depend on any of it.
+## Build
 
-**Pin discipline:** `wgpu`, `winit` and `accesskit`/`accesskit_winit` move together — see
-the comment in `Cargo.toml`. Consumers pin the same trio.
+The crates declare Rust 1.87 as their minimum version. With rustup installed,
+`rust-toolchain.toml` selects Rust 1.87.0.
 
+Build the rendering, platform, and text libraries with:
+
+```sh
+cargo build --locked -p qs-gpu -p qs-platform -p qs-text
 ```
-cargo build --workspace --all-targets
-cargo nextest run --workspace
+
+`qs-ui` currently fails to compile because its material renderer is missing a
+`DashedStroke` match arm.
+
+Generate the API documentation with:
+
+```sh
+cargo doc --workspace --no-deps --locked --open
 ```
 
-Apache-2.0 — see `LICENSE` and `NOTICE`.
+## Use in a project
+
+The crates are available as Git dependencies:
+
+```toml
+[dependencies]
+qs-gpu = { git = "https://github.com/AlrikOlson/qs-framework" }
+qs-platform = { git = "https://github.com/AlrikOlson/qs-framework" }
+qs-text = { git = "https://github.com/AlrikOlson/qs-framework" }
+```
+
+Use the same Git revision for each `qs-*` crate. If your application also depends
+on wgpu, winit, or AccessKit, use the versions in [Cargo.toml](Cargo.toml) to
+avoid incompatible types between the application and these libraries.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

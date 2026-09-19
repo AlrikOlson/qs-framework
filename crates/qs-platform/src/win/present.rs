@@ -1,31 +1,7 @@
-//! Windows present tuning: `SetMaximumFrameLatency` plus the waitable object.
+//! Windows presentation settings.
 //!
-//! # What this is for
-//!
-//! By default DXGI lets the driver queue up to three frames ahead. That maximizes
-//! throughput and is exactly wrong for an interactive application: every queued frame is a
-//! frame of input latency the user feels as the list lagging behind the pointer. Setting
-//! the maximum frame latency to 2 and waiting on the swapchain's waitable object means the
-//! application starts each frame when the display is ready for it, rather than as fast as
-//! it can and then queueing.
-//!
-//! # Why this is not implemented yet, stated plainly
-//!
-//! Reaching the `IDXGISwapChain2` behind a `wgpu::Surface` requires
-//! `Surface::as_hal::<wgpu_hal::dx12::Api, _, _>()`, which is `unsafe`, is only valid when
-//! the surface actually has a D3D12 backend, and hands back a handle whose lifetime is tied
-//! to internals `wgpu` does not promise to keep stable.
-//!
-//! The honest position for a spike is that the *measurement* -- how much latency the
-//! default queueing costs -- has not been taken yet, and this tuning should be applied in
-//! response to that measurement rather than ahead of it. Writing the `unsafe` block now
-//! would add a platform-specific hazard to the frame path in order to fix a problem nobody
-//! has yet shown exists at this milestone.
-//!
-//! So this reports `not applied` with the reason, which is what
-//! [`crate::present_tuning::PresentTuningOutcome`] exists for, and the bench report carries
-//! it. That is Constitution III applied to our own tooling: the capability is reduced and it
-//! says so, rather than a stub silently claiming success.
+//! Frame latency tuning is not implemented. The implementation reports that it
+//! was not applied, with a reason in the returned outcome.
 
 use crate::present_tuning::{PresentConfig, PresentTuning, PresentTuningOutcome};
 

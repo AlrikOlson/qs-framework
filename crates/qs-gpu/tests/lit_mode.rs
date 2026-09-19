@@ -1,17 +1,7 @@
-//! The lit mode's three adapter claims, on real hardware (specs/002 T034, FR-004, SC-007).
+//! GPU checks for the lighting pass.
 //!
-//! 1. **Mode off is byte-identical to the pre-feature frame.** With no scene, `render`
-//!    encodes the command stream it always did — the lighting pipeline exists but never
-//!    draws — so two unlit renders of one list are identical, and that pair *is* the
-//!    pre-feature baseline: the baseline is not a recorded image from an old binary, it is
-//!    the unlit path itself, which this test holds still.
-//! 2. **A shadowless scene changes nothing.** A scene whose only slabs lie flat (the canvas
-//!    at elevation zero) has nothing to cast and nothing to occlude, so the lighting draw
-//!    runs and multiplies every pixel by one. Byte-identical to mode off — which is what
-//!    makes "the mode is on but nothing is elevated" indistinguishable from off, exactly as
-//!    designed.
-//! 3. **An elevated caster changes pixels.** The proof the pass can go red: without it,
-//!    claims 1 and 2 would also pass for a pipeline that never drew at all.
+//! Repeated unlit frames must match. A scene with no elevated slabs must leave
+//! the image unchanged, while an elevated caster must change pixels.
 
 #![allow(
     clippy::unwrap_used,

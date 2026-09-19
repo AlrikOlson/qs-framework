@@ -1,23 +1,8 @@
-//! The accessibility tree.
+//! Accessibility trees for virtualized lists.
 //!
-//! # The one invariant this file exists for
-//!
-//! > `set_size` is the corpus length and `index_in_set` is the row's corpus ordinal. A
-//! > screen reader announcing "item 4 of 60" instead of "item 4,312 of 1,204,883" is the
-//! > canonical virtualized-list accessibility bug, and it is a build failure here, not a
-//! > polish item.
-//!
-//! It is easy to get wrong because the natural thing to publish is what you just rendered,
-//! and what you just rendered is sixty recycled rows. [`SemanticTree::build`] takes the
-//! logical index explicitly and `tests/a11y_audit.rs` asserts the result against a
-//! million-row corpus.
-//!
-//! # Why this is here at M0 rather than at M4
-//!
-//! Research R12: the virtualized-list-to-semantic-tree mapping is the single hardest
-//! accessibility problem in this product, and discovering at M4 that the recycler's
-//! architecture cannot express it would be catastrophic. M4 is where accessibility is
-//! *audited*; M0 is where it is proven possible.
+//! `set_size` is the total row count, and `index_in_set` is a row's position in
+//! that full list. [`SemanticTree::build`] receives logical indices so screen
+//! readers announce positions consistently as visible rows change.
 
 use accesskit::{Live, Node, NodeId, Rect, Role, Tree, TreeUpdate};
 
@@ -84,12 +69,10 @@ pub struct SemanticNode {
     /// Announced when its label changes, without taking focus. Only the selection status
     /// node sets this.
     pub live: bool,
-    /// One of the tree's **regions**: something that holds items and declares how many.
+    /// Whether this node is a region that contains items and declares a count.
     ///
-    /// Stated rather than inferred from the role, because ADR 013's inspector publishes
-    /// containers that are not lists — a preview is a `Group`, a terminal is a `Terminal` —
-    /// and inferring from `set_size` instead would make a container that *forgot* its
-    /// `set_size` invisible to the very audit whose job is to notice that.
+    /// The flag is independent of role and `set_size`, allowing audits to
+    /// detect a missing count on a container.
     pub container: bool,
 }
 
@@ -177,18 +160,10 @@ impl SemanticTree {
         Self { nodes }
     }
 
-    /// Append a region that publishes a container and no items of its own.
+    /// Append a region with a container and no child items.
     ///
-    /// The inspector's preview and terminal (ADR 013). They are containers with a length
-    /// like the file list is, and the length is **their own** — a preview that inherited the
-    /// list's `set_size` would tell a screen-reader user there were 1,204,883 things in it.
-    /// [`audit_columns`] is what refuses that, which is why this pushes a real `set_size`
-    /// rather than leaving it `None`: an absent length cannot be wrong, and cannot be checked
-    /// either.
-    ///
-    /// `role` is the region's own — a preview is a `Group`, a terminal is a `Terminal`.
-    /// Publishing either as a `List` to make the audit happy would be telling assistive
-    /// technology something false in order to pass a check about telling the truth.
+    /// `role` and `set_size` describe this region, independently of other
+    /// lists or panes. [`audit_columns`] checks its count.
     pub fn push_region(
         &mut self,
         column: u32,
@@ -376,12 +351,10 @@ fn selection_announcement(count: u64) -> String {
     }
 }
 
-/// The string a screen reader announces for a row.
+/// Accessible name for a row, including its optional session indicator.
 ///
-/// Never empty for a focusable node (FR-028). A row whose name is empty -- which happens
-/// for a stub that has not yet learned its name -- announces "Loading" rather than nothing,
-/// because a focusable node with no name is a node the user cannot identify.
-/// `mark` is the row's session indicator, when it has one — see [`crate::mark`].
+/// A row with no known name announces "Loading" so focusable rows always
+/// have a name. See [`crate::mark`] for the indicator.
 fn describe(buf: &RowBuf, row: &RowView, mark: Option<&crate::mark::SessionMark>) -> String {
     let name = buf.name(row);
     let name = name.trim();
@@ -565,27 +538,16 @@ pub struct AuditFinding {
     pub problem: String,
 }
 
-/// Check the tree against the rules SC-008 gates on.
-///
-/// Returns findings rather than a bool so a failure names the node and the rule, which is
-/// the difference between a test that fails and a test that tells you what to fix.
+/// Audit the accessibility tree and return findings with the affected nodes.
 pub fn audit(tree: &SemanticTree, expected_set_size: u64) -> Vec<AuditFinding> {
     audit_columns(tree, &[expected_set_size])
 }
 
-/// The same check over a tree that publishes **several** containers.
+/// Audit a tree containing multiple regions.
 ///
-/// `expected` is one length per container, in tree order. A window with a file list and an
-/// inspector beside it shows two regions at once and each has its own length, so a single
-/// expected size cannot express the right answer for either — it would either fail a correct
-/// tree or, worse, pass one where the preview claimed the list's size. That second failure is
-/// the reason this is generalised rather than relaxed: Constitution VI makes the semantic
-/// tree definition-of-done, and a check that goes green on a wrong answer is not one.
-///
-/// A list item belongs to the most recent container before it, which is the order
-/// [`SemanticTree::push_list`] and [`SemanticTree::push_region`] build. There are no parent
-/// links in this shape — it exists to be asserted against, and adding a parent field to carry
-/// information the order already carries would be a second source of truth.
+/// `expected` gives each container's row count in tree order. Items belong
+/// to the preceding container, matching the order produced by
+/// [`SemanticTree::push_list`] and [`SemanticTree::push_region`].
 pub fn audit_columns(tree: &SemanticTree, expected: &[u64]) -> Vec<AuditFinding> {
     let mut findings = Vec::new();
 

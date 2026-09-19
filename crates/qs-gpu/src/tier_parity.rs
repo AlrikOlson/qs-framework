@@ -1,106 +1,12 @@
-//! Per-primitive agreement between the CPU tier and the shader, with no GPU device.
+//! Compare CPU primitives with a Rust evaluation of the shader.
 //!
-//! # Why this exists
+//! The tests require no GPU. They check primitive rendering, not application
+//! layout or driver behavior. Exact primitives use bounds based on curved-edge
+//! coverage and [`CPU_EDGE_QUANTUM`]; enhanced primitives must render their
+//! declared CPU fallback exactly.
 //!
-//! RP-2 says all three tiers consume the same draw lists. Consuming the same list is not
-//! the same as producing the same pixels, and the gap between those two statements is
-//! where [`PrimKind::Stroke`] lived for a while: the shader strokes *inside* the shape,
-//! `tiny-skia` strokes *centred* on the path, and the two disagreed by a pixel on every
-//! edge. Nothing caught it, because nothing had ever emitted a stroke.
-//!
-//! The thing that *would* have caught it is the cross-tier reference-image suite, which
-//! needs a GPU device and a perceptual threshold that is still uncalibrated (research
-//! R10). So this module takes the cheap half of that job and does it now: it transcribes
-//! `shaders/instance.wgsl` into Rust, evaluates it per pixel, and compares the result
-//! against [`CpuRasterizer`]'s output. No device, milliseconds, and a failure names one
-//! primitive instead of one frame.
-//!
-//! It does **not** replace the reference-image suite. It cannot see anything that happens
-//! above the draw list -- wrong colour, wrong position, a row that forgot to emit -- and
-//! it cannot see driver-specific behaviour, because there is no driver. What it sees is
-//! exactly one class of bug: the two tiers implementing the same primitive differently.
-//!
-//! # Why a transcription is possible at all
-//!
-//! `fs_main` has no `fwidth`, no `smoothstep` and no derivative of any kind -- the comment
-//! at line 124 of the shader explains that `0.5 - d` is exact one-pixel coverage for a
-//! distance field measured in pixels, and says so *because* it is what keeps the CPU tier
-//! correct. That same property is what makes the shader reproducible in ordinary Rust: a
-//! fragment's output depends only on its own interpolated inputs.
-//!
-//! # What the numbers can and cannot mean
-//!
-//! Two things make the tiers differ for reasons that are not bugs, and both were found by
-//! building this suite rather than assumed beforehand.
-//!
-//! The first is definitional. `tiny-skia` computes analytic *area* coverage; the shader
-//! computes `0.5` minus a *distance*. On a straight edge those are the same number. On a
-//! curve they are two different exact answers to slightly different questions, and they
-//! diverge in proportion to curvature -- which is why the rounded fixtures carry a larger
-//! bound than the sharp ones.
-//!
-//! The second is [`CPU_EDGE_QUANTUM`]: `tiny-skia` resolves an edge to the nearest quarter
-//! pixel, and the shader's distance field does not resolve it to anything, because it is
-//! continuous. Geometry landing on a quarter therefore agrees to the last bit, and
-//! geometry landing on an eighth -- a 1.875px stroke at 125% display scale, say -- does
-//! not. That is a property of the fallback tier, measured here and bounded here.
-//!
-//! Every bound below is derived from one of those two numbers and stated in the fixture
-//! that uses it. None was raised until a test went green.
-//!
-//! # What the bounds were checked against
-//!
-//! Twelve mutations, each applied for real and re-run: the CPU tier shifted a whole pixel;
-//! shifted a *quarter* pixel; the stroke inset deleted (the original bug); the glyph blit
-//! reading one texel across; the transcription's stroke band turned into a fill; its
-//! radius clamp deleted; a `PrimKind` dropped from `ALL`; a `cases_for` arm stubbed out to
-//! nothing; and `CPU_EDGE_QUANTUM` sharpened. Those nine all fail the suite. The radius clamp
-//! was the one that initially did *not* -- no fixture asked for a radius large enough to
-//! clamp, so deleting the clamp changed nothing anywhere. `rect/over-large-radius` and
-//! `stroke/over-large-radius` exist because of that survivor.
-//!
-//! Three more arrived with the gradient, and they matter more than the count suggests
-//! because a ramp can be wrong in ways that still look like a ramp. Making the CPU tier
-//! interpolate in linear light rather than Oklab takes `gradient/vertical-sharp` to 33
-//! channels and also reddens `the_ramp_is_walked_in_oklab_and_not_in_linear_srgb` -- two
-//! independent failures, which is the point of having both. Normalizing the gradient axis
-//! against the box's half-width instead of its support takes it to 29. And dropping the
-//! dither from the CPU tier while the shader keeps it takes it to 1, which is the whole
-//! bound now that the three sharp gradient fixtures measure zero.
-//!
-//! Those fixtures used to allow 1, and the 1 was the CPU tier approximating an Oklab curve
-//! with 33 chords. `prim-noise-dither` had to delete that approximation -- a stop list has
-//! nowhere to put a per-pixel offset -- and the tiers came out bit-identical on a ramp, so
-//! the bound was tightened to nothing rather than left with slack nobody was using.
-//!
-//! # Two questions, chosen by the primitive
-//!
-//! Everything above describes the [`Fidelity::Exact`] question: *do the two tiers agree?*
-//! It is the right question for a rounded rect and an impossible one for an effect
-//! `tiny-skia` cannot draw at any tolerance, so a primitive picks which question it is
-//! asked. An [`Fidelity::Enhanced`] kind is asked the other one -- *did the CPU tier draw
-//! the floor its `PrimKind` declares?* -- and it is asked exactly, with no tolerance at all,
-//! because both sides of that comparison are the same rasterizer.
-//!
-//! What the second question buys is not leniency. It is that the fallback stops being
-//! whatever fell out and becomes something somebody chose, wrote down, and can be held to.
-//!
-//! [`PrimKind::Glow`] is the one `Enhanced` kind, and its fixtures ask the floor question
-//! instead. The synthetic declarations in `the_floor_check_*` are still here and still run
-//! in both directions: they are what shows the check can go red, which a real `Enhanced`
-//! kind cannot demonstrate about itself.
-//!
-//! One thing the floor route structurally cannot see is whether the *shader* draws anything
-//! -- a branch returning zero satisfies "the CPU tier drew nothing" perfectly. The four
-//! tests under "the glow's own geometry" are that half, and they hold the transcription to
-//! the halo's measured profile rather than to a snapshot of it.
-//!
-//! A tolerance on its own is a weak assertion, so the comparison does not rest on one.
-//! Alongside the channel difference it pins the ink's bounding box *exactly*, its
-//! coverage-weighted centroid to a fraction of a pixel, and the total ink laid down to a
-//! fraction of a percent. That last one carries the weight where the others cannot: the
-//! quarter-pixel step takes from one edge exactly what it gives the opposite edge, so it
-//! moves the centroid and cannot move the total.
+//! Comparisons also check ink bounds, centroids and coverage. Additional
+//! shader-profile tests check effects whose CPU fallback draws nothing.
 
 #![allow(
     clippy::unwrap_used,
@@ -244,13 +150,7 @@ pub(crate) mod shader {
         ]
     }
 
-    /// `const LIGHT_DIR` -- shader line, above and slightly to the left.
-    ///
-    /// Taken from `crate::frame` rather than re-typed here. It used to be a literal, and it
-    /// stopped being one when a material gained the ability to cast a contact shadow: the
-    /// direction a shadow falls and the direction a surface is shaded from have to be the same
-    /// vector, and two copies of it are two chances for a window whose shadows point one way
-    /// and whose highlights point the other.
+    /// Key-light direction shared with `crate::frame` and the shader.
     pub const LIGHT_DIR: [f32; 3] = crate::frame::LIGHT_DIR;
     /// `const LIGHT_RADIANCE` -- the exposure that puts a flat dielectric back at its albedo.
     pub const LIGHT_RADIANCE: f32 = 4.0757;
@@ -699,14 +599,10 @@ pub(crate) mod shader {
         [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha, alpha]
     }
 
-    /// `textureSample(atlas_texture, atlas_sampler, uv).r` -- shader line 107.
+    /// Bilinear atlas sampling with clamped edges.
     ///
-    /// The sampler is `FilterMode::Linear` with `AddressMode::ClampToEdge` (see
-    /// `batcher.rs`), so this is bilinear, not nearest. That distinction is invisible in
-    /// the pipeline as it stands, because glyph quads land on integer pixels and the
-    /// bilinear weights collapse to `1, 0, 0, 0` -- but it is exactly why a quad at a
-    /// *fractional* origin does not agree between the tiers, and it has to be modelled
-    /// honestly for that measurement to mean anything.
+    /// Integer-aligned glyph quads sample whole texels. Fractional origins use
+    /// interpolation and can differ from the CPU renderer.
     pub fn texture_sample_r(atlas: &[u8], size: u32, uv: [f32; 2]) -> f32 {
         let last = i64::from(size) - 1;
         // Texel centres sit at +0.5, so the filter grid is offset by half a texel.
@@ -853,7 +749,7 @@ pub(crate) mod shader {
             .fold(1e9, f32::min)
     }
 
-    /// `fn soft_shadow` — `min(k * h / t)` along one ray toward the light (research R4).
+    /// Evaluate `min(k * h / t)` along a ray toward the light.
     pub fn soft_shadow(origin: [f32; 3], toward: [f32; 3], k: f32, slabs: &[Slab]) -> f32 {
         let mut res = 1.0_f32;
         let mut t = 0.35_f32;
@@ -2732,12 +2628,10 @@ fn run_kind(kind: PrimKind) {
 use crate::lighting::{SceneEffect, SceneFloor};
 use crate::path::RenderPath;
 
-/// One tier's rendering of one scene effect's contribution, isolated: what the lighting
-/// pass would add to or remove from an otherwise-untouched `SURFACE` x `SURFACE` image.
+/// Function that renders one scene effect's contribution for a tier.
 ///
-/// A function value rather than a method so the mutation test can hand the harness a
-/// deliberately wrong renderer and watch it go red — the same design that keeps
-/// [`assert_floor`] honest for primitives.
+/// Tests can replace it with an incorrect implementation to verify that
+/// the comparison detects the change.
 type EffectContribution = fn(SceneEffect, RenderPath) -> Surface;
 
 /// The zero contribution: the pass touched nothing.
@@ -2749,18 +2643,10 @@ fn zero_contribution() -> Surface {
     }
 }
 
-/// The lighting pass's contribution for one effect on one tier, through the **real**
-/// transcription rather than a stub.
+/// Evaluate one lighting effect for a tier using the shader transcription.
 ///
-/// This function used to return zero for every effect on every tier, which was honest while
-/// no shader existed and became vacuous the moment one did: `scene_effect_holds_its_floor`
-/// only compares when the floor is `Nothing`, so a contribution that is zero everywhere
-/// compares zero against zero and the sweep passes without touching the pass. The fixture is
-/// what makes the comparison mean something — a scene that genuinely produces the effect, so
-/// a tier that declares `Nothing` is asserted to have dropped something that was there.
-///
-/// The tier gate is [`SceneEffect::draws`] rather than a match, so a tier's answer comes from
-/// the same declaration the floor does and the two cannot drift apart.
+/// The fixture produces the effect when supported. [`SceneEffect::draws`]
+/// determines whether the tier draws it or uses its declared fallback.
 fn lit_contribution(effect: SceneEffect, tier: RenderPath) -> Surface {
     let mut surface = zero_contribution();
     if !effect.draws(tier) {
@@ -3206,17 +3092,10 @@ fn blur_falls_back_to_the_floor_uxdd_chose() {
     run_kind(PrimKind::Blur);
 }
 
-/// The one assertion that can tell the right encoding from the wrong one.
+/// Check that the rendered blur fallback is opaque.
 ///
-/// [`run_kind`] above asks whether the CPU tier drew `Floor::Plain(Rect)`, and a rect is a
-/// rect: it holds whichever colour is in [`Instance::color`], so it passes just as happily on
-/// the arrangement UXDD 10.7 names as wrong -- a **translucent unblurred panel**. Every other
-/// check in this file passes on it too. The fidelity declaration is right, the floor kind is
-/// right, the geometry is right, and the product is wrong.
-///
-/// So this asks the question the table actually poses: is the fallback OPAQUE. It reads the
-/// pixels rather than the instance, because the claim is about what a machine without a GPU
-/// shows and not about which field a constructor happened to fill.
+/// This inspects pixels as well as the declared rectangle fallback, since
+/// a rectangle with the glass tint would still be translucent.
 #[test]
 fn the_floor_is_the_opaque_panel_and_not_the_glass() {
     for case in &cases_for(PrimKind::Blur) {
@@ -3274,17 +3153,9 @@ fn the_blur_fixtures_lay_down_ink_so_a_floor_check_means_something() {
     }
 }
 
-/// The image fixtures put ink on the surface, so agreeing about them means something.
+/// Check that image fixtures draw visible pixels.
 ///
-/// **This test exists because the first version of those fixtures did not.** They passed
-/// every bound at zero tolerance while drawing nothing at all: `uv_for` normalises against
-/// [`ATLAS`], the colour page is [`COLOUR_ATLAS`], and the resulting coordinates addressed
-/// empty texels. Both tiers agreed perfectly about a blank rectangle, and every assertion
-/// in [`assert_parity`] is a comparison -- so all of them held.
-///
-/// A tolerance of zero is the strongest bound in the file and the easiest one to satisfy by
-/// accident. What separates the two is whether anything was drawn, and nothing else in the
-/// harness asks.
+/// A parity comparison alone would also accept two blank images.
 #[test]
 fn the_image_fixtures_lay_down_ink_so_a_pass_means_something() {
     for case in &cases_for(PrimKind::Image) {
@@ -4315,13 +4186,10 @@ fn fixture_pbr(roughness: f32, metallic: f32, albedo: Srgba) -> Instance {
     )
 }
 
-/// Where the emissive fixture sits: `x0, y0, x1, y1`.
+/// Bounds of the emissive fixture: `x0, y0, x1, y1`.
 ///
-/// Deliberately much larger than [`fixture_pbr`]'s 24x20. The interior more than a bevel from
-/// every edge is what `emission_never_reaches_the_middle_of_a_surface` measures, and on the
-/// smaller rectangle that interior is 60 pixels -- which the test refuses as too few to be a
-/// measurement. Widening the fixture is the honest fix; loosening that guard would have been
-/// the other one.
+/// The rectangle leaves enough interior pixels beyond the bevel to check
+/// that emission does not reach the label area.
 #[test]
 fn pbr_stays_at_its_floor_on_the_cpu_tier() {
     run_kind(PrimKind::Pbr);

@@ -1,11 +1,8 @@
-//! The boundary between "where rows come from" and "how rows are drawn".
+//! The row-data interface consumed by layout and accessibility.
 //!
-//! Implements [`contracts/row-source.md`]. M0 fills it from an in-memory corpus; M1 fills
-//! it from the VFS and directory cache; M2 fills it from search results. **The renderer
-//! must not be able to tell the difference** -- that is the test of whether this boundary
-//! is drawn in the right place, and it is why `RowBuf` hands out borrowed name bytes rather
-//! than `String`s: a source that had to allocate a `String` per visible row per frame would
-//! be a source that could not meet RS-1.
+//! Sources fill a reusable [`RowBuf`] with borrowed name bytes and metadata.
+//! The renderer can use in-memory rows, directory listings or search results
+//! without depending on how they are stored.
 
 use std::ops::Range;
 
@@ -20,10 +17,7 @@ pub struct RowId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct KindId(pub u16);
 
-/// How much of a row is actually known.
-///
-/// Mirrors SDD §5.1 so that placeholder rendering is exercised for real at M0 rather than
-/// bolted on at M1 when there is finally I/O to be slow.
+/// How much of a row has been loaded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(u8)]
 pub enum LoadState {
@@ -33,7 +27,7 @@ pub enum LoadState {
     Stub = 0,
     /// Name, size, mtime, kind.
     Basic = 1,
-    /// Everything, including anything a later milestone adds.
+    /// All row fields are available.
     Full = 2,
 }
 
@@ -92,27 +86,17 @@ impl core::ops::BitOr for RowFlags {
     }
 }
 
-/// One displayable row, as handed to the renderer.
+/// One row supplied to the renderer.
 ///
-/// `name` is a **byte range into the buffer's arena**, never an owned string. Names are raw
-/// bytes rather than `str` because M1 must render filenames that are not valid UTF-8
-/// (SDD §5.2), and changing the type then would ripple through every layer above.
-///
-/// Not `Copy`: the name range makes it 40 bytes, and passing it by reference is what the
-/// row builder does anyway.
+/// `name` is a byte range into the buffer's arena. Raw bytes allow filenames
+/// that are not valid UTF-8.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RowView {
     pub id: RowId,
-    /// Range into [`RowBuf::names`].
+    /// Range into the name arena in [`RowBuf`].
     pub name: Range<u32>,
     pub size: u64,
-    /// Modification time in **unix seconds**, and the unit is load-bearing.
-    ///
-    /// `qs-shell` fills it from `SystemTime::duration_since(UNIX_EPOCH).as_secs()` and
-    /// [`crate::format_mtime`] reads it as seconds. Those two used to disagree — this said
-    /// nothing about its unit and `format_mtime` divided by a billion — so every real file
-    /// rendered as `1970-01-01`. Both sides now say seconds here, in one place, because the
-    /// bug lived in the gap between two crates that agreed on `i64` and nothing else.
+    /// Modification time in Unix seconds, as expected by [`crate::format_mtime`].
     pub mtime: i64,
     pub kind: KindId,
     pub flags: RowFlags,
@@ -195,15 +179,12 @@ impl RowBuf {
     }
 }
 
-/// Where rows come from.
+/// Source of rows for layout and accessibility.
 ///
-/// See [`contracts/row-source.md`] for the guarantees. The two that constrain callers most:
-/// `rows()` must return immediately (RS-1), and it must fill the **entire** requested range
-/// using [`LoadState::Stub`] for anything not resident (RS-2). A short return would force
-/// the recycler to handle gaps, and gaps are where blank rows come from.
+/// `rows()` must return immediately and fill the entire requested range.
+/// Use [`LoadState::Stub`] for rows whose data has not loaded.
 pub trait RowSource: Send + Sync {
-    /// Exact logical row count. Drives the scrollbar extent and, critically, the
-    /// accessibility `set_size` (FR-027). MUST be exact, never an estimate.
+    /// Exact row count, used for scroll extent and accessibility `set_size`.
     fn len(&self) -> u64;
 
     fn is_empty(&self) -> bool {
@@ -216,9 +197,7 @@ pub trait RowSource: Send + Sync {
     /// Row heights at `density`, in physical pixels.
     fn heights(&self, density: Density, scale: f32) -> Heights;
 
-    /// Monotonic content version. Bumped only when content changes -- never per frame
-    /// (RS-4), because a version that churns defeats snapshot reuse and silently doubles
-    /// layout cost.
+    /// Monotonic version that increases when content changes, not on each frame.
     fn version(&self) -> u64;
 }
 

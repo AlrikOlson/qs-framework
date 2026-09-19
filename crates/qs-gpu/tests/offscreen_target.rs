@@ -1,26 +1,7 @@
-//! The offscreen target's one load-bearing claim: taking the two-pass path changes nothing.
+//! Check that an offscreen resolve preserves the directly rendered image.
 //!
-//! # Why this test is the chunk
-//!
-//! `crates/qs-gpu/src/target.rs` adds a second render target and a resolve pass. Every effect
-//! that needs neighbouring pixels — blur, bloom, refraction — is built on it, and every one of
-//! them will be authored by looking at the result. So if the resolve is not *exactly* a copy,
-//! all three are authored against an image that differs from the single-pass one by an amount
-//! nobody measured, and the difference is attributed to the effect.
-//!
-//! The failure modes this catches are all silent ones. A linear sampler with a half-texel
-//! offset blurs the frame by a hair. A target in a non-sRGB format makes the resolve a gamma
-//! conversion. A blend state on the resolve pipeline composites every translucent pixel twice.
-//! An unflipped `v` axis renders the frame upside down — which is the one that is *not* silent,
-//! and is here for completeness rather than for fear.
-//!
-//! # Why it forces the path
-//!
-//! No shipped primitive returns `true` from `PrimKind::needs_backdrop` yet: the infrastructure
-//! deliberately landed before the first effect that uses it, so its memory cost, resize
-//! behaviour and tier answer were decided in the open. `Renderer::force_offscreen` is what
-//! keeps the path from being unreachable, and therefore untested, in the meantime. Without it
-//! the blur chunk would be debugging the target and the blur at the same time.
+//! The test forces the offscreen path and compares pixels. This catches
+//! sampling offsets, format conversions, extra blending and flipped coordinates.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the vocabulary of a
 // test, not a hazard in one.

@@ -1,20 +1,8 @@
-//! Windowing, input, display enumeration and present tuning — behind traits that outlive
-//! the backend.
+//! Window, display and presentation interfaces backed by `winit`.
 //!
-//! # Why `winit`, and why behind a trait
-//!
-//! Research R1: SDD §3.2 specifies a per-OS `qs-platform` implementation, but hand-writing
-//! Win32 + AppKit + Wayland/X11 windowing is roughly a milestone of work by itself and
-//! retires **none** of M0's risk. The risk M0 exists to measure is rendering throughput, not
-//! window creation.
-//!
-//! Wrapping `winit` behind our own trait means the eventual hand-written layer is a swap
-//! rather than a rewrite. The trait surface here is deliberately the *minimum* `qs-ui`
-//! actually consumes -- every method that leaks a `winit` type into it is a method that
-//! makes the swap harder, and there are none.
-//!
-//! M0 implements 2 of the ~12 traits SDD §9.1 eventually needs: [`PlatformWindow`] and
-//! [`PlatformDisplay`].
+//! [`PlatformWindow`] exposes window handles, size, scale and redraw requests.
+//! [`PlatformDisplay`] provides monitor information. Applications receive events
+//! directly from the backend.
 
 pub mod display;
 pub mod present_tuning;

@@ -1,37 +1,9 @@
-//! Render the gradient primitive against the real tokens, in both themes, and write two
-//! PNGs to look at.
+//! Save gradient comparisons using the theme tokens.
 //!
 //! `cargo run -p qs-ui --example gradient_strip -- out.png`
 //!
-//! chunk:prim-gradient's numeric criteria are all checkable and all green: the two tiers
-//! agree to one 8-bit level where the ramp is isolated, the midpoint lands on the
-//! perceptual midpoint of its stops, and the contrast gate covers both ends. None of that
-//! answers whether the ramp *looks* like anything, and this project has shipped a defect
-//! that only looking found in every visual chunk so far. It found one here too: at the
-//! dark theme's first values the bar's ramp was indistinguishable from the flat fill it
-//! replaced, because `surface/overlay` is pinned at `l = 0` and a small lift off pure
-//! black is a handful of 8-bit levels. See `surface/overlay-lift`'s description.
-//!
-//! # Why this lives in qs-ui and not qs-gpu
-//!
-//! It was written in `qs-gpu` first, next to the primitive, and had to hand-resolve the
-//! two stops out of `design/tokens.json` as literals -- `qs-gpu` is below the token layer.
-//! Two copies of a colour is the drift this token file exists to prevent, and a *looking*
-//! harness showing something other than what ships is worse than no harness. `qs-ui` reads
-//! the real tokens, so the picture is the shipped ramp by construction.
-//!
-//! Four bands per theme, adjacent so the comparisons are seen rather than remembered:
-//!
-//! - the command bar's ramp, at roughly the height it is drawn -- the only band that
-//!   answers "is the lift visible, and is it too much";
-//! - the flat fill it replaced, directly beneath, because the honest question about a
-//!   subtle gradient is whether it is doing anything at all;
-//! - a wide-interval ramp, steel blue to amber, in Oklab;
-//! - the same pair walked in **linear light**, which is what the shader would do without
-//!   `linear_rgb_to_oklab`. It reaches the bright end early and spends most of its length
-//!   near the top, crushing the dark half into a sliver. That is the same defect
-//!   `the_ramp_is_walked_in_oklab_and_not_in_linear_srgb` measures as an `l` of 0.647
-//!   where the perceptual midpoint is 0.551, and it is far more obvious as a picture.
+//! Each theme includes the command-bar gradient, a flat fill, an Oklab gradient
+//! from blue to amber, and the same colors interpolated in linear light.
 
 // A looking harness, not shipped code: a panic here is a developer seeing a stack trace
 // instead of a picture. Same set the other two examples allow.

@@ -1,6 +1,6 @@
 [package]
 name = "qs-platform"
-description = "Windowing, input, display enumeration and present tuning, behind traits that outlive the backend."
+description = "Window, display and presentation interfaces using winit."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

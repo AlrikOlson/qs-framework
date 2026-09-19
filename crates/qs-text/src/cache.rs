@@ -1,20 +1,8 @@
-//! The shaped-run cache.
+//! Bounded LRU cache for shaped text.
 //!
-//! Shaping is the single most expensive thing a scroll does per row. A 1M-row corpus
-//! scrolled at 120 Hz presents roughly 40 new rows per frame at the fastest fling, and
-//! reshaping all of them every frame is the difference between holding 8.33 ms and not.
-//!
-//! Two design points are load-bearing:
-//!
-//! * **Hits verify the text, they do not trust the hash.** The key carries a 64-bit hash,
-//!   but every hit compares the stored string against the query. A hash collision in a
-//!   shaped-run cache does not corrupt memory -- it draws *the wrong filename*, which is a
-//!   silent, unreproducible, screenshot-only bug. At a million rows the birthday odds are
-//!   small and non-zero, and "small and non-zero" is not a property worth shipping when the
-//!   fix is a string comparison on a path that already hit a hash map.
-//! * **Eviction is O(1).** An intrusive LRU list over a slab, not a scan for the oldest
-//!   entry. Under the R8 thrash scenario the cache evicts on nearly every insert, and an
-//!   O(n) eviction there would turn a cache-pressure problem into a quadratic one.
+//! Cache hits compare the stored text as well as its hash, so a hash collision
+//! cannot return another string's glyphs. Eviction uses a linked list over a slab
+//! and takes constant time.
 
 use std::collections::HashMap;
 use std::sync::Arc;

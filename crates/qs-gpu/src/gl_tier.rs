@@ -1,20 +1,7 @@
-//! The Reduced tier: GL 4.3 / GLES 3.1.
+//! Resource limits for the reduced rendering tier.
 //!
-//! # Why this file is short, and why that is the point
-//!
-//! The Reduced tier is *not* a second renderer. It is the same pipeline, the same shader
-//! and the same draw lists on a smaller feature set -- which is what makes RP-2 true rather
-//! than aspirational. Everything tier-specific fits in the two functions below:
-//!
-//! * A smaller atlas, because GL 4.3 guarantees only 16384 but the hardware that actually
-//!   lands on this tier is old integrated graphics where a 2048² R8 texture is already
-//!   4 MB of a small budget.
-//! * A smaller per-frame upload bound, because these machines have slower CPUs and the
-//!   rasterization cost dominates.
-//!
-//! If this file ever grows a `draw_row_gl`, the parity guarantee has been lost and the
-//! reference-image suite is checking two renderers against each other rather than one
-//! renderer against itself.
+//! This tier uses the shared pipeline with a smaller glyph atlas and a lower
+//! per-frame upload budget.
 
 use crate::path::RenderPath;
 

@@ -1,27 +1,8 @@
-//! Row-height prefix sums, with a uniform-height fast path.
+//! Row-height prefix sums and offset lookup.
 //!
-//! Research R6 settles the structure: a Fenwick tree (binary indexed tree) giving O(log n)
-//! offset→index and index→offset. For a million rows that is ~8 MB of `u32` prefix sums and
-//! roughly 20 memory accesses per lookup -- negligible against an 8.33 ms budget.
-//!
-//! # The fast path is not an optimization, it is the common case
-//!
-//! Every corpus M0 gates on has uniform row heights, and so does every real directory
-//! listing in the flat view. [`Heights::Uniform`] short-circuits the tree entirely: the
-//! mapping becomes a division, the 8 MB is never allocated, and `flat-1m` never touches
-//! this file's interesting code at all.
-//!
-//! The tree still has to exist and has to be correct, because M1's grouped and grid views
-//! need variable heights, and building the spike on a uniform-height assumption would make
-//! the M0 measurement describe a renderer nobody is going to ship (research R6's rejected
-//! alternative).
-//!
-//! # Heights are integers
-//!
-//! Row heights are stored as `u32` in physical pixels, not `f32` in logical ones. Summing a
-//! million `f32` heights accumulates error at exactly the scale that matters -- see
-//! research R5 -- and an integer prefix sum is exact by construction. Fractional logical
-//! heights are resolved to whole physical pixels once, when the density or scale changes.
+//! Variable heights use a Fenwick tree with logarithmic lookup and updates.
+//! [`Heights::Uniform`] uses arithmetic directly and needs no tree allocation.
+//! Heights are whole physical pixels to keep cumulative offsets exact.
 
 /// Prefix sums over per-row heights.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,14 +11,9 @@ pub struct Fenwick {
     tree: Vec<u64>,
     len: usize,
     total: u64,
-    /// Shortest row, recorded at construction.
+    /// Shortest row height, recorded at construction.
     ///
-    /// This is what actually bounds virtualization when heights vary. FR-002 states the
-    /// bound as `viewport_height / row_height + 2`, which is unambiguous only while every
-    /// row is the same height. With variable heights the worst case is set by the
-    /// *shortest* row -- that is how many can fit on screen at once -- and computing the
-    /// bound from a nominal or average height would make the assertion pass while the
-    /// recycler laid out several times more rows than intended.
+    /// This determines the maximum number of visible rows when heights vary.
     min_height: u32,
 }
 

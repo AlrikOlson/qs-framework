@@ -1,24 +1,8 @@
-//! The row recycler: decides which rows exist this frame, and proves it stayed bounded.
+//! Visible-row layout with reusable storage.
 //!
-//! # FR-002 is the definition of "virtualized"
-//!
-//! > Requests at most `viewport_height / row_height + 2` rows per frame.
-//!
-//! A regression here does not look like a bug. The list still renders correctly; it just
-//! lays out ten thousand rows instead of forty and misses the frame budget by two orders of
-//! magnitude. Nothing about the output says why. So the bound is **asserted in debug
-//! builds** on every frame ([`Recycler::layout`]) and asserted again by
-//! `tests/virtualization_bound.rs` across the full parameter space, because a silent
-//! failure that destroys SC-001 deserves two independent checks rather than a comment.
-//!
-//! # What "recycling" means here, and what it does not
-//!
-//! There are no retained row objects to recycle. Each frame reads the visible slice into a
-//! reused [`RowBuf`] and builds instances from it. That *is* the recycling: the allocations
-//! persist, the contents do not. A pool of live row widgets would buy nothing -- there is
-//! no per-row state worth carrying between frames -- and would cost the correctness problem
-//! that makes virtualized lists notorious, where a recycled row keeps a scrap of the
-//! previous row's data.
+//! Each frame reads the visible range into a reused [`RowBuf`]. For uniform
+//! heights, layout requests at most `viewport_height / row_height + 2` rows.
+//! Debug assertions and `tests/virtualization_bound.rs` check this bound.
 
 use crate::density::Density;
 use crate::fenwick::Heights;
@@ -60,9 +44,7 @@ pub struct ViewportLayout {
     pub origin_x: f32,
     /// Top edge of the entry surface within the window, in physical pixels.
     pub origin_y: f32,
-    /// Physical pixels. The size of the **entry surface**, not of the window: chrome is
-    /// subtracted before this is computed, which is what keeps the FR-002 bound honest
-    /// once a command bar and a status shelf are on screen.
+    /// Size of the entry area in physical pixels, excluding window chrome.
     pub width: u32,
     pub height: u32,
     /// Device pixel ratio.
@@ -84,52 +66,24 @@ pub struct ViewportLayout {
     /// Shortest row in the source, in physical pixels. See
     /// [`ViewportLayout::virtualization_bound`].
     pub min_row_height: u32,
-    /// Entries packed into one laid-out row. `1` in the list, and whatever fits across the
-    /// surface in the grid.
-    ///
-    /// This is what keeps `visible.count` meaning **entries** in every view. `fill`, the
-    /// accessibility tree and `ensure_filled` all already read it that way, so the
-    /// alternative — counting grid rows here and entries somewhere else — would leave the
-    /// FR-002 assertion checking a number nothing else uses.
+    /// Entries per laid-out row: one in a list, or the number of columns
+    /// in a grid. Visible counts remain entry counts in either view.
     pub columns: u32,
 }
 
 impl ViewportLayout {
-    /// The FR-002 bound for this viewport, counted in **entries**.
+    /// Maximum entries needed for this viewport.
     ///
-    /// Derived from the **shortest** row, not the nominal one. FR-002 writes the bound as
-    /// `viewport_height / row_height + 2`, which is unambiguous only while every row is the
-    /// same height -- the case `flat-1m` exercises. With variable heights (`deep-40`) the
-    /// worst case is however many of the shortest row fit on screen, and computing the
-    /// bound from the nominal height would let the assertion pass while the recycler laid
-    /// out several times more rows than intended.
-    ///
-    /// The `* columns` is the whole reason [`ViewportLayout::columns`] exists. A grid lays
-    /// out several entries per row, and there are two wrong ways to reconcile that which
-    /// fail in opposite directions: pushing entry counts through the row-shaped bound fires
-    /// the assertion on a perfectly correct grid, and keeping the bound in grid rows while
-    /// counting entries elsewhere leaves the assertion passing while nothing checks the
-    /// number that actually costs frame time.
+    /// Uses the shortest row height, with room for partially visible rows,
+    /// then multiplies by the number of columns.
     pub fn virtualization_bound(&self) -> u32 {
         ((self.height / self.min_row_height.max(1)) + 2).saturating_mul(self.columns.max(1))
     }
 
-    /// The FR-002 bound restated in the unit that costs frame time: **surface primitives**.
+    /// Maximum surface primitives for this viewport.
     ///
-    /// Bounding entries was enough while a row's surface was a fixed handful of hand-written
-    /// `Instance` pushes. Materials make composition cheap, and cheap composition is how one
-    /// row goes from six primitives to twenty without anybody deciding to -- a layer added to
-    /// `row/selected` in `design/tokens.json` costs one instance per selected row on every
-    /// frame, and nothing in a token file looks like a frame-time decision.
-    ///
-    /// So the bound is re-measured here rather than assumed. [`SURFACE_PRIMS_PER_ENTRY`] is
-    /// the per-entry allowance and `the_surface_primitive_budget_holds_in_the_worst_case` in
-    /// `row.rs` is what holds the row renderer to it, with every state a row can be in
-    /// switched on at once.
-    ///
-    /// Glyphs are deliberately outside it. A row's glyph count is a function of how long its
-    /// name is, not of how it is composed, and folding the two together would produce a
-    /// number that moves when a directory is renamed.
+    /// Multiplies the entry bound by [`SURFACE_PRIMS_PER_ENTRY`]. Glyphs are
+    /// excluded because their count depends on text length.
     pub fn surface_prim_bound(&self) -> u32 {
         self.virtualization_bound()
             .saturating_mul(SURFACE_PRIMS_PER_ENTRY)
@@ -174,14 +128,10 @@ impl ViewportLayout {
         self
     }
 
-    /// Top edge of a visible row in **window** space.
+    /// Top edge of a visible row in window coordinates.
     ///
-    /// Note that the row's position within the surface is derived from its index in the
-    /// visible slice, not from its absolute content offset. That is deliberate and it is
-    /// research R5 in practice: the absolute offset of row 999,999 is 28 million, and
-    /// subtracting the scroll from it in `f32` would lose the fractional part. Here the
-    /// arithmetic never leaves the surface's own coordinate range before the origin is
-    /// added.
+    /// Calculates within the visible range before adding the viewport origin,
+    /// avoiding precision loss from large absolute `f32` offsets.
     pub fn row_top(&self, slot: u32) -> f32 {
         let line = f64::from(slot / self.columns.max(1));
         self.origin_y + (line * f64::from(self.row_height) - self.first_row_offset) as f32
@@ -241,8 +191,7 @@ impl ViewportLayout {
 #[derive(Debug, Default)]
 pub struct Recycler {
     buf: RowBuf,
-    /// Source version the buffer was filled from. RS-4 promises this changes only on real
-    /// content changes, which is what makes it usable as a staleness check.
+    /// Source content version used to fill the buffer.
     filled_version: u64,
     last_range: Option<VisibleRange>,
 }
@@ -387,10 +336,10 @@ impl Recycler {
         layout
     }
 
-    /// Fill the buffer with the visible rows.
+    /// Fill the buffer with visible rows.
     ///
-    /// Calls `source.rows()` exactly once per frame with exactly the visible range. RS-1
-    /// promises that call returns immediately; RS-2 promises it fills the whole range.
+    /// Calls `source.rows()` once with the visible range. The source must
+    /// return immediately and provide placeholders for unloaded rows.
     pub fn fill(&mut self, source: &dyn RowSource, layout: &ViewportLayout) -> &RowBuf {
         qs_gpu::affinity::assert_ui_thread("Recycler::fill");
 

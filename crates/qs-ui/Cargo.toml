@@ -1,6 +1,6 @@
 [package]
 name = "qs-ui"
-description = "Row recycling, scroll state, densities, layout, tokens and the accessibility tree."
+description = "List layout, scrolling, materials, animation and accessibility."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

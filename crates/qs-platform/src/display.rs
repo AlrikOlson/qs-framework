@@ -1,11 +1,7 @@
-//! Display enumeration: per-monitor DPI scale, refresh rate, and change events.
+//! Display information, including scale factors and refresh rates.
 //!
-//! # Why refresh rate is an `Option`
-//!
-//! Not every platform reports it. Wayland does, X11 sometimes does, and a virtual display
-//! in a VM frequently reports something meaningless. The frame budget is derived from the
-//! refresh rate (8.33 ms *is* one frame at 120 Hz), so a wrong value is worse than no
-//! value: it would produce a budget the harness gates on and nobody can explain.
+//! A refresh rate is optional because some displays and backends do not report it.
+//! Frame budgets are available only when that rate is known.
 
 use crate::PhysicalSize;
 
@@ -25,11 +21,7 @@ pub struct DisplayInfo {
 }
 
 impl DisplayInfo {
-    /// The frame budget this display implies, in milliseconds.
-    ///
-    /// `None` when the refresh rate is unknown, which is the honest answer: the alternative
-    /// is assuming 60 Hz and gating a 120 Hz machine against a budget twice as generous as
-    /// it should be.
+    /// Frame budget in milliseconds, or `None` when the refresh rate is unknown.
     pub fn frame_budget_ms(&self) -> Option<f64> {
         self.refresh_hz.filter(|hz| *hz > 0.0).map(|hz| 1000.0 / hz)
     }
@@ -41,11 +33,10 @@ pub trait PlatformDisplay {
     fn primary(&self) -> Option<DisplayInfo>;
 }
 
-/// What changed about the display configuration.
+/// A change in display configuration.
 ///
-/// A DPI change must re-lay-out at the *exact* new physical resolution (FR-014). Treating
-/// it as a resize would work by accident on most platforms and produce half-pixel text on
-/// the ones where the scale changes without the physical size doing so.
+/// Scale changes require layout at the new physical resolution even when
+/// the window's physical size remains unchanged.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DisplayChange {
     /// The window moved to a monitor with a different scale, or the user changed the

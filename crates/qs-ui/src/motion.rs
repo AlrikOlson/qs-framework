@@ -1,60 +1,13 @@
-//! Motion, and how it stops.
+//! Animation plans, timing and reduced-motion behavior.
 //!
-//! Constitution VI requires reduced motion to be honoured. The requirement is narrower and
-//! stricter than "make animations shorter":
+//! Callers choose the curve and motion kind. Reduced motion makes layout changes
+//! instant and caps fades at 80 milliseconds. User-controlled scrolling keeps
+//! its momentum.
 //!
-//! * **No spring.** A spring overshoots and settles, and overshoot is precisely the motion
-//!   that triggers vestibular symptoms. Reduced motion replaces it with an instant change
-//!   or an 80 ms cross-fade -- an opacity change, which moves nothing.
-//! * **Position never animates.** A fling is motion the *user* initiated and is still
-//!   directing; a density change animating row heights is motion the application initiated.
-//!   Under reduced motion the second one becomes instant. The first is not an animation in
-//!   the relevant sense and is left alone -- disabling scrolling momentum because someone
-//!   asked for reduced motion would be a misreading that makes the application harder to
-//!   use for the person who asked.
-//!
-//! # The curve belongs to the pattern, not to the kind
-//!
-//! An earlier version of this module decided the curve from the [`MotionKind`] alone: every
-//! layout change got a spring. UXDD 10.3 does not work that way. It is a table of *patterns*,
-//! and it hands out a spring to exactly one of its nine rows -- sort/filter reorder, at
-//! 220 ms with 0.8 damping. Selection change, which is unambiguously a geometry change, is
-//! 120 ms `ease-out`. So the curve is an input, and [`MotionKind`] retains the one job it is
-//! actually good at: deciding what reduced motion *does* to a pattern. A fade may survive,
-//! capped; a layout change becomes instant.
-//!
-//! # A duration is not a speed
-//!
-//! UXDD 10.3 gives each pattern one number, and one number is only right for one distance.
-//! Arrowing down a single row moves the selection region a row height; `End` after a page of
-//! scrolling moves it most of a viewport. Spending the table's 120 ms on both makes the short
-//! move *feel slow*, and specifically it feels slow in the way that reads as lag rather than
-//! as animation: a cubic ease-out lays 94 % of the travel into the first 60 % of the time and
-//! then creeps through what is left, so over 28 pixels the last 50 ms move under two pixels.
-//! Nothing is broken and nothing measures wrong; the interface simply feels like it is
-//! waiting for something.
-//!
-//! So a pattern that has a distance scales its duration by one -- see [`duration_for`] --
-//! between a floor and the table's number, which becomes the *ceiling* rather than the
-//! answer. A pattern with no distance keeps its single number, because inventing a distance
-//! to scale a fade by would be worse than the problem.
-//!
-//! # Every animation retires, and that is the whole of SC-003
-//!
-//! The frame loop stays awake exactly as long as one [`Animation`] is live. Idle is not a
-//! slow timer, it is the absence of any reason to draw, so an animation that never formally
-//! completes is the single most likely cause of an SC-003 failure. Three properties defend
-//! it, and all three are tested:
-//!
-//! 1. [`Animation::advance`] always terminates -- there is no asymptotic path.
-//! 2. [`Phase::set`] is a **no-op when the target is unchanged**. Pointer motion arrives as
-//!    a stream, and a caller that re-asserted the same hover row every frame would otherwise
-//!    extend the animation forever and the loop would never return to `Wait`. That is a
-//!    correctness property, not an optimization.
-//! 3. An [`MotionPlan::Instant`] plan never constructs an `Animation` at all, so it opens no
-//!    ticket for even one tick. Under reduced motion every layout change is instant, and a
-//!    wake-per-keypress on the configuration whose entire point is to do less would be a
-//!    particularly bad way to fail.
+//! [`duration_for`] scales movement duration with distance. [`Animation::advance`]
+//! completes finite animations, and [`Phase::set`] leaves an unchanged target
+//! alone. An instant plan creates no animation, allowing the frame loop to sleep
+//! when nothing changes.
 
 use crate::density::{Density, DensityTransition};
 use crate::material::Drive;
@@ -71,16 +24,7 @@ pub enum MotionPreference {
 /// Cross-fade duration under reduced motion, in seconds.
 pub const REDUCED_CROSSFADE: f32 = 0.080;
 
-/// How long one turn of the material cycle takes, in seconds of **awake** time.
-///
-/// Provisional, and stated as provisional rather than tuned: nothing in the build consumes a
-/// phase yet at a speed anyone can look at. `prim-conic-sweep` is the first unit that will
-/// be able to judge it against a moving highlight, and it should change this number rather
-/// than work around it.
-///
-/// Six seconds is chosen to be slower than any pattern in UXDD 10.3 by an order of
-/// magnitude, so a cyclic effect reads as ambience the eye can ignore rather than as a
-/// second animation competing with the one the user caused.
+/// Duration of one material cycle, in seconds of active animation time.
 pub const CYCLE_SECONDS: f32 = 6.0;
 
 /// Where the cycle sits under Reduce Motion. See [`InteractionMotion::phase`].
@@ -103,12 +47,7 @@ pub enum MotionKind {
     UserDirectedScroll,
 }
 
-/// The shape of a transition over time.
-///
-/// [`Curve::Spring`] is reachable only through [`plan`] directly: none of the patterns M0
-/// has a surface for uses one. It is here because "reduced motion removes the spring" is a
-/// guarantee with no witness unless a spring exists to remove, and because it is the curve
-/// UXDD 10.3 assigns to sort/filter reorder, which is the first pattern M1 will need.
+/// Transition curve used by an animation plan.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Curve {
     /// Fast start, settled finish -- the shape that reads as "responsive".
@@ -160,14 +99,9 @@ impl MotionPlan {
     }
 }
 
-/// A row of the UXDD 10.3 motion table that this build actually drives.
+/// Named interaction patterns with durations, curves and motion kinds.
 ///
-/// UXDD 10.3 has nine rows; four of them have a surface in M0. The other five -- row
-/// insert/remove, sort/filter reorder, panel open/close, navigation, toast -- are
-/// deliberately **absent** rather than transcribed, because a variant nothing constructs is
-/// the same dead metadata this chunk exists to remove. [`MotionPattern::ALL`] and the
-/// exhaustive matches below mean a fifth cannot be added without naming its duration, its
-/// curve and its kind.
+/// [`MotionPattern::ALL`] lists the supported patterns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MotionPattern {
     /// Pointer enters or leaves a row. Also the *release* half of a press -- see
@@ -179,20 +113,13 @@ pub enum MotionPattern {
     SelectionChange,
     /// Row heights change because the density changed.
     DensityChange,
-    /// The lit mode's focus lamp travels to a different row.
+    /// Move the focus lamp to another row.
     ///
-    /// Not a row of UXDD 10.3 — it is spec 002 US3's, and it is here rather than beside the
-    /// scene because "what reduced motion does to this" is a motion question and this module
-    /// is the only place that answers it. See [`InteractionMotion::focus_light_draw`].
+    /// See [`InteractionMotion::focus_light_draw`].
     FocusLight,
-    /// A session transitions into awaiting approval: the accent arrives once, then holds.
+    /// Show the accent when a session starts waiting for approval.
     ///
-    /// Not a row of UXDD 10.3 — it is the Sessions workstream's (roadmap `summons-arrival`,
-    /// ADR 014's design half of the needs-you event). It is here for FocusLight's reason:
-    /// what reduced motion does to it is decided in this table and nowhere else, and the
-    /// answer is **instant** — an attention-grabbing arrival is exactly the large-area event
-    /// reduced motion exists to remove, so it is `Layout`, not a `Fade` that would keep an
-    /// 80 ms version playing.
+    /// The accent appears once and holds. Reduced motion makes the change instant.
     SummonsArrival,
 }
 
@@ -241,10 +168,9 @@ impl MotionPattern {
         }
     }
 
-    /// Full-motion duration in seconds, from UXDD 10.3.
+    /// Duration in seconds with full motion enabled.
     ///
-    /// For a pattern with [`MotionPattern::distance_scaling`] this is the **ceiling**, spent
-    /// only by a move at least a span long. Everything shorter gets less.
+    /// For distance-scaled patterns, this is the maximum duration.
     pub fn duration(self) -> f32 {
         match self {
             Self::HoverFeedback => 0.080,
@@ -265,8 +191,7 @@ impl MotionPattern {
         }
     }
 
-    /// The curve, from UXDD 10.3. All four of M0's patterns are `ease-out`; the table's one
-    /// spring belongs to a pattern M0 has no surface for.
+    /// Transition curve for this pattern.
     pub fn curve(self) -> Curve {
         match self {
             Self::HoverFeedback
@@ -321,20 +246,10 @@ impl MotionPattern {
     }
 }
 
-/// How long a move of `distance` should take: `shortest` for a standing start, rising to
-/// `longest` once the move is `span` or more.
+/// Scale duration from `shortest` to `longest` with the square root of distance.
 ///
-/// The growth is a **square root**, and the two straight-line alternatives are both worse.
-/// A constant duration is a speed that varies with distance, which is where "a short move
-/// looks artificially slow" comes from. A constant *speed* -- duration linear in distance --
-/// fixes the short move and ruins the long one: a viewport-long slide at a one-row pace takes
-/// most of a second, and the user is waiting for a region they can already see the
-/// destination of. A square root keeps the short move short and lets a long one take only
-/// somewhat longer, which is about how far anyone's patience actually scales with distance.
-///
-/// A non-finite or non-positive `distance` or `span` returns `shortest`: no distance to
-/// spend means nothing to spend it on, and it keeps a NaN out of an animation's clock, where
-/// it would make [`Animation::advance`] never terminate and take SC-003 with it.
+/// Moves of at least `span` use `longest`. A non-finite or non-positive
+/// `distance` or `span` returns `shortest`.
 pub fn duration_for(distance: f32, span: f32, shortest: f32, longest: f32) -> f32 {
     // Spelled out rather than negated, because `!(x > 0.0)` and `x <= 0.0` differ on NaN and
     // the difference is the one that matters here.
@@ -566,11 +481,9 @@ pub struct FocusLightDraw {
     pub offset_rows: f32,
 }
 
-/// The animated presentation of [`Interaction`], plus the density transition.
+/// Animated interaction and density state.
 ///
-/// This is deliberately the **only** thing that answers "is anything animating". The frame
-/// loop's decision to keep polling or go back to `Wait` is SC-003, and splitting that answer
-/// across two owners is how one of them gets forgotten.
+/// The frame loop checks this state to decide whether another frame is needed.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InteractionMotion {
     preference: MotionPreference,
@@ -620,10 +533,7 @@ impl InteractionMotion {
         self.hover.set(row, plan);
     }
 
-    /// Press down is faster than release, which is UXDD 10.3's "press is faster than
-    /// release" read literally: going *to* a pressed row uses the 40 ms press timing, and
-    /// letting go uses the 80 ms hover timing, because releasing is the row returning to the
-    /// hover state it came from.
+    /// Use 40 milliseconds for a press and 80 milliseconds for release.
     pub fn set_pressed(&mut self, row: Option<u64>) {
         let pattern = match row {
             Some(_) => MotionPattern::PressFeedback,
@@ -751,28 +661,10 @@ impl InteractionMotion {
         self.pressed.intensity(Some(row))
     }
 
-    /// Where to draw the selection region, given how many rows the viewport holds.
+    /// Selection movement intensity in `0.0..=1.0`.
     ///
-    /// A move of more than a viewport's worth of rows **cross-fades in place instead of
-    /// sliding**. A region that has to travel further than the screen is tall never reads as
-    /// travelling: it reads as a flash, and at a million rows the naive version would try to
-    /// slide the region across half the corpus in 120 ms. The viewport is the bound because
-    /// it is exactly the distance beyond which the start and the end cannot both be seen.
-    /// How hard the selection is being *moved*, `0.0..=1.0`.
-    ///
-    /// The drive an animated material reads: `1.0` the instant the selection changes,
-    /// falling to `0.0` as the region settles, and exactly `0.0` whenever nothing is
-    /// animating. Materials multiply their swell by it, so a halo flares as the region
-    /// leaves and has settled by the time it lands.
-    ///
-    /// `1 - progress` rather than a bump curve, and the difference matters because the
-    /// pattern's curve is an `ease-out`: about 94% of the travel happens in the first 60% of
-    /// the time, so the drive is already low while the region is still visibly arriving. The
-    /// flare is on the *departure*, which is the half the eye is following.
-    ///
-    /// Reduce Motion needs no branch here. A reduced plan is instant, `Phase::set` never
-    /// opens a ticket for it, `is_animating` is false and this is `0.0` — so an animated
-    /// material is simply a still one, which is what UXDD 10.3 asks for.
+    /// Starts at one and falls with animation progress. Returns zero when
+    /// selection is still, including when reduced motion makes the change instant.
     #[must_use]
     pub fn selection_swell(&self) -> f32 {
         if !self.selected.is_animating() {
@@ -781,18 +673,9 @@ impl InteractionMotion {
         (1.0 - self.selected.progress()).clamp(0.0, 1.0)
     }
 
-    /// Where the material cycle is, in turns, `0.0..1.0`.
+    /// Material-cycle position in turns, `0.0..1.0`.
     ///
-    /// The **position** half of a [`Drive`], and a different question from
-    /// [`InteractionMotion::selection_swell`]: a swell says how loud a material is, and no
-    /// amount of loudness says a highlight is three-quarters of the way round a border.
-    ///
-    /// Under Reduce Motion this is **pinned**, not frozen, and the distinction is the whole
-    /// of UXDD 10.3's "instant" for a cyclic effect. Freezing would hand back whatever
-    /// `cycle` happened to hold when the preference was read, so the still frame would
-    /// depend on when the user turned the setting on — a different picture on different
-    /// machines, none of them drawn by anyone. Pinned to zero, the still frame is the layer
-    /// at its authored angle, which is a picture a designer chose.
+    /// Reduced motion returns zero, placing the layer at its configured angle.
     #[must_use]
     pub fn phase(&self) -> f32 {
         match self.preference {
@@ -854,21 +737,10 @@ impl InteractionMotion {
         }
     }
 
-    /// Where the focus lamp is this frame, or `None` when nothing has focus.
+    /// Focus-lamp position for this frame, or `None` when nothing has focus.
     ///
-    /// # FR-029, and why there is no branch on the preference here
-    ///
-    /// Under Reduce Motion `MotionPattern::FocusLight` plans to `Instant`, `Phase::set` never
-    /// opens a ticket, `is_animating` is false, and the first arm below returns the lamp at
-    /// the focused row with a zero offset. So the reduced picture is the lamp **at** focus —
-    /// a place the layout chose — and not wherever a suppressed animation would have left it.
-    /// A preference check in this function would be a second answer to a question
-    /// [`MotionPattern::kind`] already answers, and the two could disagree.
-    ///
-    /// Unlike the selection region there is no long-distance special case. The region fades
-    /// across a jump longer than the viewport because a rectangle streaking past the rows is
-    /// what a person's eye follows to nothing; a lamp travelling the same distance changes
-    /// only where the shadows point, which is not something to protect anyone from.
+    /// Reduced motion places the lamp at the focused row immediately, with
+    /// zero travel offset.
     #[must_use]
     pub fn focus_light_draw(&self) -> Option<FocusLightDraw> {
         if !self.focused.is_animating() {

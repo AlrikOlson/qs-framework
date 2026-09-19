@@ -1,48 +1,14 @@
-//! What the bloom costs per frame, per tier — and whether it can be seen at all.
+//! Measure bloom, blur and offscreen rendering costs.
 //!
 //! `cargo run --release -p qs-gpu --example bloom_cost`
 //!
-//! # The four numbers
+//! Compares direct rendering, an offscreen resolve, bloom, and bloom with blur.
+//! It also measures changes outside a bright source to check how far the bloom
+//! spreads. The threshold is chosen for this example's palette.
 //!
-//! `blur_cost`'s structure, with one column added, because the bloom's cost has to separate
-//! from the target's exactly as the blur's did:
-//!
-//! - **one pass** — the frame as it renders with no target at all.
-//! - **two pass** — `force_offscreen`, so the whole frame goes through the target and the
-//!   resolve. The difference from one pass is the *target's* cost, taken here on the same
-//!   machine in the same run rather than read off another report.
-//! - **bloomed** — the same list with an active [`Bloom`]. The difference from two pass is the
-//!   bloom itself: one bright-pass downsample and two Gaussian passes at a sixteenth of the
-//!   viewport's fragment count, plus a resolve that samples a second texture.
-//! - **bloomed + blurred** — both effects in one frame, which is the case the third chain
-//!   texture exists for. The difference from *bloomed* is the blur's own three passes, and it
-//!   should land near `blur_cost`'s chain figure — if it does not, the two effects are
-//!   interfering rather than sharing.
-//!
-//! # The visibility check, and why it is not "bloom on versus bloom off"
-//!
-//! It is that, but measured **outside the bright element**. A bloom that only brightened the
-//! emitter's own pixels would pass an on-versus-off comparison over the whole frame and be
-//! invisible as an effect — the whole claim is that light *leaves* the bright thing. So the
-//! reported figure is the largest change at a distance from the source, inside the blur's
-//! reach, with the source's own rect excluded.
-//!
-//! This is `specs/002-ray-traced-mode`'s R15 lesson applied one effect further out: a guard
-//! that compares the effect against its own absence measures that *something* happened, not
-//! that the thing the effect is for happened.
-//!
-//! # What it measures, and what it does not
-//!
-//! `blur_cost`'s caveats, unchanged and all of them: wall clock from submit to the queue going
-//! idle, not a GPU timestamp; treat the absolute figures as an upper bound and the differences
-//! as the answer. The Reduced tier is reached by asking for its backends directly, so on a
-//! machine whose GL driver is a translation layer over the same hardware "the low tier" means
-//! the low *API*, not low-end hardware.
-//!
-//! The threshold below is this harness's own, not the shipped one. The shipped number comes
-//! from `qs_ui::Tokens::bloom` and `qs-gpu` cannot see a palette; what is reproduced here is
-//! the *rule* — a threshold above every flat colour in the scene — so the emitter is the only
-//! thing that blooms.
+//! Timings run from queue submission to completion and include driver overhead.
+//! Compare the differences between paths. Requesting a reduced backend tests
+//! that API on the available hardware; it does not simulate a slower GPU.
 
 #![allow(
     clippy::unwrap_used,
@@ -278,18 +244,11 @@ fn light_that_left_the_source(off: &[u8], on: &[u8]) -> (u8, u32) {
     (worst, changed)
 }
 
-/// What blooming a *mark* costs the contrast ratio between it and its own ground.
+/// Measure the contrast between a bright mark and its background with bloom.
 ///
-/// This is the measurement that decides where the shipped threshold may sit, and it exists
-/// because the argument against a lower one was a citation rather than a number. Rule 1a of
-/// `specs/002-ray-traced-mode/contracts/lit-contrast.md` says a meaning-bearing element may
-/// emit but its ground may never receive; bloom from a glyph lands on that glyph's own ground,
-/// so a threshold below the ink ceiling puts the two in conflict. How much conflict is a
-/// quantity, and `cargo xtask contrast` cannot see it — it reads tokens, not frames.
-///
-/// The scene is the shipped dark theme's worst realistic pair: body ink at 0.817 relative
-/// luminance on a ground at 0.011, which clears 4.5:1 by a wide margin *before* the bloom.
-/// Returns (ratio before, ratio after) with the ground sampled just outside the mark.
+/// The scene uses ink at 0.817 relative luminance over a background at 0.011.
+/// Returns the contrast ratio before and after bloom, sampling the background
+/// just outside the mark.
 fn contrast_cost_of_blooming_a_mark(ctx: &GpuContext) -> (f64, f64) {
     // Dark-theme `surface/base` and `content/primary`, as sRGB, to two decimal places. Close
     // enough: the question is the size of the change, not the third digit of the ratio.

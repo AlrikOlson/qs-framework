@@ -1,13 +1,7 @@
-//! Linux font locations and fallback ordering.
+//! Linux font directories and fallback preferences.
 //!
-//! Linux is the platform where this module's approach loses the most, and it is worth being
-//! precise about what: fontconfig is *configuration*, not just a font list. A user's
-//! `fonts.conf` can substitute families, reorder the cascade, and set per-family rendering
-//! options, none of which a directory scan can observe. What is preserved is the part that
-//! decides whether a glyph renders at all -- which face covers the codepoint.
-//!
-//! The lists below assume the Noto family, which is what every mainstream distribution
-//! ships as its fallback set, with DejaVu as the older floor.
+//! The preferences use Noto and DejaVu fonts when installed. Directory scanning
+//! does not apply family substitutions or rendering options from fontconfig.
 
 use std::path::PathBuf;
 

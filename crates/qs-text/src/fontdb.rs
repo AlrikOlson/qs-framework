@@ -1,38 +1,12 @@
-//! Font enumeration and codepoint fallback.
+//! Font discovery and fallback by codepoint.
 //!
-//! # What this is, and what it deliberately is not
+//! The database scans standard font directories and uses platform-specific
+//! preference lists. It does not read native fallback settings such as fontconfig
+//! rules, and fonts outside the scanned directories are not found.
 //!
-//! Research R2 names DirectWrite / CoreText / fontconfig as the enumeration and fallback
-//! backends, and flags fallback as the place SC-006 ("no missing-glyph boxes") is won or
-//! lost. This module implements that contract with a **directory scan plus a
-//! per-platform preference chain** rather than three FFI bindings, and the reason is
-//! worth stating rather than discovering later:
-//!
-//! * The three native APIs cannot be compile-tested from one host. Untested FFI on two of
-//!   the three platforms is not coverage, it is the appearance of coverage -- which is
-//!   exactly the failure mode the constitution's "Degrade Visibly" principle exists to
-//!   prevent.
-//! * The part of native fallback that carries the actual knowledge is the *ordering*: which
-//!   face a platform reaches for when the primary font lacks a CJK ideograph. That ordering
-//!   is data, and it is encoded in [`PlatformFonts::preference`] per platform.
-//!
-//! What is genuinely lost is system fallback *configuration* -- a user's fontconfig rules,
-//! or a font installed somewhere non-standard. That is a real gap, it is recorded as a
-//! finding rather than papered over, and the trait boundary here is what makes replacing
-//! this with the native backends a swap rather than a rewrite.
-//!
-//! # Why the scan is lazy
-//!
-//! A Windows install carries several hundred font files totalling well over half a
-//! gigabyte. Parsing all of them at startup to build a family index would put a
-//! measurable, pointless cost in front of the first frame. Instead:
-//!
-//! 1. Scanning collects **paths only** -- one directory walk, no file contents read.
-//! 2. The preference chain (roughly a dozen faces) is resolved eagerly, because those are
-//!    the faces that will actually be used.
-//! 3. Anything else is parsed only when a codepoint misses every preferred face, and the
-//!    answer is memoized per codepoint so the walk happens at most once per glyph the
-//!    corpus contains.
+//! Scanning collects file paths. Preferred faces are resolved at startup; other
+//! faces are loaded when needed for fallback. Fallback results are cached per
+//! codepoint.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -175,11 +149,10 @@ pub trait FontDb: Send + Sync + fmt::Debug {
     /// Resolve a family name to a face. `None` when the family is not installed.
     fn query(&self, family: &str, weight: FontWeight, style: FontStyle) -> Option<FontId>;
 
-    /// The face to use for `ch` when `preferred` does not cover it.
+    /// Find a face covering `ch`, starting with `preferred`.
     ///
-    /// Returns `preferred` unchanged when it *does* cover `ch`, so callers can invoke this
-    /// unconditionally per cluster. `None` means no installed face covers the codepoint,
-    /// which is the SC-006 failure and must be surfaced, not silently rendered as `.notdef`.
+    /// Returns `preferred` when it covers the codepoint, or `None` when no
+    /// available face covers it.
     fn fallback(&self, ch: char, preferred: FontId) -> Option<FontId>;
 
     /// Face bytes. Loaded on first request and retained for the process lifetime.
@@ -278,11 +251,9 @@ impl fmt::Debug for SystemFontDb {
 }
 
 impl SystemFontDb {
-    /// Scan the platform font directories.
+    /// Scan the platform's font directories.
     ///
-    /// Never fails: a machine with no readable font directory yields an empty database,
-    /// and the caller renders nothing rather than refusing to start. That is Principle III
-    /// applied at the least convenient moment.
+    /// Returns an empty database if no readable fonts are found.
     pub fn scan() -> Self {
         Self::scan_with(platform_fonts())
     }
@@ -357,10 +328,7 @@ impl SystemFontDb {
         self.slots.len()
     }
 
-    /// Which weight classes this machine can actually satisfy, ascending.
-    ///
-    /// Exposed so a caller can *report* a degraded type scale rather than quietly render
-    /// every role at 400. Constitution III: reduced capability is never silent.
+    /// Available font-weight classes in ascending order.
     pub fn weight_coverage(&self) -> Vec<u16> {
         self.weights.iter().map(|&(weight, _)| weight).collect()
     }

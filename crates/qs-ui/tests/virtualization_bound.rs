@@ -1,15 +1,7 @@
-//! T049 — rows laid out ≤ `viewport / row_height + 2`.
+//! Property tests for the visible-row count bound.
 //!
-//! FR-002, and the reason it deserves its own test file rather than an assertion tucked
-//! inside the recycler:
-//!
-//! > A regression here does not look like a bug. The list still renders correctly; it just
-//! > lays out ten thousand rows instead of forty and misses the frame budget by two orders
-//! > of magnitude.
-//!
-//! The recycler's own `debug_assert` covers the paths a test happens to exercise. This
-//! covers the parameter space -- every plausible viewport, row height, and scroll position,
-//! including the boundaries where an off-by-one would hide.
+//! The cases vary viewport size, row height and scroll position, including
+//! partially visible rows at either edge.
 
 // Integration tests assert by panicking; `unwrap`/`expect`/`panic!` are the
 // vocabulary of a test, not a hazard in one. The workspace lints deny them for
@@ -26,8 +18,7 @@ use qs_ui::fenwick::{Fenwick, Heights};
 use qs_ui::recycler::Recycler;
 use qs_ui::row_source::{RowSource, StubbornSource};
 
-/// The FR-002 bound, plus the one row of slack `visible_range` adds so a fractional scroll
-/// position cannot leave a gap at the bottom of the viewport.
+/// Visible-row bound with the extra row needed for fractional scrolling.
 fn bound(viewport_height: u32, row_height: u32) -> u32 {
     viewport_height / row_height.max(1) + 3
 }

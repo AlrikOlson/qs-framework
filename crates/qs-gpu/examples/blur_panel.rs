@@ -1,28 +1,10 @@
-//! A popover over a list, through the real pipeline on a real adapter, as a PNG.
+//! Save a side-by-side comparison of a blurred panel and its opaque fallback.
 //!
 //! `cargo run --release -p qs-gpu --example blur_panel -- out.png`
 //!
-//! # Why this exists rather than a test
-//!
-//! Everything about the blur that a test can hold, a test holds: the floor is asserted in
-//! `tier_parity`, the kernel and the memory in `qs_gpu::target`, the contrast in `qs_ui`. What
-//! none of them can see is whether the effect is *visible* — research R15 is this repository's
-//! recorded case of a correct, bounded, four-ways-tested effect that moved 446,580 pixels by a
-//! peak of 7/255 and was worth nothing. Every gate here asks whether a claim is true; none asks
-//! whether an effect can be seen.
-//!
-//! So this draws the two frames side by side — the same panel with the blur and with the floor
-//! it degrades to — and leaves the answer to a person looking at it. It also prints the mean
-//! absolute difference between the halves, which is the cheap version of the R15 question: a
-//! number near zero means the chain ran and changed nothing, which is the failure that looks
-//! exactly like success.
-//!
-//! # What is in the frame
-//!
-//! Deliberately high-frequency content behind the panel — thin bright bars at row pitch, a
-//! saturated ramp, hard edges — because a blur over a flat ground is indistinguishable from a
-//! tint. If the bars are still countable through the glass, the kernel is too narrow; if the
-//! panel is a flat slab, the glass is too opaque.
+//! The background contains thin bars, a color ramp and hard edges to make the
+//! blur visible. The example uses a GPU adapter and prints the mean absolute
+//! difference between the two panels.
 
 // Same set the other examples allow: a harness that panics on a malformed readback is
 // reporting a defect rather than hiding one.

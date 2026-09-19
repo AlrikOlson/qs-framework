@@ -1,10 +1,7 @@
-//! Text shaping, shaped-run caching, glyph rasterization and bidirectional resolution.
+//! Text shaping, font lookup, glyph rasterization and bidirectional text.
 //!
-//! The boundary this crate defends is that **nothing above it knows what a glyph is**.
-//! `qs-ui` asks for a shaped run and gets back positioned glyph ids plus a cluster map;
-//! `qs-gpu` asks for a coverage bitmap and gets back an R8 buffer. Neither of them ever
-//! touches `rustybuzz` or `swash` directly, which is what makes research R2's "held in
-//! reserve: swap in HarfBuzz proper" a real option rather than a comforting sentence.
+//! `rustybuzz` produces positioned glyphs and cluster offsets; `swash` rasterizes
+//! glyphs into coverage masks. The shaped-run cache reuses results across frames.
 
 pub mod bidi;
 pub mod cache;
@@ -54,8 +51,7 @@ impl PxSize {
 /// Shaping features that change the output and therefore participate in the cache key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Features {
-    /// `tnum` -- fixed-advance digits. The size and modified columns need it so numbers
-    /// do not jitter horizontally as rows scroll past (FR-013).
+    /// `tnum`: fixed-width digits for aligned numeric columns.
     pub tabular_figures: bool,
     /// `zero` -- the face's slashed-zero alternate, so an id or a hash reads `0` against
     /// `O` at a glance. A face without the feature shapes its default zero; the tag is

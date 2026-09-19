@@ -1,37 +1,10 @@
-//! A glass panel over a list, through the real pipeline on a real adapter, as a PNG.
+//! Save a glass panel with refraction disabled and enabled.
 //!
 //! `cargo run --release -p qs-gpu --example refract_panel -- out.png`
 //!
-//! # Why this exists rather than a test
-//!
-//! `blur_panel`'s reason, one primitive later: every gate in this repository asks whether a
-//! claim is *true*, and none asks whether an effect is *visible*. Research R15 is the recorded
-//! case — a correct, bounded, four-ways-tested effect that moved 446,580 pixels by a peak of
-//! 7/255 and was worth nothing.
-//!
-//! But this example also does something `blur_panel` does not, because refraction has a claim
-//! blur does not have. `PrimKind::Refract` transmits **only within the bevel**, and the middle
-//! of the panel is asserted to be bit-identical to the PBR surface — that is the contrast
-//! argument that lets a glass panel carry a label at all. So the two halves are measured
-//! twice, in two regions, and the two numbers point in opposite directions:
-//!
-//! - the **interior** difference must be exactly `0.00`, or the effect is under a label;
-//! - the **bevel band** difference must be large, or the effect is invisible.
-//!
-//! A build where both are near zero is R15 again. A build where the interior is non-zero is a
-//! moving ground under a green `cargo xtask contrast`, which is the failure
-//! `qs_ui::substance` refused three separate encodings to avoid.
-//!
-//! # What is in the frame
-//!
-//! The two halves are the same panel at refraction strength 0 and 1. Strength 0 is the PBR
-//! surface exactly — `Instance::refract` documents that as byte-identical — so the difference
-//! between the halves is the glass and nothing else: not a different primitive, not a different
-//! shading path, not a different set of surface parameters.
-//!
-//! The content behind is high-frequency and runs **through** where the bevel falls, because a
-//! displacement is only visible to the extent the thing displaced varies. A panel floated over
-//! a flat ground refracts perfectly and shows nothing.
+//! The GPU renders both panels over detailed background content. The example
+//! reports pixel differences separately for the bevel and interior: refraction
+//! should change the bevel while leaving the interior unchanged.
 
 // Same set the other examples allow: a harness that panics on a malformed readback is
 // reporting a defect rather than hiding one.
